@@ -1,0 +1,8 @@
+{
+  "name": "New Delhi- FMS Order Automation ",
+  "description": "Google Apps Script generator and interactive spreadsheet simulator for Product Order to FMS automation with vertical cell merging, individual item rows, and live dispatch balance tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

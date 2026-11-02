@@ -1,0 +1,44 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* HIGH-CONTRAST VISIBLE VERTICAL & HORIZONTAL SPREADSHEET SCROLLBAR */
+.fms-sheet-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #475569 #f1f5f9;
+}
+
+.fms-sheet-scroll::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+.fms-sheet-scroll::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+}
+
+.fms-sheet-scroll::-webkit-scrollbar-thumb {
+  background: #64748b;
+  border: 2px solid #f1f5f9;
+  border-radius: 6px;
+}
+
+.fms-sheet-scroll::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}
+
+.fms-sheet-scroll::-webkit-scrollbar-corner {
+  background: #e2e8f0;
+}

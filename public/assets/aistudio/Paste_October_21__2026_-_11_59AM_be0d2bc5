@@ -1,0 +1,1241 @@
+
+/************************************************************
+ * GINZA FMS - OPTIMIZED COMBINED SCRIPT
+ *
+ * Tabs:
+ *   Product Order
+ *   Product Automation
+ *   Closed Orders
+ *
+ * Features:
+ * 1. Skips unnecessary full refreshes when source is unchanged.
+ * 1a. Reduced full-grid formatting; order blocks retain medium outer borders.
+ * 1b. Normalized product keys to better preserve manually entered dispatch quantities.
+ * 2. Product Order AA -> Product Automation X.
+ * 3. Product Automation AN = Closed -> move order to Closed Orders.
+ * 4. Closed Orders AN = Open -> move order back to Product Automation.
+ * 5. Product Automation Z = K - Y automatically.
+ * 6. Preserve approval, order number, dispatch and operational data.
+ * 7. Product Automation AO = Message Sent creates AP WhatsApp link with all items.
+ *
+ * Dispatch Done Report is never accessed or modified.
+ ************************************************************/
+
+const FMS_CONFIG = {
+  SOURCE: "Product Order",
+  TARGET: "Product Automation",
+  ARCHIVE: "Closed Orders",
+
+  FIRST_DATA_ROW: 2,
+  ORDER_NO_SOURCE_COL: 27,  // AA
+  ORDER_NO_TARGET_COL: 24,  // X
+  DISPATCH_COL: 25,          // Y
+  BALANCE_COL: 26,           // Z
+  STATUS_COL: 40,            // AN
+  LAST_COL: 45               // AS
+};
+
+
+/* =========================================================
+   GENERAL HELPERS
+   ========================================================= */
+
+function fmsDateText_(value, timezone) {
+  if (value === "" || value == null) return "";
+
+  if (!(value instanceof Date)) {
+    return String(value).trim();
+  }
+
+  return Utilities.formatDate(value, timezone, "dd/MM/yyyy");
+}
+
+
+function fmsMakeKey_(values) {
+  return values.map(value =>
+    String(value == null ? "" : value).trim()
+  ).join("|");
+}
+
+
+function keySafeProduct(values) {
+  return fmsMakeKey_(values);
+}
+
+
+/**
+ * Fingerprint source orders and archived Closed statuses.
+ * Lets a repeated manual refresh exit before rebuilding/formatting the sheet
+ * when the source has not changed. Operational edits in Product Automation
+ * are therefore not overwritten by an unnecessary refresh.
+ */
+function fmsSourceFingerprint_(sourceData, closedKeys) {
+  const payload = JSON.stringify({
+    source: sourceData,
+    closed: Array.from(closedKeys).sort()
+  });
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    payload,
+    Utilities.Charset.UTF_8
+  );
+  return Utilities.base64Encode(digest);
+}
+
+function forceUpdateFMSFromResponses() {
+  // Use only when you intentionally need a complete rebuild/format refresh.
+  PropertiesService.getDocumentProperties()
+    .deleteProperty('GINZA_FMS_SOURCE_FINGERPRINT');
+  updateFMSFromResponses();
+}
+
+
+function fmsEnsureColumns_(sheet, requiredColumns) {
+  if (sheet.getMaxColumns() < requiredColumns) {
+    sheet.insertColumnsAfter(
+      sheet.getMaxColumns(),
+      requiredColumns - sheet.getMaxColumns()
+    );
+  }
+}
+
+
+/**
+ * Temporarily remove a basic sheet filter before merging order blocks.
+ * Google Sheets does not allow mergeVertically() over rows hidden by a filter.
+ * The filter range and its column criteria are captured and restored afterward.
+ */
+function fmsSuspendFilterForMerge_(sheet) {
+  const filter = sheet.getFilter();
+  if (!filter) return null;
+
+  const range = filter.getRange();
+  const snapshot = {
+    row: range.getRow(),
+    column: range.getColumn(),
+    numRows: range.getNumRows(),
+    numColumns: range.getNumColumns(),
+    criteria: []
+  };
+
+  for (let offset = 0; offset < snapshot.numColumns; offset++) {
+    snapshot.criteria.push(
+      filter.getColumnFilterCriteria(snapshot.column + offset)
+    );
+  }
+
+  filter.remove();
+  return snapshot;
+}
+
+
+function fmsRestoreFilter_(sheet, snapshot) {
+  if (!snapshot) return;
+
+  try {
+    const range = sheet.getRange(
+      snapshot.row,
+      snapshot.column,
+      snapshot.numRows,
+      snapshot.numColumns
+    );
+    const filter = range.createFilter();
+
+    snapshot.criteria.forEach((criteria, offset) => {
+      if (criteria) {
+        filter.setColumnFilterCriteria(
+          snapshot.column + offset,
+          criteria
+        );
+      }
+    });
+  } catch (error) {
+    // Do not fail the entire FMS refresh just because Google Sheets refuses
+    // to restore a filter over merged order cells. Report the issue clearly.
+    console.warn('FMS filter could not be restored: ' + error.message);
+    try {
+      SpreadsheetApp.getActiveSpreadsheet().toast(
+        'Data refreshed, but the sheet filter could not be restored because the order rows contain merged cells. Reapply the filter manually if needed.',
+        'Filter Notice',
+        8
+      );
+    } catch (_) {}
+  }
+}
+
+
+function fmsGetOrderBlock_(sheet, row) {
+  let startRow = row;
+  let endRow = row;
+
+  // Prefer the status column's merged order block.
+  let merges = sheet.getRange(
+    row, FMS_CONFIG.STATUS_COL
+  ).getMergedRanges();
+
+  // Fallback to column B's merged order block.
+  if (!merges.length) {
+    merges = sheet.getRange(row, 2).getMergedRanges();
+  }
+
+  if (merges.length) {
+    startRow = merges[0].getRow();
+    endRow = startRow + merges[0].getNumRows() - 1;
+  }
+
+  if (startRow < FMS_CONFIG.FIRST_DATA_ROW) {
+    throw new Error("Could not identify a valid order block.");
+  }
+
+  return {
+    start: startRow,
+    count: endRow - startRow + 1
+  };
+}
+
+
+function fmsCopyOrderBlock_(
+  sourceSheet,
+  sourceStart,
+  rowCount,
+  destinationSheet,
+  destinationStart
+) {
+  fmsEnsureColumns_(destinationSheet, FMS_CONFIG.LAST_COL);
+
+  const requiredLastRow = destinationStart + rowCount - 1;
+
+  if (requiredLastRow > destinationSheet.getMaxRows()) {
+    destinationSheet.insertRowsAfter(
+      destinationSheet.getMaxRows(),
+      requiredLastRow - destinationSheet.getMaxRows()
+    );
+  }
+
+  const sourceRange = sourceSheet.getRange(
+    sourceStart,
+    1,
+    rowCount,
+    FMS_CONFIG.LAST_COL
+  );
+
+  const destinationRange = destinationSheet.getRange(
+    destinationStart,
+    1,
+    rowCount,
+    FMS_CONFIG.LAST_COL
+  );
+
+  // Copy data, formulas, formatting and merges.
+  sourceRange.copyTo(
+    destinationRange,
+    SpreadsheetApp.CopyPasteType.PASTE_NORMAL,
+    false
+  );
+
+  // Preserve row heights.
+  for (let i = 0; i < rowCount; i++) {
+    destinationSheet.setRowHeight(
+      destinationStart + i,
+      sourceSheet.getRowHeight(sourceStart + i)
+    );
+  }
+
+  SpreadsheetApp.flush();
+
+  // Verify copied values before removing the source block.
+  const originalValues = sourceRange.getValues();
+  const copiedValues = destinationRange.getValues();
+
+  if (
+    JSON.stringify(originalValues) !==
+    JSON.stringify(copiedValues)
+  ) {
+    throw new Error(
+      "Copy verification failed. The original order was retained."
+    );
+  }
+}
+
+
+/* =========================================================
+   CLOSED ORDER KEYS
+   Only orders currently marked Closed remain excluded.
+   Orders marked Open are eligible to return to active data.
+   ========================================================= */
+
+function getClosedOrderKeys_(ss) {
+  const archive = ss.getSheetByName(FMS_CONFIG.ARCHIVE);
+  const keys = new Set();
+
+  if (!archive || archive.getLastRow() < 2) return keys;
+
+  const timezone = ss.getSpreadsheetTimeZone();
+  const rowCount = archive.getLastRow() - 1;
+
+  // Read only the identity columns B:E and status column AN.
+  const identities = archive.getRange(2, 2, rowCount, 4).getValues();
+  const statuses = archive.getRange(
+    2, FMS_CONFIG.STATUS_COL, rowCount, 1
+  ).getValues();
+
+  for (let i = 0; i < rowCount; i++) {
+    const row = identities[i];
+    const hasIdentity = row.some(value => value !== '' && value != null);
+    if (!hasIdentity) continue;
+
+    if (String(statuses[i][0] || '').trim().toLowerCase() !== 'closed') {
+      continue;
+    }
+
+    keys.add(fmsMakeKey_([
+      row[0], // B: PO
+      row[1], // C: Customer
+      row[2], // D: Email
+      fmsDateText_(row[3], timezone) // E: Date
+    ]));
+  }
+
+  return keys;
+}
+
+
+/* =========================================================
+   1. REFRESH PRODUCT AUTOMATION
+   ========================================================= */
+
+function updateFMSFromResponses() {
+  const lock = LockService.getDocumentLock();
+  let filterSnapshot = null;
+  let filterRestoreAttempted = false;
+
+  if (!lock.tryLock(20000)) {
+    throw new Error(
+      "Another FMS operation is running. Please try again."
+    );
+  }
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const source = ss.getSheetByName(FMS_CONFIG.SOURCE);
+    const target = ss.getSheetByName(FMS_CONFIG.TARGET);
+
+    if (!source || !target) {
+      throw new Error(
+        'Required tabs "Product Order" and/or "Product Automation" were not found.'
+      );
+    }
+
+    const timezone = ss.getSpreadsheetTimeZone();
+    const sourceLastRow = source.getLastRow();
+
+    if (sourceLastRow < FMS_CONFIG.FIRST_DATA_ROW) {
+      throw new Error("No source data found. Nothing was changed.");
+    }
+
+    fmsEnsureColumns_(target, FMS_CONFIG.LAST_COL);
+
+    // Read source data in one operation.
+    const sourceData = source.getRange(
+      FMS_CONFIG.FIRST_DATA_ROW,
+      1,
+      sourceLastRow - FMS_CONFIG.FIRST_DATA_ROW + 1,
+      27
+    ).getValues();
+
+    // If neither source data nor archived Closed status changed, skip the
+    // expensive clear/merge/border/rebuild cycle entirely.
+    const closedKeys = getClosedOrderKeys_(ss);
+    const fingerprint = fmsSourceFingerprint_(sourceData, closedKeys);
+    const properties = PropertiesService.getDocumentProperties();
+    const previousFingerprint = properties.getProperty(
+      'GINZA_FMS_SOURCE_FINGERPRINT'
+    );
+
+    if (
+      previousFingerprint &&
+      previousFingerprint === fingerprint &&
+      target.getLastRow() >= FMS_CONFIG.FIRST_DATA_ROW
+    ) {
+      ss.toast(
+        'No source changes detected. Product Automation was left untouched.',
+        'FMS Update',
+        4
+      );
+      return;
+    }
+
+    // Remove active filter temporarily so filtered/hidden rows can be merged.
+    filterSnapshot = fmsSuspendFilterForMerge_(target);
+
+    const oldLastRow = target.getLastRow();
+    const oldRowCount = Math.max(0, oldLastRow - 1);
+
+    // Preserve existing active values and formulas before rebuilding.
+    const oldRows = oldRowCount
+      ? target.getRange(2, 1, oldRowCount, 45).getValues()
+      : [];
+
+    // Only operational formulas in AA:AS are restored by this refresh.
+    const oldFormulas = oldRowCount
+      ? target.getRange(2, 27, oldRowCount, 19).getFormulas()
+      : [];
+
+    function sourceOrderKey(row) {
+      return fmsMakeKey_([
+        row[2],
+        row[3],
+        row[4],
+        fmsDateText_(row[5], timezone)
+      ]);
+    }
+
+    function productKey(row) {
+      // Normalize product fields consistently for old rows and new output.
+      // Column N (index 8 within F:N) may be a Date object in the sheet
+      // and a formatted string in the new output. Without this normalization,
+      // the product key can differ and a manually entered Y dispatch quantity
+      // may not be restored after refresh.
+      const product = row.slice(5, 14);
+      product[8] = fmsDateText_(product[8], timezone);
+      return fmsMakeKey_(product);
+    }
+
+    /* -----------------------------------------------------
+       STEP 1: Save existing active order-level information
+       and product dispatch quantities.
+       ----------------------------------------------------- */
+
+    const oldOrders = new Map();
+    const oldProducts = new Map();
+    const oldProductOccurrences = new Map();
+
+    let activeOldOrder = null;
+
+    oldRows.forEach((row, index) => {
+      const hasIdentity =
+        row[1] !== "" || row[2] !== "" ||
+        row[3] !== "" || row[4] !== "";
+
+      if (hasIdentity) {
+        activeOldOrder = {
+          po: row[1],
+          customer: row[2],
+          email: row[3],
+          orderDate: fmsDateText_(row[4], timezone)
+        };
+      }
+
+      if (!activeOldOrder) return;
+
+      const orderKey = fmsMakeKey_([
+        activeOldOrder.po,
+        activeOldOrder.customer,
+        activeOldOrder.email,
+        activeOldOrder.orderDate
+      ]);
+
+      const hasProduct = row.slice(5, 14).some(value =>
+        value !== "" && value != null
+      );
+
+      if (!hasProduct) return;
+
+      if (!oldOrders.has(orderKey)) {
+        oldOrders.set(orderKey, {
+          approval: row[21],
+          approvalTimestamp: row[22],
+          orderNo: row[23],
+          orderFields: row.slice(26, 45),
+          orderFormulas: oldFormulas[index]
+        });
+      } else {
+        const saved = oldOrders.get(orderKey);
+
+        for (let c = 0; c < 19; c++) {
+          if (
+            (saved.orderFields[c] === "" ||
+              saved.orderFields[c] == null) &&
+            row[c + 26] !== "" &&
+            row[c + 26] != null
+          ) {
+            saved.orderFields[c] = row[c + 26];
+            saved.orderFormulas[c] = oldFormulas[index][c];
+          }
+        }
+
+        if (!saved.approval && row[21]) {
+          saved.approval = row[21];
+        }
+
+        if (!saved.approvalTimestamp && row[22]) {
+          saved.approvalTimestamp = row[22];
+        }
+
+        if (!saved.orderNo && row[23]) {
+          saved.orderNo = row[23];
+        }
+      }
+
+      const productIdentity = orderKey + "||" + productKey(row);
+      const occurrence =
+        (oldProductOccurrences.get(productIdentity) || 0) + 1;
+
+      oldProductOccurrences.set(productIdentity, occurrence);
+
+      oldProducts.set(
+        productIdentity + "||" + occurrence,
+        { dispatchQty: row[24] }
+      );
+    });
+
+    /* -----------------------------------------------------
+       STEP 2: Group source rows, excluding orders still Closed.
+       ----------------------------------------------------- */
+
+    const groups = new Map();
+
+    sourceData.forEach(row => {
+      if (row.every(value => value === "" || value == null)) return;
+
+      const groupKey = sourceOrderKey(row);
+
+      if (closedKeys.has(groupKey)) return;
+
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, {
+          key: groupKey,
+          timestamp: row[1],
+          po: row[2],
+          customer: row[3],
+          email: row[4],
+          orderDate: fmsDateText_(row[5], timezone),
+          remark: row[15],
+          number: row[16],
+          billing: row[17],
+          delivery: row[18],
+          transporter: row[19],
+          salesperson: row[20],
+          accountStatus: row[21],
+          sourceApproval: row[23],
+          products: [],
+          orderNos: []
+        });
+      }
+
+      const group = groups.get(groupKey);
+
+      const product = [
+        row[6] || "",
+        row[7] || "",
+        row[8] || "",
+        row[9] || "",
+        row[10] || "",
+        row[11] === 0 ? 0 : (row[11] || ""),
+        row[12] === 0 ? 0 : (row[12] || ""),
+        row[13] === 0 ? 0 : (row[13] || ""),
+        fmsDateText_(row[14], timezone)
+      ];
+
+      group.products.push(product);
+
+      const orderNo = String(row[26] || "").trim();
+
+      if (orderNo && !group.orderNos.includes(orderNo)) {
+        group.orderNos.push(orderNo);
+      }
+    });
+
+    /* -----------------------------------------------------
+       STEP 3: Prepare output and restore saved information.
+       ----------------------------------------------------- */
+
+    const output = [];
+    const blocks = [];
+    const restores = [];
+    const newProductOccurrences = new Map();
+
+    groups.forEach(group => {
+      const saved = oldOrders.get(group.key);
+      const startRow = output.length + 2;
+      const orderNos = group.orderNos.slice();
+
+      if (saved && saved.orderNo) {
+        String(saved.orderNo).split(/\n/).forEach(value => {
+          value = value.trim();
+
+          if (value && !orderNos.includes(value)) {
+            orderNos.push(value);
+          }
+        });
+      }
+
+      group.products.forEach(product => {
+        const identity = group.key + "||" + productKey(product);
+        const occurrence =
+          (newProductOccurrences.get(identity) || 0) + 1;
+
+        newProductOccurrences.set(identity, occurrence);
+
+        const oldProduct = oldProducts.get(
+          identity + "||" + occurrence
+        );
+
+        const dispatchQty = oldProduct
+          ? oldProduct.dispatchQty
+          : "";
+
+        const orderedQty = product[5];
+
+        const dispatchNumber =
+          dispatchQty !== "" && dispatchQty != null
+            ? Number(dispatchQty)
+            : 0;
+
+        const balanceQty =
+          orderedQty !== "" &&
+          orderedQty != null &&
+          !isNaN(Number(orderedQty))
+            ? Number(orderedQty) - dispatchNumber
+            : "";
+
+        output.push([
+          group.timestamp,                    // A
+          group.po,                           // B
+          group.customer,                     // C
+          group.email,                        // D
+          group.orderDate,                    // E
+          ...product,                         // F:N
+          group.remark || "",                 // O
+          group.number || "",                 // P
+          group.billing || "",                // Q
+          group.delivery || "",               // R
+          group.transporter || "",            // S
+          group.salesperson || "",             // T
+          group.accountStatus || "",          // U
+          saved && saved.approval !== "" &&
+            saved.approval != null
+              ? saved.approval
+              : (group.sourceApproval || ""), // V
+          saved ? saved.approvalTimestamp : "", // W
+          orderNos.join("\n"),                // X
+          dispatchQty,                        // Y
+          balanceQty                          // Z
+        ]);
+      });
+
+      blocks.push({
+        start: startRow,
+        count: group.products.length
+      });
+
+      if (saved) {
+        restores.push({
+          row: startRow,
+          values: saved.orderFields,
+          formulas: saved.orderFormulas
+        });
+      }
+    });
+
+    if (!output.length) {
+      throw new Error(
+        "No active product rows found. Nothing was changed."
+      );
+    }
+
+    /* -----------------------------------------------------
+       STEP 4: Clear old merges and write values in batches.
+       ----------------------------------------------------- */
+
+    const requiredLastRow = output.length + 1;
+
+    if (requiredLastRow > target.getMaxRows()) {
+      target.insertRowsAfter(
+        target.getMaxRows(),
+        requiredLastRow - target.getMaxRows()
+      );
+    }
+
+    const rowsToPrepare = Math.max(oldLastRow, requiredLastRow) - 1;
+
+    if (rowsToPrepare > 0) {
+      const oldRange = target.getRange(
+        2, 1, rowsToPrepare, FMS_CONFIG.LAST_COL
+      );
+
+      oldRange.breakApart();
+      oldRange.clearContent();
+    }
+
+    // Single batch write for A:Z.
+    target.getRange(2, 1, output.length, 26).setValues(output);
+
+    // Single batch write for AA:AS.
+    const operationalValues = Array.from(
+      { length: output.length },
+      () => Array(19).fill("")
+    );
+
+    restores.forEach(item => {
+      operationalValues[item.row - 2] = item.values.slice();
+    });
+
+    target.getRange(2, 27, output.length, 19)
+      .setValues(operationalValues);
+
+    // Restore formulas only where saved formulas actually exist.
+    restores.forEach(item => {
+      item.formulas.forEach((formula, index) => {
+        if (formula) {
+          target.getRange(
+            item.row, 27 + index
+          ).setFormula(formula);
+        }
+      });
+    });
+
+    /* -----------------------------------------------------
+       STEP 5: Batch formatting.
+       Avoid repeating border, wrap and alignment operations
+       for every individual order block.
+       ----------------------------------------------------- */
+
+    const outputRange = target.getRange(
+      2, 1, output.length, FMS_CONFIG.LAST_COL
+    );
+
+    // Keep the data bold, as requested. Avoid drawing a border around every
+    // individual cell in the entire 1,000-5,000-row output; that adds a large
+    // formatting workload and can make the browser sluggish. The medium outer
+    // border for each order block is applied below.
+    outputRange.setFontWeight("bold");
+
+    // Apply wrap and alignment once.
+    outputRange
+      .setWrap(true)
+      .setVerticalAlignment("middle");
+
+    // Merge common order-level cells only.
+    blocks.forEach(block => {
+      if (block.count <= 1) return;
+
+      target.getRange(
+        block.start, 1, block.count, 5
+      ).mergeVertically(); // A:E
+
+      target.getRange(
+        block.start, 15, block.count, 10
+      ).mergeVertically(); // O:X
+
+      target.getRange(
+        block.start, 27, block.count, 19
+      ).mergeVertically(); // AA:AS
+    });
+
+    // Rebuild each AP link after the rows are in their final positions so
+    // formulas always point to the correct product rows after a refresh.
+    blocks.forEach(block => {
+      fmsSetWhatsAppLinkForOrder_(target, block.start);
+    });
+
+    // Apply BOLD OUTER BORDER to each complete order block A:AS.
+    blocks.forEach(block => {
+      if (block.count < 1) return;
+
+      target.getRange(
+        block.start,
+        1,
+        block.count,
+        FMS_CONFIG.LAST_COL
+      ).setBorder(
+        true,  // Top border
+        true,  // Left border
+        true,  // Bottom border
+        true,  // Right border
+        false, // No internal vertical borders
+        false, // No internal horizontal borders
+        "#000000",
+        SpreadsheetApp.BorderStyle.SOLID_MEDIUM
+      );
+    });
+
+
+    // Batch number formats.
+    target.getRange(2, 1, output.length, 1)
+      .setNumberFormat("dd/MM/yyyy hh:mm:ss AM/PM");
+
+    target.getRange(2, 5, output.length, 1)
+      .setNumberFormat("dd/MM/yyyy");
+
+    target.getRange(2, 14, output.length, 1)
+      .setNumberFormat("dd/MM/yyyy");
+
+    SpreadsheetApp.flush();
+
+    // Restore the basic filter and any saved column criteria after merging.
+    filterRestoreAttempted = true;
+    fmsRestoreFilter_(target, filterSnapshot);
+
+    // Save the fingerprint only after the refresh completes successfully.
+    properties.setProperty('GINZA_FMS_SOURCE_FINGERPRINT', fingerprint);
+
+    ss.toast(
+      "Product Automation refreshed: " + output.length + " product rows.",
+      "FMS Update",
+      5
+    );
+
+  } finally {
+    if (filterSnapshot && !filterRestoreAttempted) {
+      fmsRestoreFilter_(
+        SpreadsheetApp.getActiveSpreadsheet().getSheetByName(FMS_CONFIG.TARGET),
+        filterSnapshot
+      );
+    }
+    lock.releaseLock();
+  }
+}
+
+
+/* =========================================================
+   WHATSAPP DISPATCH LINK: AO -> AP
+   When AO is set to "Message Sent", AP shows a clickable link.
+   The link includes every product row in the same merged order block.
+   ========================================================= */
+
+function fmsSetWhatsAppLinkForOrder_(sheet, editedRow) {
+  const block = fmsGetOrderBlock_(sheet, editedRow);
+  const start = block.start;
+  const end = start + block.count - 1;
+  const status = String(sheet.getRange(start, 41).getDisplayValue() || "").trim();
+  const linkCell = sheet.getRange(start, 42); // AP top-left of merged order block
+
+  if (status !== "Message Sent") {
+    linkCell.clearContent();
+    return;
+  }
+
+  const g = `G${start}:G${end}`;
+  const h = `H${start}:H${end}`;
+  const y = `Y${start}:Y${end}`;
+  const j = `J${start}:J${end}`;
+
+  // One item detail block for each product row in F:N.
+  const itemDetails =
+    `TEXTJOIN(CHAR(10)&"--------------------------"&CHAR(10),TRUE,` +
+    `MAP(SEQUENCE(ROWS(${g})),LAMBDA(i,` +
+      `"*Item Name*    : "&IFERROR(INDEX(${g},i,1),"")&CHAR(10)&` +
+      `"*Color*        : "&IFERROR(INDEX(${h},i,1),"")&CHAR(10)&` +
+      `"*Dispatch Qnt* : "&IFERROR(INDEX(${y},i,1),"")&CHAR(10)&` +
+      `"*Unit of Item* : "&IFERROR(INDEX(${j},i,1),"")` +
+    `)))`;
+
+  const message =
+    `"Dear "&C${start}&","&CHAR(10)&CHAR(10)&` +
+    `"We are pleased to inform you that your order has been *successfully dispatched*."&CHAR(10)&CHAR(10)&` +
+    `"*Order Summary*"&CHAR(10)&` +
+    `"--------------------------"&CHAR(10)&` +
+    `"Order Date : "&IF(E${start}="","",TEXT(E${start},"dd/MM/yyyy"))&CHAR(10)&` +
+    `"Order No   : "&X${start}&CHAR(10)&` +
+    `"--------------------------"&CHAR(10)&CHAR(10)&` +
+    `${itemDetails}&CHAR(10)&CHAR(10)&` +
+    `"We wish you a wonderful experience with your purchase."&CHAR(10)&` +
+    `"Thank you for trusting *Soie & Ginza Industries Limited*."`;
+
+  const formula =
+    `=IF(TRIM(AO${start})="Message Sent",` +
+    `HYPERLINK(` +
+      `"https://web.whatsapp.com/send?phone="&REGEXREPLACE(TO_TEXT(P${start}),"[^0-9]","")&` +
+      `"&text="&ENCODEURL(${message}),` +
+      `"Sent Messages"` +
+    `),"")`;
+
+  linkCell.setFormula(formula);
+}
+
+
+/* =========================================================
+   2. EDIT HANDLER
+   ========================================================= */
+
+function onEdit(e) {
+  if (!e || !e.range) return;
+
+  const sheet = e.range.getSheet();
+  const sheetName = sheet.getName();
+  const firstCol = e.range.getColumn();
+  const lastCol = firstCol + e.range.getNumColumns() - 1;
+
+  // A. Reopen an order when Closed Orders AN becomes Open.
+  if (
+    sheetName === FMS_CONFIG.ARCHIVE &&
+    firstCol <= FMS_CONFIG.STATUS_COL &&
+    lastCol >= FMS_CONFIG.STATUS_COL &&
+    e.range.getNumRows() === 1 &&
+    e.range.getNumColumns() === 1
+  ) {
+    reopenOrderFromArchive_(e);
+    return;
+  }
+
+  // B. Product Automation: update balance when Y is edited.
+  if (
+    sheetName === FMS_CONFIG.TARGET &&
+    firstCol <= FMS_CONFIG.DISPATCH_COL &&
+    lastCol >= FMS_CONFIG.DISPATCH_COL
+  ) {
+    updateBalanceForEditedRows_(sheet, e.range);
+  }
+
+  // C. Product Automation AO = Message Sent -> AP WhatsApp link.
+  if (
+    sheetName === FMS_CONFIG.TARGET &&
+    firstCol === 41 && lastCol === 41 &&
+    e.range.getNumRows() === 1 && e.range.getNumColumns() === 1
+  ) {
+    fmsSetWhatsAppLinkForOrder_(sheet, e.range.getRow());
+    return;
+  }
+
+  // D. Archive an order when Product Automation AN becomes Closed.
+  if (
+    sheetName === FMS_CONFIG.TARGET &&
+    firstCol === FMS_CONFIG.STATUS_COL &&
+    e.range.getNumRows() === 1 &&
+    e.range.getNumColumns() === 1
+  ) {
+    archiveClosedOrder_(e);
+    return;
+  }
+
+  // E. Product Order AA -> Product Automation X.
+  if (sheetName !== FMS_CONFIG.SOURCE) return;
+
+  if (firstCol !== FMS_CONFIG.ORDER_NO_SOURCE_COL) return;
+  if (e.range.getRow() < FMS_CONFIG.FIRST_DATA_ROW) return;
+
+  if (e.range.getNumRows() !== 1 || e.range.getNumColumns() !== 1) {
+    return;
+  }
+
+  const ss = e.source;
+  const target = ss.getSheetByName(FMS_CONFIG.TARGET);
+  if (!target) return;
+
+  const sourceIdentity = sheet.getRange(
+    e.range.getRow(), 3, 1, 4
+  ).getValues()[0];
+
+  const orderNo = String(e.range.getValue() || "").trim();
+  if (!orderNo) return;
+
+  const timezone = ss.getSpreadsheetTimeZone();
+  const wantedKey = fmsMakeKey_([
+    sourceIdentity[0], // C
+    sourceIdentity[1], // D
+    sourceIdentity[2], // E
+    fmsDateText_(sourceIdentity[3], timezone) // F
+  ]);
+
+  const lastRow = target.getLastRow();
+  if (lastRow < 2) return;
+
+  // Read only B:E for matching instead of A:X.
+  const rows = target.getRange(2, 2, lastRow - 1, 4).getValues();
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row[0] && !row[1] && !row[2]) continue;
+
+    const existingKey = fmsMakeKey_([
+      row[0], // B: PO
+      row[1], // C: Customer
+      row[2], // D: Email
+      fmsDateText_(row[3], timezone) // E: Date
+    ]);
+
+    if (existingKey !== wantedKey) continue;
+
+    const orderCell = target.getRange(
+      i + 2, FMS_CONFIG.ORDER_NO_TARGET_COL
+    );
+    const existingNumbers = String(orderCell.getValue() || "")
+      .split(/\n/)
+      .map(value => value.trim())
+      .filter(Boolean);
+
+    if (!existingNumbers.includes(orderNo)) {
+      existingNumbers.push(orderNo);
+      orderCell.setValue(existingNumbers.join("\n")).setWrap(true);
+    }
+    break;
+  }
+}
+
+
+/* =========================================================
+   3. AUTOMATIC BALANCE: Z = K - Y
+   Handles single-cell edits and multi-row pastes in Y.
+   ========================================================= */
+
+function updateBalanceForEditedRows_(sheet, editedRange) {
+  const firstCol = editedRange.getColumn();
+  const lastCol = firstCol + editedRange.getNumColumns() - 1;
+
+  if (
+    FMS_CONFIG.DISPATCH_COL < firstCol ||
+    FMS_CONFIG.DISPATCH_COL > lastCol
+  ) {
+    return;
+  }
+
+  const startRow = Math.max(
+    editedRange.getRow(),
+    FMS_CONFIG.FIRST_DATA_ROW
+  );
+
+  const endRow = editedRange.getLastRow();
+
+  if (endRow < startRow) return;
+
+  const rowCount = endRow - startRow + 1;
+
+  // K = ordered quantity; Y = dispatch quantity.
+  const orderedQuantities = sheet.getRange(
+    startRow, 11, rowCount, 1
+  ).getValues();
+
+  const dispatchQuantities = sheet.getRange(
+    startRow, FMS_CONFIG.DISPATCH_COL, rowCount, 1
+  ).getValues();
+
+  const balances = orderedQuantities.map((row, index) => {
+    const ordered = row[0];
+    const dispatch = dispatchQuantities[index][0];
+
+    // Support numeric values and Alt+Enter line-separated quantities.
+    // Example K = "5000\n49594" and Y = "100\n200" -> Z = "4900\n49394".
+    const parseQuantityLines = value => {
+      if (value === "" || value == null) return [];
+      return String(value).split(/\r?\n/).map(part => part.trim())
+        .filter(part => part !== "")
+        .map(part => Number(part));
+    };
+
+    const orderedLines = parseQuantityLines(ordered);
+    if (!orderedLines.length || orderedLines.some(value => !Number.isFinite(value))) {
+      return [""];
+    }
+
+    const dispatchLines = parseQuantityLines(dispatch);
+    if (dispatchLines.some(value => !Number.isFinite(value))) {
+      return [""];
+    }
+
+    // One dispatch number subtracts from one ordered number. When multiple
+    // lines exist, pair line-by-line; missing dispatch lines count as zero.
+    const balancesForLines = orderedLines.map((qty, i) => {
+      const dispatched = dispatchLines[i] == null ? 0 : dispatchLines[i];
+      return qty - dispatched;
+    });
+
+    return [balancesForLines.join("\n")];
+  });
+
+  // One write updates Z for all edited rows.
+  sheet.getRange(
+    startRow, FMS_CONFIG.BALANCE_COL, rowCount, 1
+  ).setValues(balances);
+}
+
+
+/* =========================================================
+   4. ARCHIVE ORDER WHEN AN = CLOSED
+   ========================================================= */
+
+function archiveClosedOrder_(e) {
+  if (!e || !e.range) return;
+
+  const active = e.range.getSheet();
+  const ss = e.source;
+
+  if (active.getName() !== FMS_CONFIG.TARGET) return;
+
+  const status = String(e.range.getDisplayValue() || "")
+    .trim()
+    .toLowerCase();
+
+  if (status !== "closed") return;
+
+  const lock = LockService.getDocumentLock();
+
+  if (!lock.tryLock(10000)) {
+    ss.toast(
+      "Another FMS operation is running. Please try again.",
+      "Please Wait",
+      5
+    );
+    return;
+  }
+
+  try {
+    const archive = ss.getSheetByName(FMS_CONFIG.ARCHIVE);
+
+    if (!archive) {
+      throw new Error('The "Closed Orders" tab was not found.');
+    }
+
+    const block = fmsGetOrderBlock_(
+      active, e.range.getRow()
+    );
+
+    const destinationStart = Math.max(
+      archive.getLastRow() + 1,
+      FMS_CONFIG.FIRST_DATA_ROW
+    );
+
+    fmsCopyOrderBlock_(
+      active,
+      block.start,
+      block.count,
+      archive,
+      destinationStart
+    );
+
+    // Delete active rows only after copy verification succeeds.
+    active.deleteRows(block.start, block.count);
+
+    SpreadsheetApp.flush();
+
+    ss.toast(
+      "Order moved to Closed Orders successfully.",
+      "Order Closed",
+      5
+    );
+
+  } catch (error) {
+    ss.toast(
+      "Archive failed: " + error.message,
+      "Archive Error",
+      10
+    );
+
+    console.error(error);
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/* =========================================================
+   5. REOPEN ORDER WHEN CLOSED ORDERS AN = OPEN
+   ========================================================= */
+
+function reopenOrderFromArchive_(e) {
+  if (!e || !e.range) return;
+
+  const archive = e.range.getSheet();
+  const ss = e.source;
+
+  if (archive.getName() !== FMS_CONFIG.ARCHIVE) return;
+
+  const status = String(e.range.getDisplayValue() || "")
+    .trim()
+    .toLowerCase();
+
+  if (status !== "open") return;
+
+  const lock = LockService.getDocumentLock();
+
+  if (!lock.tryLock(10000)) {
+    ss.toast(
+      "Another FMS operation is running. Please try again.",
+      "Please Wait",
+      5
+    );
+    return;
+  }
+
+  try {
+    const target = ss.getSheetByName(FMS_CONFIG.TARGET);
+
+    if (!target) {
+      throw new Error('The "Product Automation" tab was not found.');
+    }
+
+    const block = fmsGetOrderBlock_(
+      archive, e.range.getRow()
+    );
+
+    // Append after the last active order.
+    const destinationStart = Math.max(
+      target.getLastRow() + 1,
+      FMS_CONFIG.FIRST_DATA_ROW
+    );
+
+    fmsCopyOrderBlock_(
+      archive,
+      block.start,
+      block.count,
+      target,
+      destinationStart
+    );
+
+    // Remove from Closed Orders only after copy verification.
+    archive.deleteRows(block.start, block.count);
+
+    SpreadsheetApp.flush();
+
+    ss.toast(
+      "Order reopened and moved to Product Automation.",
+      "Order Reopened",
+      6
+    );
+
+  } catch (error) {
+    ss.toast(
+      "Reopen failed: " + error.message,
+      "Reopen Error",
+      10
+    );
+
+    console.error(error);
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/* =========================================================
+   6. CLEAN UP OLD INSTALLABLE EDIT TRIGGERS
+   Run once after replacing the old script.
+   The built-in onEdit function remains active.
+   ========================================================= */
+
+function cleanUpOldFMSEditTriggers() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    const handler = trigger.getHandlerFunction();
+
+    if (
+      handler === "onEdit" ||
+      handler === "archiveClosedOrder_" ||
+      handler === "reopenOrderFromArchive_"
+    ) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+
+  ss.toast(
+    "Old duplicate edit triggers removed. Built-in onEdit remains active.",
+    "FMS Setup",
+    6
+  );
+}
+
+
+
