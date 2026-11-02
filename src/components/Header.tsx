@@ -56,20 +56,6 @@ const PRESET_GINZA_ACCOUNTS = [
     role: 'Branch Dispatch & O.N Team',
     branch: 'New Delhi',
     avatarColor: 'bg-blue-600'
-  },
-  {
-    name: 'Lalit Maroo',
-    email: 'lalit.maroo@ginzalimited.com',
-    role: 'Sales Manager (Delhi)',
-    branch: 'Delhi Branch',
-    avatarColor: 'bg-indigo-600'
-  },
-  {
-    name: 'Viren Shah',
-    email: 'viren.shah@ginzalimited.com',
-    role: 'Order Approval Authority',
-    branch: 'HO Surat',
-    avatarColor: 'bg-purple-600'
   }
 ];
 
@@ -132,7 +118,7 @@ export const Header: React.FC<HeaderProps> = ({
   const [newInviteEmail, setNewInviteEmail] = useState('');
   const [copiedGitCmd, setCopiedGitCmd] = useState(false);
 
-  // Live Connected Team Member IDs (Google Sheets-style real-time presence)
+  // Live Connected Team Member IDs (Google Sheets-style real-time presence - M, T, D)
   const [connectedUsers, setConnectedUsers] = useState<ConnectedUser[]>([
     {
       id: 'usr_active_you',
@@ -163,26 +149,6 @@ export const Header: React.FC<HeaderProps> = ({
       status: 'editing',
       activeCell: 'Col 27 (Order No)',
       avatarColor: 'bg-blue-600'
-    },
-    {
-      id: 'usr_lalit',
-      name: 'Lalit Maroo',
-      email: 'lalit.maroo@ginzalimited.com',
-      role: 'Sales Manager (Delhi)',
-      branch: 'Delhi Branch',
-      status: 'editing',
-      activeCell: 'PO 5277 (Col S)',
-      avatarColor: 'bg-indigo-600'
-    },
-    {
-      id: 'usr_viren',
-      name: 'Viren Shah',
-      email: 'viren.shah@ginzalimited.com',
-      role: 'Order Approval Authority',
-      branch: 'HO Surat',
-      status: 'active',
-      activeCell: 'Col V (Approval)',
-      avatarColor: 'bg-purple-600'
     }
   ]);
 

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { GroupedOrder, ProductOrderRow, OrderItem } from '../types/fms';
 import { initialRawResponses, initialExistingDispatch, fmsColumnMapping, productOrderColumns } from '../data/sampleOrders';
-import { ProductOrderView, isDateOrTimestampStr, DEFAULT_BRANCH_HEAD_NAME, DEFAULT_BRANCH_HEAD_EMAIL } from './ProductOrderView';
+import { ProductOrderView, isDateOrTimestampStr, DEFAULT_BRANCH_HEAD_NAME, DEFAULT_BRANCH_HEAD_EMAIL, MONTH_OPTIONS, parseOrderDateParts } from './ProductOrderView';
 import { saveOrdersToStorage, loadOrdersFromStorage, clearOrdersFromStorage } from '../utils/orderStorage';
 import {
   RotateCcw,
@@ -54,7 +54,8 @@ import {
   Loader2,
   Link2,
   ChevronLeft,
-  ChevronRight
+  ChevronRight,
+  Calendar
 } from 'lucide-react';
 
 const LOCAL_STORAGE_KEY = 'ginza_fms_sheet_orders_v9';
@@ -143,15 +144,22 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     return initialRawResponses.map(sanitizeProductOrderRow);
   });
 
+  // Guard so initial 14 sample rows never overwrite a large 6,000+ row IndexedDB dataset before async hydration finishes
+  const isStorageHydratedRef = useRef<boolean>(false);
+
   // Load larger datasets (6,000+ rows) from IndexedDB on initial mount and sanitize any legacy date-in-OrderNo or blank Branch Head fields
   useEffect(() => {
-    loadOrdersFromStorage().then((saved) => {
-      if (saved && Array.isArray(saved) && saved.length > 0) {
-        const cleaned = saved.map(sanitizeProductOrderRow);
-        setRawResponses(cleaned);
-        saveOrdersToStorage(cleaned);
-      }
-    });
+    loadOrdersFromStorage()
+      .then((saved) => {
+        if (saved && Array.isArray(saved) && saved.length > 0) {
+          const cleaned = saved.map(sanitizeProductOrderRow);
+          setRawResponses(cleaned);
+          saveOrdersToStorage(cleaned);
+        }
+      })
+      .finally(() => {
+        isStorageHydratedRef.current = true;
+      });
   }, []);
 
   // State for user-entered dispatch quantities in Col Y
@@ -403,6 +411,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   // Status Filter in Toolbar
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'Open' | 'In-Progress' | 'Closed'>('ALL');
 
+  // Month & Year Filter for Order Automation / Closed Orders tabs
+  const [automationMonth, setAutomationMonth] = useState<string>('ALL');
+  const [automationYear, setAutomationYear] = useState<string>('ALL');
+
   // View mode: 'merged' (Customer A-E & N-X Vertically Merged) vs 'unmerged' (Flat row-wise)
   const [viewMode, setViewMode] = useState<'merged' | 'unmerged'>('merged');
 
@@ -431,6 +443,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
   // Debounced safe saving to IndexedDB (supports 10,000+ items without 3,000 cap)
   useEffect(() => {
+    if (!isStorageHydratedRef.current) return;
     const timer = setTimeout(() => {
       // 1. Save entire array to IndexedDB (no 3,000 cap, supports 10,000+ rows)
       saveOrdersToStorage(rawResponses);
@@ -520,10 +533,14 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       }
     });
 
-    // 2. Group ONLY consecutive rows belonging to the same order so row order & count match Google Sheets 1:1
+    // 2. Group consecutive rows belonging to the same customer order into Vertically Merged Order Blocks ("Merged Visual View")
     const result: GroupedOrder[] = [];
     let lastGroup: GroupedOrder | null = null;
-    let lastMergeSignature = '';
+    let lastBucket = '';
+    let lastNormCust = '';
+    let lastNormPO = '';
+    let lastNormDate = '';
+    let lastNormOrdNo = '';
 
     rawResponses.forEach((row, idx) => {
       const baseOrderKey = [
@@ -534,19 +551,33 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         row.orderDate
       ].map(v => (v || '').trim()).join('_');
 
-      const tabBucket = row.sheetSource || (row.statusAN === 'Closed' ? 'closed' : 'automation');
+      const normBucket = row.sheetSource === 'closed' || row.statusAN === 'Closed' ? 'closed' : 'active';
       const poClean = (row.customerPO || '').trim();
+      const normPO = ['n/a', '-', 'nil', 'na'].includes(poClean.toLowerCase()) ? '' : poClean.toLowerCase();
       const ordNoClean = (row.orderNo || '').trim();
+      const normOrdNo = ordNoClean.toLowerCase();
       const custClean = (row.customerName || '').trim();
+      const normCust = custClean.toLowerCase();
       const dateClean = (row.orderDate || '').trim();
+      const normDate = dateClean.toLowerCase();
 
-      // Consecutive rows merge ONLY if they share the same tab bucket, status, customer, date, PO, and Order No
-      const mergeSignature = `${tabBucket}__${row.statusAN || 'Open'}__${poClean}__${custClean}__${dateClean}__${ordNoClean}`;
-      const canMergeWithPrevious =
+      // Merge if continuation sub-row (blank customer name with item data) OR consecutive row for same Customer + PO + Date
+      const isContinuationSubRow =
         lastGroup !== null &&
-        lastMergeSignature === mergeSignature &&
-        custClean !== '' &&
-        (poClean !== '' || ordNoClean !== '');
+        lastBucket === normBucket &&
+        normCust === '' &&
+        Boolean((row.itemName && row.itemName.trim() !== '') || row.qty);
+
+      const isSameCustomerOrderBlock =
+        lastGroup !== null &&
+        lastBucket === normBucket &&
+        normCust !== '' &&
+        lastNormCust === normCust &&
+        lastNormPO === normPO &&
+        lastNormDate === normDate &&
+        (lastNormOrdNo === normOrdNo || lastNormOrdNo === '' || normOrdNo === '');
+
+      const canMergeWithPrevious = isContinuationSubRow || isSameCustomerOrderBlock;
 
       const dupSig = buildDupSig(row);
       const dupTotal = dupSig ? (sigCounts[dupSig] || 1) : 1;
@@ -580,24 +611,68 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           orderNo: row.orderNo || '',
           orderNoTimestamp: row.orderNoTimestamp || '',
           statusAN: (row.statusAN as any) || 'Open',
-          sheetSource: row.sheetSource
+          sheetSource: row.sheetSource,
+          colAA: row.colAA,
+          colAB: row.colAB,
+          colAC: row.colAC,
+          colAD: row.colAD,
+          colAE: row.colAE,
+          colAG: row.colAG,
+          colAH: row.colAH,
+          colAI: row.colAI,
+          colAJ: row.colAJ,
+          colAK: row.colAK,
+          colAL: row.colAL,
+          lrNumber: row.lrNumber,
+          colAO: row.colAO
         };
         // Keep baseOrderKey for operational state lookups, or unique if blank
         if (!baseOrderKey.replace(/_/g, '')) {
           lastGroup.orderKey = uniqueOrderKey;
         }
         result.push(lastGroup);
-        lastMergeSignature = mergeSignature;
+        lastBucket = normBucket;
+        lastNormCust = normCust;
+        lastNormPO = normPO;
+        lastNormDate = normDate;
+        lastNormOrdNo = normOrdNo;
       } else {
         if (!lastGroup.orderNo && row.orderNo) {
           lastGroup.orderNo = row.orderNo;
           lastGroup.orderNoTimestamp = row.orderNoTimestamp;
+          lastNormOrdNo = normOrdNo;
         }
+        if (!lastGroup.colAA && row.colAA) lastGroup.colAA = row.colAA;
+        if (!lastGroup.colAB && row.colAB) lastGroup.colAB = row.colAB;
+        if (!lastGroup.colAC && row.colAC) lastGroup.colAC = row.colAC;
+        if (!lastGroup.colAD && row.colAD) lastGroup.colAD = row.colAD;
+        if (!lastGroup.colAE && row.colAE) lastGroup.colAE = row.colAE;
+        if (lastGroup.colAG === undefined && row.colAG !== undefined) lastGroup.colAG = row.colAG;
+        if (!lastGroup.colAH && row.colAH) lastGroup.colAH = row.colAH;
+        if (!lastGroup.colAI && row.colAI) lastGroup.colAI = row.colAI;
+        if (lastGroup.colAJ === undefined && row.colAJ !== undefined) lastGroup.colAJ = row.colAJ;
+        if (!lastGroup.colAK && row.colAK) lastGroup.colAK = row.colAK;
+        if (!lastGroup.colAL && row.colAL) lastGroup.colAL = row.colAL;
+        if (!lastGroup.lrNumber && row.lrNumber) lastGroup.lrNumber = row.lrNumber;
+        if (!lastGroup.colAO && row.colAO) lastGroup.colAO = row.colAO;
       }
 
       const itemKey = `${lastGroup.orderKey}___${(row.itemName || '').trim()}___${(row.color || '').trim()}___${(row.width || '').trim()}`;
-      const dispatch = dispatchRecords[itemKey] !== undefined ? dispatchRecords[itemKey] : (row.dispatchQty || 0);
-      const balance = Number(((row.qty || 0) - dispatch).toFixed(4));
+      const dispatch =
+        dispatchRecords[row.orderId] !== undefined
+          ? dispatchRecords[row.orderId]
+          : row.dispatchQty !== undefined && row.dispatchQty !== null
+          ? row.dispatchQty
+          : dispatchRecords[itemKey] !== undefined
+          ? dispatchRecords[itemKey]
+          : 0;
+      const balance =
+        row.balanceQty !== undefined &&
+        row.balanceQty !== null &&
+        dispatchRecords[row.orderId] === undefined &&
+        dispatchRecords[itemKey] === undefined
+          ? row.balanceQty
+          : Number(((row.qty || 0) - dispatch).toFixed(4));
 
       lastGroup.items.push({
         id: row.orderId,
@@ -652,8 +727,22 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
     setDispatchRecords(prev => ({
       ...prev,
+      [item.id]: val,
       [itemKey]: val
     }));
+
+    setRawResponses(prev =>
+      prev.map(row => {
+        if (row.orderId === item.id) {
+          return {
+            ...row,
+            dispatchQty: val,
+            balanceQty: Number(((row.qty || 0) - val).toFixed(4))
+          };
+        }
+        return row;
+      })
+    );
   };
 
   // Delete an entire order
@@ -850,7 +939,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }
   };
 
-  // Generate or assign Order No for a row in Product Order sheet
+  // Generate or assign Order No for a row in Product Order sheet (and sync across all items of that same Customer Order block)
   const handleGenerateOrderNo = (orderId: string, customNo?: string) => {
     const generatedNo = (customNo && customNo.trim() !== '')
       ? customNo.trim()
@@ -858,23 +947,42 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     const nowStr = new Date().toLocaleString('en-IN');
     let affectedItem = '';
 
-    setRawResponses(prev =>
-      prev.map(row => {
-        if (row.orderId === orderId) {
-          affectedItem = row.itemName;
+    setRawResponses(prev => {
+      const targetRow = prev.find(r => r.orderId === orderId);
+      const targetCust = (targetRow?.customerName || '').trim().toLowerCase();
+      const targetPO = ['n/a', '-', 'nil', 'na'].includes((targetRow?.customerPO || '').trim().toLowerCase())
+        ? ''
+        : (targetRow?.customerPO || '').trim().toLowerCase();
+      const targetDate = (targetRow?.orderDate || '').trim().toLowerCase();
+
+      return prev.map(row => {
+        const rowCust = (row.customerName || '').trim().toLowerCase();
+        const rowPO = ['n/a', '-', 'nil', 'na'].includes((row.customerPO || '').trim().toLowerCase())
+          ? ''
+          : (row.customerPO || '').trim().toLowerCase();
+        const rowDate = (row.orderDate || '').trim().toLowerCase();
+        const isSiblingOfSameOrder =
+          targetCust !== '' &&
+          rowCust === targetCust &&
+          rowPO === targetPO &&
+          rowDate === targetDate &&
+          (!row.orderNo || row.orderNo.trim() === '');
+
+        if (row.orderId === orderId || isSiblingOfSameOrder) {
+          if (row.orderId === orderId) affectedItem = row.itemName;
           return {
             ...row,
             orderNo: generatedNo,
             orderNoTimestamp: nowStr,
-            statusAN: row.statusAN || 'Open' // By default, status in Col AN is Open
+            statusAN: row.statusAN || 'Open'
           };
         }
         return row;
-      })
-    );
+      });
+    });
 
     setSyncFeedback(
-      `Order No "${generatedNo}" assigned for ${affectedItem || orderId}! Order flowed into "Product Automation (Active Orders)" with Col AN default "Open".`
+      `Order No "${generatedNo}" assigned for ${affectedItem || orderId}! Merged order block updated in "Order Automation".`
     );
     setTimeout(() => setSyncFeedback(null), 4500);
   };
@@ -1339,6 +1447,19 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     let currentBranch = '';
     let currentOrderNo = '';
     let currentRemark = '';
+    let currentColAA = '';
+    let currentColAB = '';
+    let currentColAC = '';
+    let currentColAD = '';
+    let currentColAE = '';
+    let currentColAG: boolean | undefined = undefined;
+    let currentColAH = '';
+    let currentColAI = '';
+    let currentColAJ: boolean | undefined = undefined;
+    let currentColAK = '';
+    let currentColAL = '';
+    let currentLrNumber = '';
+    let currentColAO = '';
 
     const tabLower = importTabName.toLowerCase().trim();
     const labelLower = sourceLabel.toLowerCase().trim();
@@ -1515,12 +1636,55 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             currentBranch = rawColW;
             currentOrderNo = rawColX;
           }
+
+          currentColAA = (cols[26] || '').trim();
+          currentColAB = (cols[27] || '').trim();
+          currentColAC = (cols[28] || '').trim();
+          currentColAD = (cols[29] || '').trim();
+          currentColAE = (cols[30] || '').trim();
+          if (cols[32] && cols[32].trim() !== '') {
+            const v = cols[32].toLowerCase().trim();
+            currentColAG = v === 'true' || v === 'yes' || v === '1' || v === 'done' || v === '✓';
+          } else {
+            currentColAG = undefined;
+          }
+          currentColAH = (cols[33] || '').trim();
+          currentColAI = (cols[34] || '').trim();
+          if (cols[35] && cols[35].trim() !== '') {
+            const v = cols[35].toLowerCase().trim();
+            currentColAJ = v === 'true' || v === 'yes' || v === '1' || v === 'done' || v === '✓';
+          } else {
+            currentColAJ = undefined;
+          }
+          currentColAK = (cols[36] || '').trim();
+          currentColAL = (cols[37] || '').trim();
+          currentLrNumber = (cols[38] || '').trim();
+          currentColAO = (cols[40] || '').trim();
         } else {
           // Merged continuation sub-row of the current order: only update if sub-row explicitly has a non-empty value
           if (cols[14] && cols[14].trim() !== '') currentRemark = cols[14].trim();
           if (cols[23] && cols[23].trim() !== '' && !isTimestampLike(cols[23].trim())) {
             currentOrderNo = cols[23].trim();
           }
+          if (cols[26] && cols[26].trim() !== '') currentColAA = cols[26].trim();
+          if (cols[27] && cols[27].trim() !== '') currentColAB = cols[27].trim();
+          if (cols[28] && cols[28].trim() !== '') currentColAC = cols[28].trim();
+          if (cols[29] && cols[29].trim() !== '') currentColAD = cols[29].trim();
+          if (cols[30] && cols[30].trim() !== '') currentColAE = cols[30].trim();
+          if (cols[32] && cols[32].trim() !== '') {
+            const v = cols[32].toLowerCase().trim();
+            currentColAG = v === 'true' || v === 'yes' || v === '1' || v === 'done' || v === '✓';
+          }
+          if (cols[33] && cols[33].trim() !== '') currentColAH = cols[33].trim();
+          if (cols[34] && cols[34].trim() !== '') currentColAI = cols[34].trim();
+          if (cols[35] && cols[35].trim() !== '') {
+            const v = cols[35].toLowerCase().trim();
+            currentColAJ = v === 'true' || v === 'yes' || v === '1' || v === 'done' || v === '✓';
+          }
+          if (cols[36] && cols[36].trim() !== '') currentColAK = cols[36].trim();
+          if (cols[37] && cols[37].trim() !== '') currentColAL = cols[37].trim();
+          if (cols[38] && cols[38].trim() !== '') currentLrNumber = cols[38].trim();
+          if (cols[40] && cols[40].trim() !== '') currentColAO = cols[40].trim();
         }
 
         const timestamp = currentTimestamp;
@@ -1533,9 +1697,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const color = (cols[7] || '').trim();
         const width = (cols[8] || '').trim();
         const unitOfItem = (cols[9] || '').trim();
-        const qty = cols[10] ? (parseFloat(cols[10].replace(/,/g, '')) || 0) : 0;
-        const rate = cols[11] ? (parseFloat(cols[11].replace(/[₹,\s]/g, '')) || 0) : 0;
-        const discount = cols[12] ? (parseFloat(cols[12].replace(/[%,\s]/g, '')) || 0) : 0;
+        const qty = cols[10] ? (parseFloat(cols[10].replace(/[^0-9.-]/g, '')) || 0) : 0;
+        const rate = cols[11] ? (parseFloat(cols[11].replace(/[^0-9.-]/g, '')) || 0) : 0;
+        const discount = cols[12] ? (parseFloat(cols[12].replace(/[^0-9.-]/g, '')) || 0) : 0;
         const deliveryDate = (cols[13] || '').trim();
         const remark = currentRemark;
         const phone = currentPhone;
@@ -1547,10 +1711,11 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const approvalStatus = currentApproval;
         const branch = currentBranch;
         const orderNo = currentOrderNo;
-        const dispatchQty = cols[24] ? (parseFloat(cols[24].replace(/,/g, '')) || 0) : 0;
-        const balanceQty = cols[25] && cols[25].trim() !== ''
-          ? (parseFloat(cols[25].replace(/,/g, '')) || 0)
-          : Math.max(0, Number((qty - dispatchQty).toFixed(4)));
+        const dispatchQty = cols[24] ? (parseFloat(cols[24].replace(/[^0-9.-]/g, '')) || 0) : 0;
+        const balanceQty =
+          cols[25] && cols[25].trim() !== ''
+            ? (parseFloat(cols[25].replace(/[^0-9.-]/g, '')) || 0)
+            : Math.max(0, Number((qty - dispatchQty).toFixed(4)));
 
         const rawStatus = (cols[39] || '').toLowerCase().trim();
         let statusAN: 'Open' | 'In-Progress' | 'Closed' = 'Open';
@@ -1567,23 +1732,17 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const targetSource: 'automation' | 'closed' = isClosedTabImport ? 'closed' : 'automation';
         const orderKey = [po, custName, email, phone, date].map(v => (v || '').trim()).join('_');
 
-        if (cols[26] && cols[26].trim()) newColAA[orderKey] = cols[26].trim();
-        if (cols[27] && cols[27].trim()) newColAB[orderKey] = cols[27].trim();
-        if (cols[30] && cols[30].trim()) newAeStatuses[orderKey] = cols[30].trim();
-        if (cols[32] && cols[32].trim()) {
-          const v = cols[32].toLowerCase().trim();
-          newColAG[orderKey] = v === 'true' || v === 'yes' || v === '1' || v === 'done';
-        }
-        if (cols[33] && cols[33].trim()) newColAH[orderKey] = cols[33].trim();
-        if (cols[34] && cols[34].trim()) newColAI[orderKey] = cols[34].trim();
-        if (cols[35] && cols[35].trim()) {
-          const v = cols[35].toLowerCase().trim();
-          newColAJ[orderKey] = v === 'true' || v === 'yes' || v === '1' || v === 'done';
-        }
-        if (cols[36] && cols[36].trim()) newColAK[orderKey] = cols[36].trim();
-        if (cols[37] && cols[37].trim()) newColAL[orderKey] = cols[37].trim();
-        if (cols[38] && cols[38].trim()) newLrNumbers[orderKey] = cols[38].trim();
-        if (cols[40] && cols[40].trim()) newAoStatuses[orderKey] = cols[40].trim();
+        if (currentColAA) newColAA[orderKey] = currentColAA;
+        if (currentColAB) newColAB[orderKey] = currentColAB;
+        if (currentColAE) newAeStatuses[orderKey] = currentColAE;
+        if (currentColAG !== undefined) newColAG[orderKey] = currentColAG;
+        if (currentColAH) newColAH[orderKey] = currentColAH;
+        if (currentColAI) newColAI[orderKey] = currentColAI;
+        if (currentColAJ !== undefined) newColAJ[orderKey] = currentColAJ;
+        if (currentColAK) newColAK[orderKey] = currentColAK;
+        if (currentColAL) newColAL[orderKey] = currentColAL;
+        if (currentLrNumber) newLrNumbers[orderKey] = currentLrNumber;
+        if (currentColAO) newAoStatuses[orderKey] = currentColAO;
 
         newItems.push(
           sanitizeProductOrderRow({
@@ -1619,20 +1778,41 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             statusAN: statusAN,
             dispatchQty: dispatchQty,
             balanceQty: balanceQty,
-            sheetSource: targetSource
+            sheetSource: targetSource,
+            colAA: currentColAA || undefined,
+            colAB: currentColAB || undefined,
+            colAC: currentColAC || undefined,
+            colAD: currentColAD || undefined,
+            colAE: currentColAE || undefined,
+            colAG: currentColAG,
+            colAH: currentColAH || undefined,
+            colAI: currentColAI || undefined,
+            colAJ: currentColAJ,
+            colAK: currentColAK || undefined,
+            colAL: currentColAL || undefined,
+            lrNumber: currentLrNumber || undefined,
+            colAO: currentColAO || undefined
           })
         );
       }
     });
 
     if (newItems.length > 0) {
+      isStorageHydratedRef.current = true;
       const importedSource = newItems[0].sheetSource || 'automation';
       let mergedFinalRows: ProductOrderRow[] = [];
 
       if (importReplaceMode) {
-        // IMPORTANT: Replace ONLY the rows belonging to the imported tab so other tabs never lose their data!
+        // Clear stale manual dispatch overrides so Google Sheet Col Y values display 1:1
+        setDispatchRecords({});
+        try {
+          localStorage.removeItem(LOCAL_STORAGE_DISPATCH_KEY);
+        } catch (e) {}
+
+        // Replace ONLY the rows belonging to the imported tab (and remove initial sample ORD-* demo rows) so other tabs never lose their data!
         setRawResponses(prev => {
           const otherTabRows = prev.filter(r => {
+            if (/^ORD-(REAL|NANDANI|PENDING|\d+)/.test(r.orderId)) return false; // Strip initial demo rows once real sheet data is imported
             const rSource = r.sheetSource || (r.statusAN === 'Closed' ? 'closed' : 'automation');
             return rSource !== importedSource;
           });
@@ -1786,27 +1966,58 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   };
 
   // Dedicated Live Sync for =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")
-  // Preserves existing Col 27 (Order No) & Col 28 (Timestamp) and appends new orders at the bottom!
-  const handleSyncDelhiImportRange = async () => {
+  // Loads 100% Total Orders from Delhi!A:Z into Product Order and flows them into Order Automation in Merged Visual View!
+  const handleSyncDelhiImportRange = async (silent: boolean = false) => {
     const delhiSheetId = '1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY';
     const delhiTab = 'Delhi';
-    setIsSyncingImportRange(true);
-    setSyncFeedback('Syncing =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")...');
+    if (!silent) {
+      setIsSyncingImportRange(true);
+      setSyncFeedback('Syncing =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")...');
+    }
 
-    const gvizUrl = `https://docs.google.com/spreadsheets/d/${delhiSheetId}/gviz/tq?tqx=out:csv&range=A:Z&sheet=${encodeURIComponent(delhiTab)}`;
+    const candidateUrls = [
+      `https://docs.google.com/spreadsheets/d/${delhiSheetId}/gviz/tq?tqx=out:csv&range=A:Z&sheet=${encodeURIComponent(delhiTab)}`,
+      `https://docs.google.com/spreadsheets/d/15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent('Product Order')}`
+    ];
 
     try {
-      const resp = await fetch(gvizUrl);
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
+      let csvText = '';
+      for (const url of candidateUrls) {
+        try {
+          const resp = await fetch(url);
+          if (resp.ok) {
+            const text = await resp.text();
+            if (text && text.trim().length > 0 && !text.startsWith('<!DOCTYPE html>') && !text.includes('<html')) {
+              csvText = text;
+              break;
+            }
+          }
+        } catch (e) {}
       }
-      const csvText = await resp.text();
-      if (!csvText || csvText.trim().length === 0 || csvText.startsWith('<!DOCTYPE html>') || csvText.includes('<html')) {
+
+      if (!csvText) {
         throw new Error('Sheet access restricted or requires link sharing.');
       }
 
       const parsedRows = parseCsvRows(csvText.trim());
       const fetchedRows: ProductOrderRow[] = [];
+
+      let lastTimestamp = '';
+      let lastPO = 'N/A';
+      let lastCustName = '';
+      let lastEmail = '';
+      let lastDate = '';
+      let lastRemark = '';
+      let lastPhone = '';
+      let lastBilling = '';
+      let lastDelivery = '';
+      let lastTransporter = '';
+      let lastSales = '';
+      let lastAccountStatus = '';
+      let lastBranch = 'Delhi';
+      let lastApproval = '';
+      let lastHeadName = DEFAULT_BRANCH_HEAD_NAME;
+      let lastHeadEmail = DEFAULT_BRANCH_HEAD_EMAIL;
 
       parsedRows.forEach((cols, index) => {
         const firstColLower = (cols[0] || '').toLowerCase().trim();
@@ -1827,45 +2038,64 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const offset = startsWithTimestamp ? 0 : 1;
 
         const refNo = startsWithTimestamp ? '' : (cols[0] || '').trim();
-        const timestamp = (cols[offset] || '').trim();
-        const po = (cols[offset + 1] || '').trim();
-        const custName = (cols[offset + 2] || '').trim();
-        const email = (cols[offset + 3] || '').trim();
-        const date = (cols[offset + 4] || '').trim();
+        const rawTimestamp = (cols[offset] || '').trim();
+        const rawPO = (cols[offset + 1] || '').trim();
+        const rawCustName = (cols[offset + 2] || '').trim();
+        const rawEmail = (cols[offset + 3] || '').trim();
+        const rawDate = (cols[offset + 4] || '').trim();
         const unit = (cols[offset + 5] || '').trim();
         const itemName = (cols[offset + 6] || '').trim();
         const color = (cols[offset + 7] || '').trim();
         const width = (cols[offset + 8] || '').trim();
         const unitOfItem = (cols[offset + 9] || '').trim();
-        const qty = cols[offset + 10] ? (parseFloat(cols[offset + 10].replace(/,/g, '')) || 0) : 0;
-        const rate = cols[offset + 11] ? (parseFloat(cols[offset + 11].replace(/[₹,\s]/g, '')) || 0) : 0;
-        const discount = cols[offset + 12] ? (parseFloat(cols[offset + 12].replace(/[%,\s]/g, '')) || 0) : 0;
+        const qty = cols[offset + 10] ? (parseFloat(cols[offset + 10].replace(/[^0-9.-]/g, '')) || 0) : 0;
+        const rate = cols[offset + 11] ? (parseFloat(cols[offset + 11].replace(/[^0-9.-]/g, '')) || 0) : 0;
+        const discount = cols[offset + 12] ? (parseFloat(cols[offset + 12].replace(/[^0-9.-]/g, '')) || 0) : 0;
         const deliveryDate = (cols[offset + 13] || '').trim();
-        const remark = (cols[offset + 14] || '').trim();
-        const phone = (cols[offset + 15] || '').trim();
-        const billing = (cols[offset + 16] || '').trim();
-        const delivery = (cols[offset + 17] || '').trim();
-        const transporter = (cols[offset + 18] || '').trim();
-        const sales = (cols[offset + 19] || '').trim();
-        const accountStatus = (cols[offset + 20] || '').trim();
-        const branch = (cols[offset + 21] || '').trim();
-        const approvalStatus = (cols[offset + 22] || '').trim();
-        const branchHeadName = (cols[offset + 23] || '').trim();
-        const branchHeadEmail = (cols[offset + 24] || '').trim();
+        const rawRemark = (cols[offset + 14] || '').trim();
+        const rawPhone = (cols[offset + 15] || '').trim();
+        const rawBilling = (cols[offset + 16] || '').trim();
+        const rawDelivery = (cols[offset + 17] || '').trim();
+        const rawTransporter = (cols[offset + 18] || '').trim();
+        const rawSales = (cols[offset + 19] || '').trim();
+        const rawAccountStatus = (cols[offset + 20] || '').trim();
+        const rawBranch = (cols[offset + 21] || '').trim();
+        const rawApproval = (cols[offset + 22] || '').trim();
+        const rawHeadName = (cols[offset + 23] || '').trim();
+        const rawHeadEmail = (cols[offset + 24] || '').trim();
         const orderNo = (cols[offset + 25] || '').trim();
         const orderNoTimestamp = (cols[offset + 26] || '').trim();
 
-        if (!custName && !itemName && !refNo && !po) return;
+        if (!rawCustName && !itemName && !refNo && !rawPO && !qty) return;
+
+        if (rawCustName) {
+          lastTimestamp = rawTimestamp;
+          lastPO = rawPO || 'N/A';
+          lastCustName = rawCustName;
+          lastEmail = rawEmail;
+          lastDate = rawDate;
+          lastRemark = rawRemark;
+          lastPhone = rawPhone;
+          lastBilling = rawBilling;
+          lastDelivery = rawDelivery;
+          lastTransporter = rawTransporter;
+          lastSales = rawSales;
+          lastAccountStatus = rawAccountStatus;
+          lastBranch = rawBranch || 'Delhi';
+          lastApproval = rawApproval;
+          lastHeadName = rawHeadName || DEFAULT_BRANCH_HEAD_NAME;
+          lastHeadEmail = rawHeadEmail || DEFAULT_BRANCH_HEAD_EMAIL;
+        }
 
         fetchedRows.push(
           sanitizeProductOrderRow({
-            orderId: `DELHI-${index + 1}-${Date.now().toString(36)}`,
+            orderId: `DELHI-${index + 1}`,
             referenceNo: refNo,
-            timestamp: timestamp,
-            customerPO: po || 'N/A',
-            customerName: custName,
-            customerEmail: email,
-            orderDate: date,
+            timestamp: rawCustName ? rawTimestamp : lastTimestamp,
+            customerPO: rawCustName ? (rawPO || 'N/A') : lastPO,
+            customerName: rawCustName || lastCustName,
+            customerEmail: rawCustName ? rawEmail : lastEmail,
+            orderDate: rawCustName ? rawDate : lastDate,
             unit,
             itemName,
             color,
@@ -1875,17 +2105,17 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             rate,
             discount,
             deliveryDate,
-            remark,
-            customerNumber: phone,
-            billingAddress: billing,
-            deliveryAddress: delivery,
-            transporterName: transporter,
-            salesPerson: sales,
-            accountStatus,
-            branch: branch || 'Delhi',
-            approvalStatus,
-            branchHeadName: branchHeadName || DEFAULT_BRANCH_HEAD_NAME,
-            branchHeadEmail: branchHeadEmail || DEFAULT_BRANCH_HEAD_EMAIL,
+            remark: rawRemark || lastRemark,
+            customerNumber: rawCustName ? rawPhone : lastPhone,
+            billingAddress: rawCustName ? rawBilling : lastBilling,
+            deliveryAddress: rawCustName ? rawDelivery : lastDelivery,
+            transporterName: rawCustName ? rawTransporter : lastTransporter,
+            salesPerson: rawCustName ? rawSales : lastSales,
+            accountStatus: rawCustName ? rawAccountStatus : lastAccountStatus,
+            branch: (rawCustName ? rawBranch : lastBranch) || 'Delhi',
+            approvalStatus: rawCustName ? rawApproval : lastApproval,
+            branchHeadName: (rawCustName ? rawHeadName : lastHeadName) || DEFAULT_BRANCH_HEAD_NAME,
+            branchHeadEmail: (rawCustName ? rawHeadEmail : lastHeadEmail) || DEFAULT_BRANCH_HEAD_EMAIL,
             orderNo,
             orderNoTimestamp,
             statusAN: 'Open',
@@ -1900,56 +2130,100 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         throw new Error('No valid rows found in Delhi!A:Z');
       }
 
-      let addedNewCount = 0;
+      isStorageHydratedRef.current = true;
       setRawResponses(prev => {
-        // Build lookup map of existing rows to preserve generated Order No (Col 27) & Timestamp (Col 28)
-        const existingBySig = new Map<string, ProductOrderRow>();
-        prev.forEach(r => {
-          const sig = r.referenceNo
-            ? `REF:${r.referenceNo.trim()}_${r.itemName.trim()}_${r.qty}`
-            : `KEY:${(r.customerPO || '').trim()}_${(r.customerName || '').trim()}_${(r.itemName || '').trim()}_${r.qty}_${(r.orderDate || '').trim()}`;
-          existingBySig.set(sig, r);
+        // Strip initial demo rows
+        const cleanPrev = prev.filter(r => !/^ORD-(REAL|NANDANI|PENDING|\d+)/.test(r.orderId));
+
+        // Build lookup map of existing rows to preserve any assigned Order No, Dispatch Qnt (Col Y), and Cols AA-AO
+        const existingQueueByKey = new Map<string, ProductOrderRow[]>();
+        cleanPrev.forEach(r => {
+          const k = `${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${r.qty}|${(r.orderDate || '').trim().toLowerCase()}`;
+          const list = existingQueueByKey.get(k) || [];
+          list.push(r);
+          existingQueueByKey.set(k, list);
         });
 
-        const nextRows: ProductOrderRow[] = [...prev];
-        fetchedRows.forEach(fRow => {
-          const sig = fRow.referenceNo
-            ? `REF:${fRow.referenceNo.trim()}_${fRow.itemName.trim()}_${fRow.qty}`
-            : `KEY:${(fRow.customerPO || '').trim()}_${(fRow.customerName || '').trim()}_${(fRow.itemName || '').trim()}_${fRow.qty}_${(fRow.orderDate || '').trim()}`;
-
-          if (!existingBySig.has(sig)) {
-            addedNewCount++;
-            nextRows.push(fRow); // Append new orders at the bottom!
+        const mergedDelhiRows: ProductOrderRow[] = fetchedRows.map(fRow => {
+          const k = `${(fRow.customerName || '').trim().toLowerCase()}|${(fRow.itemName || '').trim().toLowerCase()}|${fRow.qty}|${(fRow.orderDate || '').trim().toLowerCase()}`;
+          const candidates = existingQueueByKey.get(k);
+          const match = candidates && candidates.length > 0 ? candidates.shift() : undefined;
+          if (match) {
+            return {
+              ...fRow,
+              orderNo: fRow.orderNo || match.orderNo || '',
+              orderNoTimestamp: fRow.orderNoTimestamp || match.orderNoTimestamp || '',
+              statusAN: match.statusAN || fRow.statusAN || 'Open',
+              dispatchQty: match.dispatchQty ?? fRow.dispatchQty ?? 0,
+              balanceQty: match.balanceQty ?? fRow.balanceQty ?? fRow.qty,
+              colAA: match.colAA ?? fRow.colAA,
+              colAB: match.colAB ?? fRow.colAB,
+              colAC: match.colAC ?? fRow.colAC,
+              colAD: match.colAD ?? fRow.colAD,
+              colAE: match.colAE ?? fRow.colAE,
+              colAG: match.colAG ?? fRow.colAG,
+              colAH: match.colAH ?? fRow.colAH,
+              colAI: match.colAI ?? fRow.colAI,
+              colAJ: match.colAJ ?? fRow.colAJ,
+              colAK: match.colAK ?? fRow.colAK,
+              colAL: match.colAL ?? fRow.colAL,
+              lrNumber: match.lrNumber ?? fRow.lrNumber,
+              colAO: match.colAO ?? fRow.colAO
+            };
           }
+          return fRow;
         });
 
-        // If the sheet was completely cleared (0 rows), load all fetched rows in order
-        if (prev.length === 0) {
-          return fetchedRows;
+        // Keep any closed orders archive
+        const closedArchiveRows = cleanPrev.filter(r => r.sheetSource === 'closed');
+        const explicitAutoRows = cleanPrev.filter(r => r.sheetSource === 'automation');
+
+        if (explicitAutoRows.length > mergedDelhiRows.length) {
+          // User already imported a full Order Automation 1 sheet; keep explicitAutoRows and only append genuinely new Delhi!A:Z rows not already in explicitAutoRows
+          const autoKeys = new Set(
+            explicitAutoRows.map(
+              r => `${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${r.qty}|${(r.orderDate || '').trim().toLowerCase()}`
+            )
+          );
+          const brandNewDelhiRows = mergedDelhiRows.filter(
+            f => !autoKeys.has(`${(f.customerName || '').trim().toLowerCase()}|${(f.itemName || '').trim().toLowerCase()}|${f.qty}|${(f.orderDate || '').trim().toLowerCase()}`)
+          );
+          return [...explicitAutoRows, ...brandNewDelhiRows, ...closedArchiveRows];
         }
-        return nextRows;
+        return [...mergedDelhiRows, ...closedArchiveRows];
       });
 
-      setSyncFeedback(
-        `✓ IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z") synced! ${
-          addedNewCount > 0 ? `${addedNewCount} new order(s) appended at the bottom.` : `All ${fetchedRows.length} rows up to date.`
-        }`
-      );
-      setTimeout(() => setSyncFeedback(null), 5000);
+      if (!silent) {
+        setSyncFeedback(
+          `✓ IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z") synced! Total ${fetchedRows.length.toLocaleString()} orders loaded in Product Order & merged in Order Automation.`
+        );
+        setTimeout(() => setSyncFeedback(null), 5000);
+      }
     } catch (err: any) {
-      // Open Import Modal pre-filled with Delhi Sheet ID & Tab so user can check sharing or paste
-      setImportSheetId(delhiSheetId);
-      setImportTabName(delhiTab);
-      setImportReplaceMode(false); // Append at bottom
-      setImportError(
-        `Live IMPORTRANGE fetch notice (${err.message}). Make sure Sheet "1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY" (Tab: Delhi) is shared as "Anyone with the link can view", or paste rows below to append at the bottom.`
-      );
-      setShowImportModal(true);
-      setSyncFeedback(null);
+      if (!silent) {
+        setImportSheetId(delhiSheetId);
+        setImportTabName(delhiTab);
+        setImportReplaceMode(false);
+        setImportError(
+          `Live IMPORTRANGE fetch notice (${err.message}). Make sure Sheet "1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY" (Tab: Delhi) is shared as "Anyone with the link can view", or paste rows below to append at the bottom.`
+        );
+        setShowImportModal(true);
+        setSyncFeedback(null);
+      }
     } finally {
-      setIsSyncingImportRange(false);
+      if (!silent) {
+        setIsSyncingImportRange(false);
+      }
     }
   };
+
+  // Automatically sync IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z") once in background after storage hydration
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      handleSyncDelhiImportRange(true);
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, []);
 
   // 1-Click Upload all current Sheet Data to Firebase Realtime Database
   const handleUploadToFirebase = async () => {
@@ -1985,18 +2259,36 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }
   };
 
-  // Filter orders based on activeSheetTab & statusFilter & search & column filters & duplicate filter
+  // Available Years dynamically extracted from orders for Order Automation Month/Year filter
+  const availableAutomationYears = useMemo(() => {
+    const yearsSet = new Set<string>(['2025', '2026']);
+    rawResponses.forEach(r => {
+      const parsed = parseOrderDateParts(r.orderDate, r.timestamp);
+      if (parsed && parsed.year >= 2020 && parsed.year <= 2035) {
+        yearsSet.add(String(parsed.year));
+      }
+    });
+    return Array.from(yearsSet).sort((a, b) => Number(b) - Number(a));
+  }, [rawResponses]);
+
+  // Filter orders based on activeSheetTab & statusFilter & Month/Year filter & search & column filters & duplicate filter
   const filteredOrders = useMemo(() => {
     const result: GroupedOrder[] = [];
 
     groupedOrders.forEach(order => {
-      // If a row originated in Product Order (28-col Delhi!A:Z), it only flows into Product Automation once an Order No is assigned.
-      // However, rows imported directly from "Order Automation 1" / "Product Automation 1" or "Closed Orders" ALWAYS display 1:1 even if Col X is blank!
-      if (order.sheetSource === 'product_order') {
-        if (activeSheetTab === 'automation' || activeSheetTab === 'closed') {
-          if (!order.orderNo || order.orderNo.trim() === '') {
-            return;
-          }
+      // All active orders from Product Order (IMPORTRANGE Delhi!A:Z) and Order Automation flow directly into Order Automation in Merged Visual View format!
+      if (order.sheetSource === 'product_order' && activeSheetTab === 'closed') {
+        if (order.statusAN !== 'Closed') return;
+      }
+
+      // Month & Year Filter on Order Automation / Closed Orders
+      if (automationMonth !== 'ALL' || automationYear !== 'ALL') {
+        const parsed = parseOrderDateParts(order.orderDate, order.timestamp);
+        if (automationMonth !== 'ALL') {
+          if (!parsed || String(parsed.month) !== automationMonth) return;
+        }
+        if (automationYear !== 'ALL') {
+          if (!parsed || String(parsed.year) !== automationYear) return;
         }
       }
 
@@ -2100,7 +2392,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }
 
     return result;
-  }, [groupedOrders, activeSheetTab, statusFilter, searchTerm, colFilters, sortConfig, aeStatuses, aoStatuses, showDuplicatesOnly]);
+  }, [groupedOrders, activeSheetTab, statusFilter, automationMonth, automationYear, searchTerm, colFilters, sortConfig, aeStatuses, aoStatuses, showDuplicatesOnly]);
 
   // Virtual Pagination for Product Automation & Closed Orders to prevent browser crash/freeze
   const [automationPage, setAutomationPage] = useState(1);
@@ -2123,13 +2415,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     return count;
   }, [filteredOrders, safeAutomationPage, automationPageSize]);
 
-  // Dedicated rows for Product Order tab (28-col Delhi!A:Z) so Automation/Closed imports don't pollute Product Order columns
+  // Total Orders for Product Order tab (as per =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z"))
   const productOrderRows = useMemo(() => {
-    const dedicated = rawResponses.filter(r => r.sheetSource === 'product_order');
-    if (dedicated.length > 0) return dedicated;
-    // Fallback to rows without explicit automation/closed source (e.g. initial sample data)
-    const nonAuto = rawResponses.filter(r => !r.sheetSource);
-    return nonAuto.length > 0 ? nonAuto : rawResponses;
+    const activeRows = rawResponses.filter(r => r.sheetSource !== 'closed' && r.statusAN !== 'Closed');
+    return activeRows.length > 0 ? activeRows : rawResponses;
   }, [rawResponses]);
 
   // Aggregate metrics (Exact Row Counts matching Google Sheets 1:1)
@@ -2138,7 +2427,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   const activeItemsCount = useMemo(() => {
     let count = 0;
     groupedOrders.forEach(o => {
-      if (o.sheetSource === 'product_order' && (!o.orderNo || o.orderNo.trim() === '')) return;
       o.items.forEach(it => {
         if (o.sheetSource !== 'closed' && (it.statusAN || 'Open') !== 'Closed') count++;
       });
@@ -2243,6 +2531,58 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                 </button>
               )}
             </div>
+
+            {/* Month Filter */}
+            <div className="flex items-center gap-1 bg-white px-2 py-1 rounded-md border border-slate-300 shadow-2xs shrink-0">
+              <Calendar className="w-3 h-3 text-blue-600 shrink-0" />
+              <span className="text-[11px] font-bold text-slate-600">Month:</span>
+              <select
+                value={automationMonth}
+                onChange={(e) => {
+                  setAutomationMonth(e.target.value);
+                  setAutomationPage(1);
+                }}
+                className="text-xs font-bold text-slate-800 bg-transparent focus:outline-none cursor-pointer pr-1"
+              >
+                {MONTH_OPTIONS.map(m => (
+                  <option key={m.value} value={m.value}>{m.label}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Year Filter */}
+            <div className="flex items-center gap-1 bg-white px-2 py-1 rounded-md border border-slate-300 shadow-2xs shrink-0">
+              <span className="text-[11px] font-bold text-slate-600">Year:</span>
+              <select
+                value={automationYear}
+                onChange={(e) => {
+                  setAutomationYear(e.target.value);
+                  setAutomationPage(1);
+                }}
+                className="text-xs font-bold text-slate-800 bg-transparent focus:outline-none cursor-pointer pr-1"
+              >
+                <option value="ALL">All Years</option>
+                {availableAutomationYears.map(yr => (
+                  <option key={yr} value={yr}>{yr}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Clear Month/Year Filter if active */}
+            {(automationMonth !== 'ALL' || automationYear !== 'ALL') && (
+              <button
+                type="button"
+                onClick={() => {
+                  setAutomationMonth('ALL');
+                  setAutomationYear('ALL');
+                  setAutomationPage(1);
+                }}
+                className="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-md font-bold text-[11px] flex items-center gap-1 cursor-pointer shrink-0"
+              >
+                <X className="w-3 h-3" />
+                <span>Clear Date</span>
+              </button>
+            )}
 
             {/* Quick Status Filter */}
             <div className="flex items-center gap-1 text-xs shrink-0">
@@ -2453,28 +2793,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               )}
             </div>
 
-            {/* Auto-Fit Columns Button (Adjusts column width to fit text content) */}
-            <button
-              type="button"
-              onClick={() => {
-                setAutoFitColumns(prev => !prev);
-                setSyncFeedback(
-                  !autoFitColumns
-                    ? '↔ Auto-Fit Columns ON: Every column now automatically fits the full width of its text & data!'
-                    : '↔ Auto-Fit Columns OFF: Compact truncated column widths enabled.'
-                );
-                setTimeout(() => setSyncFeedback(null), 3000);
-              }}
-              className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold rounded-lg border shadow-2xs transition-colors shrink-0 cursor-pointer ${
-                autoFitColumns
-                  ? 'bg-emerald-50 text-emerald-900 border-emerald-300 hover:bg-emerald-100'
-                  : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-              }`}
-              title="Automatically adjust all column widths to fit the exact text/data inside them"
-            >
-              <span>↔ Auto-Fit Cols: {autoFitColumns ? 'ON' : 'OFF'}</span>
-            </button>
-
             {/* Columns Hide / Show Button */}
             <button
               onClick={() => setShowColManager(true)}
@@ -2587,7 +2905,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               setShowImportModal(true);
             }}
             onUpdateRow={handleUpdateProductOrderRow}
-            onNavigateToAutomation={() => setActiveSheetTab('automation')}
+            onNavigateToAutomation={() => {
+              setViewMode('merged');
+              setActiveSheetTab('automation');
+            }}
             onAddNewRow={handleAddNewProductOrderRow}
           />
         ) : (
@@ -2970,7 +3291,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         <div className="bg-slate-200 border-t border-slate-300 px-3 py-2 flex flex-wrap items-center justify-between gap-3 select-none">
           {/* Tabs */}
           <div className="flex items-center gap-1">
-            {/* Tab 1: Product Order (28-Col Flat Sheet - Shows ONLY Total Rows as requested) */}
+            {/* Tab 1: Product Order (28-Col Flat Sheet - Shows Total Orders as per =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")) */}
             <button
               onClick={() => setActiveSheetTab('product_order')}
               className={`px-3.5 py-1.5 text-xs font-bold rounded-t-md transition-colors flex items-center gap-1.5 cursor-pointer ${
@@ -2980,15 +3301,18 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               }`}
             >
               <FileSpreadsheet className="w-3.5 h-3.5 text-blue-600" />
-              <span>Product Order</span>
+              <span>Product Order (Total Orders)</span>
               <span className="ml-1 text-[10px] px-1.5 py-0.2 rounded-full bg-blue-100 text-blue-800 font-mono font-bold">
-                {productOrderRows.length.toLocaleString()} rows
+                {productOrderRows.length.toLocaleString()} orders
               </span>
             </button>
 
-            {/* Tab 2: Product Automation (Active Orders - Merged Grid) */}
+            {/* Tab 2: Order Automation */}
             <button
-              onClick={() => setActiveSheetTab('automation')}
+              onClick={() => {
+                setViewMode('merged');
+                setActiveSheetTab('automation');
+              }}
               className={`px-3.5 py-1.5 text-xs font-bold rounded-t-md transition-colors flex items-center gap-1.5 cursor-pointer ${
                 activeSheetTab === 'automation'
                   ? 'bg-white text-emerald-800 shadow-sm border-t-2 border-emerald-600'
@@ -2996,7 +3320,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               }`}
             >
               <Layers className="w-3.5 h-3.5 text-emerald-600" />
-              <span>Product Automation (Active Orders)</span>
+              <span>Order Automation</span>
               <span className="ml-1 text-[10px] px-1.5 py-0.2 rounded-full bg-emerald-100 text-emerald-800 font-mono font-bold">
                 {activeItemsCount.toLocaleString()} rows
               </span>
@@ -4540,8 +4864,8 @@ function renderSpreadsheetRows(
                   <input
                     type="text"
                     placeholder="Status..."
-                    size={autoFitColumns ? Math.max((handlers.colAAStatuses[currentOrderKey] ?? 'In Production').length + 2, 12) : undefined}
-                    value={handlers.colAAStatuses[currentOrderKey] ?? 'In Production'}
+                    size={autoFitColumns ? Math.max((handlers.colAAStatuses[currentOrderKey] ?? order.colAA ?? '').length + 2, 12) : undefined}
+                    value={handlers.colAAStatuses[currentOrderKey] ?? order.colAA ?? ''}
                     onChange={(e) => handlers.onUpdateColAA(currentOrderKey, e.target.value)}
                     className={`${autoFitColumns ? 'w-auto min-w-[95px]' : 'w-28'} px-1.5 py-0.5 border border-teal-300 rounded text-[11px] font-semibold text-slate-800 bg-teal-50/20 focus:bg-white focus:outline-none focus:ring-1 focus:ring-teal-500 h-6 shadow-2xs`}
                     title="Col AA: Editable Status (Auto-saved)"
@@ -4555,8 +4879,8 @@ function renderSpreadsheetRows(
                   <input
                     type="text"
                     placeholder="Remark..."
-                    size={autoFitColumns ? Math.max((handlers.colABRemarks[currentOrderKey] ?? '').length + 2, 12) : undefined}
-                    value={handlers.colABRemarks[currentOrderKey] ?? ''}
+                    size={autoFitColumns ? Math.max((handlers.colABRemarks[currentOrderKey] ?? order.colAB ?? '').length + 2, 12) : undefined}
+                    value={handlers.colABRemarks[currentOrderKey] ?? order.colAB ?? ''}
                     onChange={(e) => handlers.onUpdateColAB(currentOrderKey, e.target.value)}
                     className={`${autoFitColumns ? 'w-auto min-w-[100px]' : 'w-32'} px-1.5 py-0.5 border border-slate-300 rounded text-[11px] text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-emerald-500 h-6 shadow-2xs`}
                     title="Col AB: Editable Logistics Remark (Auto-saved)"
@@ -4565,19 +4889,19 @@ function renderSpreadsheetRows(
               )}
               {visibleCols['AC'] && (
                 <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-700 align-middle text-[11px] ${cellBottomBorder}`}>
-                  Sent
+                  {order.colAC || 'Sent'}
                 </td>
               )}
               {visibleCols['AD'] && (
                 <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-emerald-700 font-medium align-middle text-[11px] ${cellBottomBorder}`}>
-                  Delivered
+                  {order.colAD || 'Delivered'}
                 </td>
               )}
               {/* Col AE: Instant Confirmation Msg */}
               {visibleCols['AE'] && (
                 <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 text-center align-middle bg-blue-50/20 whitespace-nowrap ${cellBottomBorder}`}>
                   <select
-                    value={handlers.aeStatuses[currentOrderKey] || 'Pending'}
+                    value={handlers.aeStatuses[currentOrderKey] ?? order.colAE ?? 'Pending'}
                     onChange={(e) => {
                       const val = e.target.value;
                       handlers.setAeStatuses(prev => ({ ...prev, [currentOrderKey]: val }));
@@ -4595,7 +4919,7 @@ function renderSpreadsheetRows(
               {/* Col AF: Whatspp Link (Instant Confirmation AE ➔ AF) */}
               {visibleCols['AF'] && (
                 <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 text-center align-middle bg-emerald-50/20 whitespace-nowrap ${cellBottomBorder}`}>
-                  {(handlers.aeStatuses[currentOrderKey] || 'Pending') === 'Message Sent' ? (
+                  {(handlers.aeStatuses[currentOrderKey] ?? order.colAE ?? 'Pending') === 'Message Sent' ? (
                     <button
                       onClick={() => handlers.onOpenConfirmWhatsAppModal(order)}
                       className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-600 text-white hover:bg-emerald-700 transition-colors shadow-2xs"
@@ -4617,7 +4941,7 @@ function renderSpreadsheetRows(
                   <label className="inline-flex items-center justify-center cursor-pointer p-0.5" title="Check to record Follow-up 1 timestamp in Col AH">
                     <input
                       type="checkbox"
-                      checked={!!handlers.colAGChecks[currentOrderKey]}
+                      checked={Boolean(handlers.colAGChecks[currentOrderKey] ?? order.colAG)}
                       onChange={(e) => handlers.onToggleColAG(currentOrderKey, e.target.checked)}
                       className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer shadow-2xs"
                     />
@@ -4628,10 +4952,10 @@ function renderSpreadsheetRows(
               {/* Col AH: Timestamp (Auto-generated from Col AG Checkbox) */}
               {visibleCols['AH'] && (
                 <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 align-middle text-[10px] font-mono ${cellBottomBorder} whitespace-nowrap bg-emerald-50/10`}>
-                  {handlers.colAHTimestamps[currentOrderKey] ? (
+                  {(handlers.colAHTimestamps[currentOrderKey] ?? order.colAH) ? (
                     <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold">
                       <Clock className="w-3 h-3 text-emerald-600 shrink-0" />
-                      <span>{handlers.colAHTimestamps[currentOrderKey]}</span>
+                      <span>{handlers.colAHTimestamps[currentOrderKey] ?? order.colAH}</span>
                     </span>
                   ) : (
                     <span className="text-slate-300 italic text-[10px]">—</span>
@@ -4645,8 +4969,8 @@ function renderSpreadsheetRows(
                   <input
                     type="text"
                     placeholder="Follow-up 1 remark..."
-                    size={autoFitColumns ? Math.max((handlers.colAIRemarks[currentOrderKey] ?? '').length + 2, 16) : undefined}
-                    value={handlers.colAIRemarks[currentOrderKey] ?? ''}
+                    size={autoFitColumns ? Math.max((handlers.colAIRemarks[currentOrderKey] ?? order.colAI ?? '').length + 2, 16) : undefined}
+                    value={handlers.colAIRemarks[currentOrderKey] ?? order.colAI ?? ''}
                     onChange={(e) => handlers.onUpdateColAI(currentOrderKey, e.target.value)}
                     className={`${autoFitColumns ? 'w-auto min-w-[120px]' : 'w-36'} px-1.5 py-0.5 border border-slate-300 rounded text-[11px] text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-emerald-500 h-6 shadow-2xs`}
                     title="Col AI: Editable Follow-up 1 Remark (Auto-saved)"
@@ -4660,7 +4984,7 @@ function renderSpreadsheetRows(
                   <label className="inline-flex items-center justify-center cursor-pointer p-0.5" title="Check to record Follow-up 2 timestamp in Col AK">
                     <input
                       type="checkbox"
-                      checked={!!handlers.colAJChecks[currentOrderKey]}
+                      checked={Boolean(handlers.colAJChecks[currentOrderKey] ?? order.colAJ)}
                       onChange={(e) => handlers.onToggleColAJ(currentOrderKey, e.target.checked)}
                       className="w-4 h-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500 cursor-pointer shadow-2xs"
                     />
@@ -4671,10 +4995,10 @@ function renderSpreadsheetRows(
               {/* Col AK: Timestamp (Auto-generated from Col AJ Checkbox) */}
               {visibleCols['AK'] && (
                 <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 align-middle text-[10px] font-mono ${cellBottomBorder} whitespace-nowrap bg-sky-50/10`}>
-                  {handlers.colAKTimestamps[currentOrderKey] ? (
+                  {(handlers.colAKTimestamps[currentOrderKey] ?? order.colAK) ? (
                     <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-sky-100 text-sky-900 border border-sky-300 font-bold">
                       <Clock className="w-3 h-3 text-sky-600 shrink-0" />
-                      <span>{handlers.colAKTimestamps[currentOrderKey]}</span>
+                      <span>{handlers.colAKTimestamps[currentOrderKey] ?? order.colAK}</span>
                     </span>
                   ) : (
                     <span className="text-slate-300 italic text-[10px]">—</span>
@@ -4688,8 +5012,8 @@ function renderSpreadsheetRows(
                   <input
                     type="text"
                     placeholder="Follow-up 2 remark..."
-                    size={autoFitColumns ? Math.max((handlers.colALRemarks[currentOrderKey] ?? '').length + 2, 16) : undefined}
-                    value={handlers.colALRemarks[currentOrderKey] ?? ''}
+                    size={autoFitColumns ? Math.max((handlers.colALRemarks[currentOrderKey] ?? order.colAL ?? '').length + 2, 16) : undefined}
+                    value={handlers.colALRemarks[currentOrderKey] ?? order.colAL ?? ''}
                     onChange={(e) => handlers.onUpdateColAL(currentOrderKey, e.target.value)}
                     className={`${autoFitColumns ? 'w-auto min-w-[120px]' : 'w-36'} px-1.5 py-0.5 border border-slate-300 rounded text-[11px] text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-sky-500 h-6 shadow-2xs`}
                     title="Col AL: Editable Follow-up 2 Remark (Auto-saved)"
@@ -4702,8 +5026,8 @@ function renderSpreadsheetRows(
                   <input
                     type="text"
                     placeholder="e.g. MEHTA-0041"
-                    size={autoFitColumns ? Math.max((handlers.lrNumbers[currentOrderKey] || '').length + 2, 12) : undefined}
-                    value={handlers.lrNumbers[currentOrderKey] || ''}
+                    size={autoFitColumns ? Math.max((handlers.lrNumbers[currentOrderKey] ?? order.lrNumber ?? '').length + 2, 12) : undefined}
+                    value={handlers.lrNumbers[currentOrderKey] ?? order.lrNumber ?? ''}
                     onChange={(e) => {
                       const val = e.target.value;
                       handlers.setLrNumbers(prev => ({ ...prev, [currentOrderKey]: val }));
@@ -4752,7 +5076,7 @@ function renderSpreadsheetRows(
                   className={`px-1.5 py-0.5 border-r border-slate-300 text-center align-middle bg-purple-50/20 whitespace-nowrap ${cellBottomBorder}`}
                 >
                   <select
-                    value={handlers.aoStatuses[currentOrderKey] || 'Pending'}
+                    value={handlers.aoStatuses[currentOrderKey] ?? order.colAO ?? 'Pending'}
                     onChange={(e) => {
                       const val = e.target.value;
                       handlers.setAoStatuses(prev => ({ ...prev, [currentOrderKey]: val }));

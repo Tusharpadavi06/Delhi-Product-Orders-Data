@@ -9,7 +9,7 @@ export interface OrderItem {
   rate: number;          // Col L (12)
   discount: number;      // Col M (13)
   deliveryDate: string;  // Col N (14)
-  dispatchQty?: number;  // Col Y (25) - Manual user entry
+  dispatchQty?: number;  // Col Y (25) - Manual user entry / Sheet Col Y
   balanceQty?: number;   // Col Z (26) - K - Y
   statusAN?: 'Open' | 'In-Progress' | 'Closed'; // Col AN (40) - Status Dropdown
   isDuplicate?: boolean;
@@ -45,11 +45,25 @@ export interface ProductOrderRow {
   approvalStatus: string;     // Col 24: Approval Status
   branchHeadName: string;     // Col 25: Branch Head Name
   branchHeadEmail?: string;   // Col 26: Branch Head Email
-  orderNo?: string;           // Col 27: Order No (O.N Generate)
+  orderNo?: string;           // Col 27: Order No (O.N Generate) / Col X (24)
   orderNoTimestamp?: string;  // Col 28: Timestamp ( O.N Generate )
   statusAN?: 'Open' | 'In-Progress' | 'Closed'; // Col AN (40)
   dispatchQty?: number;       // Col Y (25)
   balanceQty?: number;        // Col Z (26)
+  // Operational columns AA to AS persisted per row from Google Sheet
+  colAA?: string;             // Col AA (27): Status
+  colAB?: string;             // Col AB (28): Remark
+  colAC?: string;             // Col AC (29): Confirmation Mail
+  colAD?: string;             // Col AD (30): Mail Status
+  colAE?: string;             // Col AE (31): Confirmation Msg
+  colAG?: boolean;            // Col AG (33): Follow-up 1
+  colAH?: string;             // Col AH (34): Follow-up 1 Timestamp
+  colAI?: string;             // Col AI (35): Follow-up 1 Remark
+  colAJ?: boolean;            // Col AJ (36): Follow-up 2
+  colAK?: string;             // Col AK (37): Follow-up 2 Timestamp
+  colAL?: string;             // Col AL (38): Follow-up 2 Remark
+  lrNumber?: string;          // Col AM (39): LR- Number
+  colAO?: string;             // Col AO (41): Delivered Whatspp Msg
   sheetSource?: 'product_order' | 'automation' | 'closed';
 }
 
@@ -76,6 +90,19 @@ export interface GroupedOrder {
   orderNo: string;
   orderNoTimestamp?: string;
   statusAN?: 'Open' | 'In-Progress' | 'Closed';
+  colAA?: string;
+  colAB?: string;
+  colAC?: string;
+  colAD?: string;
+  colAE?: string;
+  colAG?: boolean;
+  colAH?: string;
+  colAI?: string;
+  colAJ?: boolean;
+  colAK?: string;
+  colAL?: string;
+  lrNumber?: string;
+  colAO?: string;
   sheetSource?: 'product_order' | 'automation' | 'closed';
 }
 
