@@ -974,12 +974,59 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }
   };
 
-  // Generate or assign Order No for a row in Product Order sheet (and sync across all items of that same Customer Order block)
+  // Format Timestamp in DD/MM/YYYY HH:mm:ss matching Google Sheet "Product Order" Column AB (28)
+  const formatSheetColABTimestamp = (d: Date = new Date()): string => {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  };
+
+  // Push Order No (Col AA / 27) & Timestamp (Col AB / 28) updates to Firebase /product_order_aa_ab for 2-way Google Sheet <-> App sync
+  const pushAAABOverrideToFirebase = async (rowsUpdated: ProductOrderRow[]) => {
+    if (!rowsUpdated || rowsUpdated.length === 0) return;
+    try {
+      const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+      const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+      const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+      const payload: Record<string, any> = {};
+
+      rowsUpdated.forEach(r => {
+        const orderSig = `${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.orderDate || '').trim().toLowerCase()}`
+          .replace(/[.#$/[\]\s]+/g, '_');
+        const rowMatchSig = `${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}|${(r.orderDate || '').trim().toLowerCase()}`
+          .replace(/[.#$/[\]\s]+/g, '_');
+        const sheetRowNum = r.orderId.startsWith('DELHI-') ? Number(r.orderId.replace('DELHI-', '')) : undefined;
+
+        const record = {
+          order_no: r.orderNo || '',
+          order_no_timestamp: r.orderNoTimestamp || '',
+          reference_no: r.referenceNo || '',
+          customer_po: r.customerPO || '',
+          customer_name: r.customerName || '',
+          order_date: r.orderDate || '',
+          item_name: r.itemName || '',
+          sheet_row: sheetRowNum || null,
+          updated_at: new Date().toISOString()
+        };
+        if (orderSig) payload[`ord_${orderSig}`] = record;
+        if (rowMatchSig) payload[`row_${rowMatchSig}`] = record;
+      });
+
+      await fetch(`${baseTargetUrl}/product_order_aa_ab.json${authQuery}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+    } catch (e) {
+      // Ignore network errors silently
+    }
+  };
+
+  // Generate or assign Order No for a row in Product Order sheet (and sync across all items of that same Customer Order block + Firebase + Sheet Col AA/AB)
   const handleGenerateOrderNo = (orderId: string, customNo?: string) => {
     const generatedNo = (customNo && customNo.trim() !== '')
       ? customNo.trim()
       : `DLFSO2526-0${Math.floor(1750 + Math.random() * 50)}`;
-    const nowStr = new Date().toLocaleString('en-IN');
+    const nowStr = formatSheetColABTimestamp();
     let affectedItem = '';
 
     setRawResponses(prev => {
@@ -989,8 +1036,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         ? ''
         : (targetRow?.customerPO || '').trim().toLowerCase();
       const targetDate = (targetRow?.orderDate || '').trim().toLowerCase();
+      const changedRows: ProductOrderRow[] = [];
 
-      return prev.map(row => {
+      const updatedAll = prev.map(row => {
         const rowCust = (row.customerName || '').trim().toLowerCase();
         const rowPO = ['n/a', '-', 'nil', 'na'].includes((row.customerPO || '').trim().toLowerCase())
           ? ''
@@ -1001,23 +1049,30 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           rowCust === targetCust &&
           rowPO === targetPO &&
           rowDate === targetDate &&
-          (!row.orderNo || row.orderNo.trim() === '');
+          (!row.orderNo || row.orderNo.trim() === '' || row.orderNo === targetRow?.orderNo);
 
         if (row.orderId === orderId || isSiblingOfSameOrder) {
           if (row.orderId === orderId) affectedItem = row.itemName;
-          return {
+          const updatedRow: ProductOrderRow = {
             ...row,
             orderNo: generatedNo,
             orderNoTimestamp: nowStr,
             statusAN: row.statusAN || 'Open'
           };
+          changedRows.push(updatedRow);
+          return updatedRow;
         }
         return row;
       });
+
+      // Immediately push to Firebase /product_order_aa_ab & /product_automation for 2-way sync
+      pushAAABOverrideToFirebase(changedRows);
+      pushOrdersToFirebase(updatedAll).catch(() => {});
+      return updatedAll;
     });
 
     setSyncFeedback(
-      `Order No "${generatedNo}" assigned for ${affectedItem || orderId}! Merged order block updated in "Order Automation".`
+      `Order No "${generatedNo}" & Timestamp (${nowStr}) updated in Col AA (27) & Col AB (28) and synced to Cloud!`
     );
     setTimeout(() => setSyncFeedback(null), 4500);
   };
@@ -1025,50 +1080,78 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   // Generate Order No for all pending rows in Product Order
   const handleGenerateAllPendingOrderNo = () => {
     let counter = 1752;
-    const nowStr = new Date().toLocaleString('en-IN');
+    const nowStr = formatSheetColABTimestamp();
     let countGenerated = 0;
 
-    setRawResponses(prev =>
-      prev.map(row => {
+    setRawResponses(prev => {
+      const changedRows: ProductOrderRow[] = [];
+      const updatedAll = prev.map(row => {
         if (!row.orderNo || row.orderNo.trim() === '') {
           countGenerated++;
           const genNo = `DLFSO2526-0${counter++}`;
-          return {
+          const updatedRow: ProductOrderRow = {
             ...row,
             orderNo: genNo,
             orderNoTimestamp: nowStr,
             statusAN: row.statusAN || 'Open'
           };
+          changedRows.push(updatedRow);
+          return updatedRow;
         }
         return row;
-      })
-    );
+      });
+      pushAAABOverrideToFirebase(changedRows);
+      pushOrdersToFirebase(updatedAll).catch(() => {});
+      return updatedAll;
+    });
 
     setSyncFeedback(
-      `Generated Order Numbers for ${countGenerated} pending orders! All flowed to Product Automation (Active Orders) with Col AN default "Open".`
+      `Generated Order Numbers for ${countGenerated} pending orders! All flowed to Order Automation & synced to Cloud.`
     );
     setTimeout(() => setSyncFeedback(null), 4500);
   };
 
   // Add new row into Product Order (Appends at the bottom like IMPORTRANGE)
   const handleAddNewProductOrderRow = (newRow: ProductOrderRow) => {
-    setRawResponses(prev => [...prev, newRow]);
+    setRawResponses(prev => {
+      const updated = [...prev, newRow];
+      pushOrdersToFirebase(updated).catch(() => {});
+      return updated;
+    });
     setSyncFeedback(`New Order ${newRow.customerPO} (${newRow.referenceNo}) added at the bottom of Product Order!`);
     setTimeout(() => setSyncFeedback(null), 4000);
   };
 
   // Update row field in Product Order
   const handleUpdateProductOrderRow = (orderId: string, field: keyof ProductOrderRow, value: any) => {
-    setRawResponses(prev =>
-      prev.map(row => (row.orderId === orderId ? { ...row, [field]: value } : row))
-    );
+    setRawResponses(prev => {
+      const changedRows: ProductOrderRow[] = [];
+      const updated = prev.map(row => {
+        if (row.orderId === orderId) {
+          const updatedRow = { ...row, [field]: value };
+          if (field === 'orderNo' && value && !updatedRow.orderNoTimestamp) {
+            updatedRow.orderNoTimestamp = formatSheetColABTimestamp();
+          }
+          changedRows.push(updatedRow);
+          return updatedRow;
+        }
+        return row;
+      });
+      if (field === 'orderNo' || field === 'orderNoTimestamp') {
+        pushAAABOverrideToFirebase(changedRows);
+        pushOrdersToFirebase(updated).catch(() => {});
+      }
+      return updated;
+    });
   };
 
-  // Update Order No (Col X)
+  // Update Order No (Col X in Order Automation <-> Col AA in Product Order)
   const handleSaveOrderNo = () => {
     if (!editingOrderNo) return;
-    setRawResponses(prev =>
-      prev.map(row => {
+    const nowStr = formatSheetColABTimestamp();
+    setRawResponses(prev => {
+      const changedRows: ProductOrderRow[] = [];
+      const updatedAll = prev.map(row => {
         const key = [
           row.customerPO,
           row.customerName,
@@ -1078,17 +1161,22 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         ].map(v => (v || '').trim()).join('_');
 
         if (key === editingOrderNo.key) {
-          return {
+          const updatedRow: ProductOrderRow = {
             ...row,
             orderNo: editingOrderNo.value,
-            orderNoTimestamp: new Date().toLocaleString('en-IN'),
+            orderNoTimestamp: nowStr,
             statusAN: row.statusAN || 'Open'
           };
+          changedRows.push(updatedRow);
+          return updatedRow;
         }
         return row;
-      })
-    );
-    setSyncFeedback(`Order No for ${editingOrderNo.po} set to "${editingOrderNo.value}" in Col X!`);
+      });
+      pushAAABOverrideToFirebase(changedRows);
+      pushOrdersToFirebase(updatedAll).catch(() => {});
+      return updatedAll;
+    });
+    setSyncFeedback(`Order No for ${editingOrderNo.po} set to "${editingOrderNo.value}" (Col AA & Col X synced)!`);
     setEditingOrderNo(null);
     setTimeout(() => setSyncFeedback(null), 4000);
   };
@@ -2183,19 +2271,24 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }
   };
 
-  // Dedicated Live Sync for =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")
-  // Loads 100% Total Orders from Delhi!A:Z into Product Order and flows them into Order Automation in Merged Visual View!
+  // Dedicated Live Sync for Google Sheet "15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0" (Tab: "Product Order" Cols A:AB)
+  // and =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")
+  // Loads 100% Total Orders + Col AA (27: Order No) + Col AB (28: Timestamp) into Product Order and flows them into Order Automation!
   const handleSyncDelhiImportRange = async (silent: boolean = false) => {
+    const fmsSheetId = '15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0';
     const delhiSheetId = '1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY';
     const delhiTab = 'Delhi';
     if (!silent) {
       setIsSyncingImportRange(true);
-      setSyncFeedback('Syncing =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")...');
+      setSyncFeedback('Syncing Product Order (Cols A:AB — Order No AA & Timestamp AB) & Firebase Cloud...');
     }
 
+    const cacheBust = `&_t=${Date.now()}`;
     const candidateUrls = [
-      `https://docs.google.com/spreadsheets/d/${delhiSheetId}/gviz/tq?tqx=out:csv&range=A:Z&sheet=${encodeURIComponent(delhiTab)}`,
-      `https://docs.google.com/spreadsheets/d/15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent('Product Order')}`
+      // 1. Primary: FMS Sheet "Product Order" tab (has all Delhi!A:Z rows + Col AA (27) Order No & Col AB (28) Timestamp!)
+      `https://docs.google.com/spreadsheets/d/${fmsSheetId}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent('Product Order')}${cacheBust}`,
+      // 2. Fallback: Direct Delhi!A:Z sheet
+      `https://docs.google.com/spreadsheets/d/${delhiSheetId}/gviz/tq?tqx=out:csv&range=A:Z&sheet=${encodeURIComponent(delhiTab)}${cacheBust}`
     ];
 
     try {
@@ -2251,7 +2344,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         }
         if (cols.length < 4) return;
 
-        // Detect if Delhi!A:Z starts with Timestamp in cols[0] vs Reference No in cols[0]
+        // Detect if sheet starts with Timestamp in cols[0] vs Reference No (Col A) in cols[0]
         const startsWithTimestamp = isDateOrTimestampStr(cols[0]) && !isDateOrTimestampStr(cols[1]);
         const offset = startsWithTimestamp ? 0 : 1;
 
@@ -2281,10 +2374,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const rawApproval = (cols[offset + 22] || '').trim();
         const rawHeadName = (cols[offset + 23] || '').trim();
         const rawHeadEmail = (cols[offset + 24] || '').trim();
+        // Column AA (Col 27 = idx 26 when offset=1) = Order No
         const orderNo = (cols[offset + 25] || '').trim();
+        // Column AB (Col 28 = idx 27 when offset=1) = Timestamp ( O.N Generate )
         const orderNoTimestamp = (cols[offset + 26] || '').trim();
 
-        if (!rawCustName && !itemName && !refNo && !rawPO && !qty) return;
+        // Skip any empty or broken fragment line that has no timestamp, customer, item, or qty
+        if (!rawTimestamp && !rawCustName && !itemName && !qty) return;
 
         if (rawCustName) {
           lastTimestamp = rawTimestamp;
@@ -2345,14 +2441,25 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       });
 
       if (fetchedRows.length === 0) {
-        throw new Error('No valid rows found in Delhi!A:Z');
+        throw new Error('No valid rows found in Product Order / Delhi!A:Z');
       }
 
       isStorageHydratedRef.current = true;
 
-      // Also pull any Closed Orders & Active Order updates from Firebase Cloud (https://delhi-product-order-default-rtdb.firebaseio.com)
-      // so every system/computer opening the app gets 100% of Closed Orders & Order Automation updates!
-      const fbCloud = await fetchOrdersFromFirebase();
+      // Also pull Closed Orders, Active Order updates, and 2-way Col AA/AB overrides from Firebase Cloud
+      const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+      const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+      const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+
+      const [fbCloud, aaAbCloudData] = await Promise.all([
+        fetchOrdersFromFirebase(),
+        fetch(`${baseTargetUrl}/product_order_aa_ab.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null)
+      ]);
+
+      const aaAbOverrides: Record<string, any> =
+        aaAbCloudData && typeof aaAbCloudData === 'object' && !aaAbCloudData.error ? aaAbCloudData : {};
 
       let finalMergedForCloud: ProductOrderRow[] = [];
 
@@ -2363,6 +2470,12 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         // Combine local existing rows + Firebase Cloud rows for lookup (local closed/modified rows + Firebase closed/modified rows)
         const makeRowMatchKey = (r: ProductOrderRow) =>
           `${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}|${(r.orderDate || '').trim().toLowerCase()}`;
+
+        const makeOrderSig = (r: ProductOrderRow) =>
+          `ord_${`${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.orderDate || '').trim().toLowerCase()}`.replace(/[.#$/[\]\s]+/g, '_')}`;
+
+        const makeRowSig = (r: ProductOrderRow) =>
+          `row_${makeRowMatchKey(r).replace(/[.#$/[\]\s]+/g, '_')}`;
 
         const allKnownClosedRows: ProductOrderRow[] = [...fbCloud.closedRows];
         const seenClosedSigs = new Set(allKnownClosedRows.map(makeRowMatchKey));
@@ -2392,13 +2505,24 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
         const mergedDelhiRows: ProductOrderRow[] = fetchedRows.map(fRow => {
           const k = makeRowMatchKey(fRow);
+          const cloudAAAB = aaAbOverrides[makeRowSig(fRow)] || aaAbOverrides[makeOrderSig(fRow)];
+          // 2-Way ("Multipurpose") Resolution for Col AA (Order No) and Col AB (Timestamp):
+          // - If Google Sheet has Order No (fRow.orderNo), use it unless Web App has an explicit override in /product_order_aa_ab
+          // - If Google Sheet Order No is blank, use Web App / Firebase override if present
+          const resolvedOrderNo =
+            (cloudAAAB?.order_no && (!fRow.orderNo || fRow.orderNo === cloudAAAB.order_no))
+              ? cloudAAAB.order_no
+              : (fRow.orderNo || cloudAAAB?.order_no || '');
+          const resolvedOrderNoTs =
+            fRow.orderNoTimestamp || cloudAAAB?.order_no_timestamp || '';
+
           const closedMatch = closedLookupMap.get(k);
           if (closedMatch) {
             matchedClosedKeys.add(k);
             return {
               ...fRow,
-              orderNo: closedMatch.orderNo || fRow.orderNo || '',
-              orderNoTimestamp: closedMatch.orderNoTimestamp || fRow.orderNoTimestamp || '',
+              orderNo: resolvedOrderNo || closedMatch.orderNo || '',
+              orderNoTimestamp: resolvedOrderNoTs || closedMatch.orderNoTimestamp || '',
               statusAN: 'Closed',
               sheetSource: 'closed',
               dispatchQty: closedMatch.dispatchQty ?? fRow.dispatchQty ?? 0,
@@ -2424,8 +2548,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           if (match) {
             return {
               ...fRow,
-              orderNo: fRow.orderNo || match.orderNo || '',
-              orderNoTimestamp: fRow.orderNoTimestamp || match.orderNoTimestamp || '',
+              orderNo: resolvedOrderNo || match.orderNo || '',
+              orderNoTimestamp: resolvedOrderNoTs || match.orderNoTimestamp || '',
               statusAN: match.statusAN || fRow.statusAN || 'Open',
               sheetSource: match.statusAN === 'Closed' ? 'closed' : (fRow.sheetSource || 'product_order'),
               dispatchQty: match.dispatchQty ?? fRow.dispatchQty ?? 0,
@@ -2445,7 +2569,11 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               colAO: match.colAO ?? fRow.colAO
             };
           }
-          return fRow;
+          return {
+            ...fRow,
+            orderNo: resolvedOrderNo,
+            orderNoTimestamp: resolvedOrderNoTs
+          };
         });
 
         // Collect all additional closed orders from Firebase /closed_orders and local storage that were not in Delhi!A:Z
@@ -2477,18 +2605,20 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       }, 400);
 
       if (!silent) {
+        const countWithAA = fetchedRows.filter(r => r.orderNo && r.orderNo.trim() !== '').length;
+        const countWithAB = fetchedRows.filter(r => r.orderNoTimestamp && r.orderNoTimestamp.trim() !== '').length;
         setSyncFeedback(
-          `✓ Synced Delhi!A:Z & Firebase Cloud (${DEFAULT_FIREBASE_RTDB_URL})! Total ${fetchedRows.length.toLocaleString()} orders loaded.`
+          `✓ Synced "Product Order" (15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0)! ${fetchedRows.length.toLocaleString()} rows loaded (${countWithAA.toLocaleString()} Col AA Order Nos & ${countWithAB.toLocaleString()} Col AB Timestamps).`
         );
         setTimeout(() => setSyncFeedback(null), 5000);
       }
     } catch (err: any) {
       if (!silent) {
-        setImportSheetId(delhiSheetId);
-        setImportTabName(delhiTab);
+        setImportSheetId(fmsSheetId);
+        setImportTabName('Product Order');
         setImportReplaceMode(false);
         setImportError(
-          `Live IMPORTRANGE fetch notice (${err.message}). Make sure Sheet "1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY" (Tab: Delhi) is shared as "Anyone with the link can view", or paste rows below to append at the bottom.`
+          `Live Sheet fetch notice (${err.message}). Make sure Sheet "15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0" (Tab: Product Order) is shared as "Anyone with the link can view".`
         );
         setShowImportModal(true);
         setSyncFeedback(null);
@@ -2524,6 +2654,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           return {
             ...row,
             orderNo: closedMatch.orderNo || row.orderNo || '',
+            orderNoTimestamp: closedMatch.orderNoTimestamp || row.orderNoTimestamp || '',
             statusAN: 'Closed' as const,
             sheetSource: 'closed' as const,
             dispatchQty: closedMatch.dispatchQty ?? row.dispatchQty ?? 0,
@@ -2542,13 +2673,19 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     });
   };
 
-  // Automatically sync Firebase Cloud + IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z") on mount
+  // Automatically sync Firebase Cloud + Google Sheet "Product Order" (A:AB) on mount and every 30s for real-time 2-way updates
   useEffect(() => {
     handleRefreshFromFirebaseCloud();
     const timer = setTimeout(() => {
       handleSyncDelhiImportRange(true);
-    }, 800);
-    return () => clearTimeout(timer);
+    }, 600);
+    const interval = setInterval(() => {
+      handleSyncDelhiImportRange(true);
+    }, 30000);
+    return () => {
+      clearTimeout(timer);
+      clearInterval(interval);
+    };
   }, []);
 
   // 1-Click Upload all current Sheet Data to Firebase Realtime Database
@@ -3140,19 +3277,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             >
               <Trash2 className="w-3 h-3 text-rose-600" />
               <span>Clear Tab</span>
-            </button>
-
-            {/* Direct Excel / Google Sheet Import Button */}
-            <button
-              onClick={() => {
-                setImportError(null);
-                setShowImportModal(true);
-              }}
-              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white border border-blue-700 rounded-lg shadow-2xs transition-colors shrink-0 cursor-pointer"
-              title="Import New Data from Google Sheet (ID & Tab) or Excel"
-            >
-              <Upload className="w-3 h-3 text-white" />
-              <span>Import New Data</span>
             </button>
 
             {/* Export CSV */}

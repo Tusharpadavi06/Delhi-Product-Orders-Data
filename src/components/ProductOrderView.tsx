@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { ProductOrderRow } from '../types/fms';
 import { productOrderColumns } from '../data/sampleOrders';
 import {
@@ -15,15 +15,24 @@ import {
   ChevronLeft,
   ChevronRight,
   Trash2,
-  Upload,
   Calendar,
   Crosshair,
   RefreshCw,
   FileSpreadsheet,
-  Flame
+  Flame,
+  Columns,
+  Edit3
 } from 'lucide-react';
 
 export const DELHI_IMPORTRANGE_FORMULA = '=IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")';
+
+const PO_VISIBLE_COLS_STORAGE_KEY = 'ginza_fms_po_visible_cols_v1';
+
+// Helper: Convert 0-based index (0..27) to Excel column letter (A..Z, AA, AB)
+export function getPoSheetColLetter(idx: number): string {
+  if (idx < 26) return String.fromCharCode(65 + idx);
+  return 'A' + String.fromCharCode(65 + (idx - 26));
+}
 
 interface ProductOrderViewProps {
   orders: ProductOrderRow[];
@@ -142,7 +151,6 @@ export const DEFAULT_BRANCH_HEAD_EMAIL = 'vinay.chhajer@ginzalimited.com';
 export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
   orders,
   searchTerm,
-  setSearchTerm,
   isFullWidth,
   freezeColumns = 2,
   freezeRows = 1,
@@ -150,25 +158,54 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
   isSyncingImportRange = false,
   onSyncImportRange,
   onGenerateOrderNo,
-  onDeleteRow,
   onClearAllRows,
-  onOpenImportModal,
   onOpenFirebaseModal,
   onNavigateToAutomation,
   onAddNewRow
 }) => {
-  const [filterPendingOnly, setFilterPendingOnly] = useState(false);
+  const [filterPendingOnly] = useState(false);
   const [selectedMonth, setSelectedMonth] = useState<string>('ALL');
   const [selectedYear, setSelectedYear] = useState<string>('ALL');
   const [filterYesterdayTodayOnly, setFilterYesterdayTodayOnly] = useState(false);
 
   const [inputOrderNos, setInputOrderNos] = useState<Record<string, string>>({});
+  const [editingRowOrderId, setEditingRowOrderId] = useState<string | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
   const [showClearConfirmModal, setShowClearConfirmModal] = useState(false);
+  const [showPoColManager, setShowPoColManager] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [copiedFormula, setCopiedFormula] = useState(false);
   const [highlightedOrderId, setHighlightedOrderId] = useState<string | null>(null);
-  const [jumpCursorIndex, setJumpCursorIndex] = useState<number>(0);
+
+  // Column Visibility State for Product Order Tab (28 Columns: A to AB)
+  const [visiblePoCols, setVisiblePoCols] = useState<Record<string, boolean>>(() => {
+    try {
+      const saved = localStorage.getItem(PO_VISIBLE_COLS_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        const merged: Record<string, boolean> = {};
+        productOrderColumns.forEach(c => {
+          merged[c.id] = parsed[c.id] ?? true;
+        });
+        return merged;
+      }
+    } catch (e) {}
+    const initial: Record<string, boolean> = {};
+    productOrderColumns.forEach(c => {
+      initial[c.id] = true;
+    });
+    return initial;
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PO_VISIBLE_COLS_STORAGE_KEY, JSON.stringify(visiblePoCols));
+    } catch (e) {}
+  }, [visiblePoCols]);
+
+  const visiblePoColsCount = useMemo(
+    () => productOrderColumns.filter(c => visiblePoCols[c.id] !== false).length,
+    [visiblePoCols]
+  );
 
   // Fast Virtual Pagination (Default 100 rows in view with option to view All Total Orders)
   const [currentPage, setCurrentPage] = useState(1);
@@ -268,17 +305,8 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
     return filteredRows.slice(start, start + pageSize);
   }, [filteredRows, safeCurrentPage, pageSize]);
 
-  const pendingCount = useMemo(() => {
-    return orders.filter(r => {
-      const cleanOrdNo = r.orderNo && !isDateOrTimestampStr(r.orderNo) ? r.orderNo.trim() : '';
-      return cleanOrdNo === '';
-    }).length;
-  }, [orders]);
-
-  const activeAssignedCount = orders.length - pendingCount;
-
   /**
-   * Toggle "New Orders: Yesterday / Today (Order No)" ON / OFF:
+   * Toggle "New Orders" ON / OFF:
    * - Click 1 (Active): Filters to Current Date Yesterday/Today with blank Order No, highlights rows, and focuses cursor on Order No input.
    * - Click 2 (Deactive): Turns off the filter and removes all row highlights.
    */
@@ -324,15 +352,9 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
     setTimeout(() => setCopiedId(null), 2000);
   };
 
-  const handleCopyImportRangeFormula = () => {
-    navigator.clipboard.writeText(DELHI_IMPORTRANGE_FORMULA);
-    setCopiedFormula(true);
-    setTimeout(() => setCopiedFormula(false), 2500);
-  };
-
   return (
     <div className="space-y-1.5">
-      {/* PRODUCT ORDER FILTER & ACTION TOOLBAR: Month/Year Filter + New Orders + Actions */}
+      {/* PRODUCT ORDER FILTER & ACTION TOOLBAR: Month/Year Filter + New Orders + Columns (Hide/Show) + Actions */}
       <div className="flex flex-wrap items-center justify-between gap-2 px-2 py-1.5 bg-slate-100/90 border border-slate-200 rounded-lg text-xs">
         {/* Left Side: Month & Year Filter + Yesterday/Today Quick Jump */}
         <div className="flex flex-wrap items-center gap-2">
@@ -415,6 +437,31 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
 
         {/* Right Side: Action Controls */}
         <div className="flex flex-wrap items-center gap-2 ml-auto">
+          {/* Columns (Hide / Show) Button for Product Order Tab */}
+          <button
+            type="button"
+            onClick={() => setShowPoColManager(true)}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-lg shadow-2xs transition-colors cursor-pointer"
+            title="Hide / Show Specific Columns in Product Order Tab"
+          >
+            <Columns className="w-3.5 h-3.5 text-blue-600" />
+            <span>Columns ({visiblePoColsCount}/28)</span>
+          </button>
+
+          {/* Sync Google Sheet AA (Order No) & AB (Timestamp) */}
+          {onSyncImportRange && (
+            <button
+              type="button"
+              disabled={isSyncingImportRange}
+              onClick={onSyncImportRange}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-bold bg-white hover:bg-blue-50 text-blue-800 border border-blue-300 rounded-lg shadow-2xs transition-colors cursor-pointer disabled:opacity-50"
+              title="Sync Live Data & Col AA (Order No) / Col AB (Timestamp) with Google Sheet (15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0)"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 text-blue-600 ${isSyncingImportRange ? 'animate-spin' : ''}`} />
+              <span>{isSyncingImportRange ? 'Syncing Sheet...' : 'Sync Sheet (AA/AB)'}</span>
+            </button>
+          )}
+
           {/* 0. Clear All Rows */}
           {onClearAllRows && (
             <button
@@ -424,18 +471,6 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
             >
               <Trash2 className="w-3.5 h-3.5 text-rose-600" />
               <span>Clear All ({orders.length})</span>
-            </button>
-          )}
-
-          {/* 0.1 Import Sheet / Excel */}
-          {onOpenImportModal && (
-            <button
-              onClick={onOpenImportModal}
-              className="px-2.5 py-1 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 font-bold rounded-lg shadow-2xs flex items-center gap-1.5 transition-colors cursor-pointer text-xs"
-              title="Import Google Sheet (ID & Tab) or paste 6,000+ rows"
-            >
-              <Upload className="w-3.5 h-3.5 text-blue-600" />
-              <span>Import Data</span>
             </button>
           )}
 
@@ -451,10 +486,10 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
             </button>
           )}
 
-          {/* 1. Total Orders Badge (as per =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")) */}
+          {/* 1. Total Orders Badge */}
           <div
             className="px-2.5 py-1 rounded-lg border border-blue-300 bg-blue-50 text-blue-950 text-xs font-bold flex items-center gap-1.5 shadow-2xs"
-            title='Total Orders in Product Order as per =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")'
+            title="Total Orders in Product Order (Synced with Google Sheet Product Order A:AB)"
           >
             <FileSpreadsheet className="w-3.5 h-3.5 text-blue-600" />
             <span>Total Orders: {orders.length.toLocaleString()}</span>
@@ -475,7 +510,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
       {/* Main Single Row Flat Table Grid */}
       <div className={`overflow-x-auto overflow-y-auto ${isFullWidth ? 'h-[calc(100vh-185px)] max-h-[85vh]' : 'h-[620px] max-h-[75vh]'} select-text relative fms-sheet-scroll border border-slate-300 rounded-lg shadow-inner bg-white`}>
         <table className={`${autoFitColumns ? 'w-max min-w-full table-auto' : 'w-full'} border-collapse text-xs text-left`}>
-          {/* Header Row: 28 Columns with Freeze / Unfreeze Support */}
+          {/* Header Row: 28 Columns with Freeze / Unfreeze & Hide/Show Support */}
           <thead className={`${freezeRows > 0 ? 'sticky top-0 z-30' : ''} select-none border-b-2 border-slate-900 font-mono text-[11px]`}>
             {/* Column Letter / Index Numbers Strip */}
             <tr className="bg-slate-900 text-slate-400 text-[10px]">
@@ -487,11 +522,13 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                 #
               </th>
               {productOrderColumns.map((col, idx) => {
+                if (visiblePoCols[col.id] === false) return null;
+                const colLetter = getPoSheetColLetter(idx);
                 let tint = 'bg-slate-900 text-slate-300 border-r border-slate-800';
                 if (idx < 6) tint = 'bg-sky-950 text-sky-300 border-r border-sky-900';
                 else if (idx >= 6 && idx < 15) tint = 'bg-amber-950 text-amber-300 border-r border-amber-800 font-bold';
                 else if (idx >= 15 && idx < 26) tint = 'bg-indigo-950 text-indigo-300 border-r border-indigo-900';
-                else tint = 'bg-emerald-950 text-emerald-300 border-r border-emerald-900';
+                else tint = 'bg-emerald-950 text-emerald-300 border-r border-emerald-900 font-bold';
 
                 let stickyHead = '';
                 if (idx === 0 && freezeColumns >= 2) {
@@ -502,7 +539,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
 
                 return (
                   <th key={col.id} className={`px-2 py-0.5 text-center font-mono whitespace-nowrap ${tint} ${stickyHead}`}>
-                    {idx + 1}
+                    {colLetter} ({idx + 1})
                   </th>
                 );
               })}
@@ -518,6 +555,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                 #
               </th>
               {productOrderColumns.map((col, idx) => {
+                if (visiblePoCols[col.id] === false) return null;
                 let bgHead = 'bg-slate-800 text-slate-100 border-r border-slate-700 font-bold';
                 if (idx < 6) bgHead = 'bg-sky-900 text-sky-100 border-r border-sky-800 font-bold';
                 else if (idx >= 6 && idx < 15) bgHead = 'bg-amber-800 text-amber-100 border-r border-amber-700 font-extrabold shadow-sm';
@@ -541,7 +579,12 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                       <span className="font-semibold">{col.label}</span>
                       {col.id === 'orderNo' && (
                         <span className="text-[9px] px-1 bg-amber-400 text-slate-950 rounded font-extrabold">
-                          TRIGGER
+                          AA (27)
+                        </span>
+                      )}
+                      {col.id === 'orderNoTimestamp' && (
+                        <span className="text-[9px] px-1 bg-emerald-300 text-slate-950 rounded font-extrabold">
+                          AB (28)
                         </span>
                       )}
                     </div>
@@ -555,10 +598,10 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
           <tbody className="font-sans">
             {filteredRows.length === 0 ? (
               <tr>
-                <td colSpan={29} className="text-center py-12 text-slate-500 bg-white">
+                <td colSpan={visiblePoColsCount + 1} className="text-center py-12 text-slate-500 bg-white">
                   <AlertCircle className="w-8 h-8 text-slate-300 mx-auto mb-2" />
                   <p className="font-semibold text-slate-700">No orders match the filter or search criteria in Product Order.</p>
-                  <p className="text-xs text-slate-400 mt-1">Try resetting the Month/Year filter or click Import Data / Sync IMPORTRANGE.</p>
+                  <p className="text-xs text-slate-400 mt-1">Try resetting the Month/Year filter or click Sync Sheet (AA/AB).</p>
                 </td>
               </tr>
             ) : (
@@ -568,6 +611,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                 const cleanOrderNo =
                   row.orderNo && !isDateOrTimestampStr(row.orderNo) ? row.orderNo.trim() : '';
                 const hasOrderNo = Boolean(cleanOrderNo !== '');
+                const isEditingThisRow = editingRowOrderId === row.orderId;
                 const isHighlighted = filterYesterdayTodayOnly || highlightedOrderId === row.orderId;
                 const rowBg = isHighlighted
                   ? 'bg-amber-100/90 ring-2 ring-amber-500'
@@ -597,9 +641,11 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                 const cleanBranch =
                   row.branch && !isDateOrTimestampStr(row.branch) ? row.branch.trim() : 'Delhi';
 
+                // Exact 1:1 print of Col AB (28) Timestamp from Google Sheet Product Order tab (no fallback to Col 2 timestamp)
                 const displayOrderNoTimestamp =
-                  row.orderNoTimestamp ||
-                  (row.orderNo && isDateOrTimestampStr(row.orderNo) ? row.orderNo.trim() : hasOrderNo ? row.timestamp : '—');
+                  row.orderNoTimestamp && row.orderNoTimestamp.trim() !== ''
+                    ? row.orderNoTimestamp.trim()
+                    : '—';
 
                 return (
                   <tr
@@ -618,236 +664,316 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                       {rowIndex}
                     </td>
 
-                    {/* Col 1: Order No (Reference / GNZ - Never shows date/time format) */}
-                    <td
-                      className={`px-2 py-1 border-r border-slate-200 font-mono font-bold text-blue-900 whitespace-nowrap text-[11px] ${
-                        freezeColumns >= 2 ? 'sticky left-[40px] z-20 bg-white shadow-[2px_0_4px_-1px_rgba(0,0,0,0.12)]' : ''
-                      }`}
-                    >
-                      {cleanRefNo ? (
-                        <div className="flex items-center gap-1">
-                          <span>{cleanRefNo}</span>
-                          <button
-                            onClick={() => handleCopyText(cleanRefNo, row.orderId)}
-                            className="opacity-0 group-hover:opacity-100 hover:opacity-100 text-slate-400 hover:text-slate-700 p-0.5 cursor-pointer"
-                            title="Copy Reference"
-                          >
-                            {copiedId === row.orderId ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
-                          </button>
-                        </div>
-                      ) : (
-                        <span className="text-slate-300 font-mono">—</span>
-                      )}
-                    </td>
+                    {/* Col 1 (A): Order No (Reference / GNZ - Never shows date/time format) */}
+                    {visiblePoCols['referenceNo'] !== false && (
+                      <td
+                        className={`px-2 py-1 border-r border-slate-200 font-mono font-bold text-blue-900 whitespace-nowrap text-[11px] ${
+                          freezeColumns >= 2 ? 'sticky left-[40px] z-20 bg-white shadow-[2px_0_4px_-1px_rgba(0,0,0,0.12)]' : ''
+                        }`}
+                      >
+                        {cleanRefNo ? (
+                          <div className="flex items-center gap-1">
+                            <span>{cleanRefNo}</span>
+                            <button
+                              onClick={() => handleCopyText(cleanRefNo, row.orderId)}
+                              className="opacity-0 group-hover:opacity-100 hover:opacity-100 text-slate-400 hover:text-slate-700 p-0.5 cursor-pointer"
+                              title="Copy Reference"
+                            >
+                              {copiedId === row.orderId ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                            </button>
+                          </div>
+                        ) : (
+                          <span className="text-slate-300 font-mono">—</span>
+                        )}
+                      </td>
+                    )}
 
-                    {/* Col 2: Timestamp */}
-                    <td className="px-2 py-1 border-r border-slate-200 text-slate-600 font-mono whitespace-nowrap text-[11px]">
-                      {row.timestamp}
-                    </td>
+                    {/* Col 2 (B): Timestamp */}
+                    {visiblePoCols['timestamp'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 text-slate-600 font-mono whitespace-nowrap text-[11px]">
+                        {row.timestamp}
+                      </td>
+                    )}
 
-                    {/* Col 3: Customer PO */}
-                    <td
-                      className={`px-2 py-1 border-r border-slate-200 font-semibold text-slate-800 whitespace-nowrap text-[11px] ${
-                        freezeColumns >= 3 ? 'sticky left-[150px] z-20 bg-white shadow-[2px_0_4px_-1px_rgba(0,0,0,0.12)]' : ''
-                      }`}
-                    >
-                      <span className={row.customerPO === 'N/A' ? 'text-slate-400 italic' : 'text-slate-900 font-bold'}>
-                        {row.customerPO}
-                      </span>
-                    </td>
-
-                    {/* Col 4: Customer Name */}
-                    <td className="px-2 py-1 border-r border-slate-200 font-medium text-slate-900 whitespace-nowrap text-[11px]">
-                      {row.customerName}
-                    </td>
-
-                    {/* Col 5: Customer Email */}
-                    <td className="px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] whitespace-nowrap">
-                      {row.customerEmail || '—'}
-                    </td>
-
-                    {/* Col 6: Order Date */}
-                    <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
-                      {row.orderDate}
-                    </td>
-
-                    {/* Col 7: Unit (Category) */}
-                    <td className="px-2 py-1 border-r border-slate-200 font-medium text-purple-900 whitespace-nowrap text-[11px]">
-                      <span className="px-1.5 py-0.5 rounded bg-purple-50 text-purple-800 border border-purple-200 text-[10px] font-semibold">
-                        {row.unit}
-                      </span>
-                    </td>
-
-                    {/* Col 8: Item Name */}
-                    <td className="px-2 py-1 border-r border-slate-200 font-semibold text-slate-900 whitespace-nowrap text-[11px]">
-                      {row.itemName}
-                    </td>
-
-                    {/* Col 9: Color */}
-                    <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
-                      {row.color}
-                    </td>
-
-                    {/* Col 10: Width */}
-                    <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
-                      {row.width}
-                    </td>
-
-                    {/* Col 11: Unit (of item) */}
-                    <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-600 text-center text-[10px] whitespace-nowrap">
-                      {row.unitOfItem}
-                    </td>
-
-                    {/* Col 12: Qty */}
-                    <td className="px-2 py-1 border-r border-slate-200 font-mono font-bold text-slate-900 text-right text-[11px]">
-                      {Number(row.qty).toLocaleString()}
-                    </td>
-
-                    {/* Col 13: Rate */}
-                    <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-700 text-right text-[11px]">
-                      ₹{row.rate}
-                    </td>
-
-                    {/* Col 14: Discount */}
-                    <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-600 text-center text-[11px]">
-                      {row.discount}%
-                    </td>
-
-                    {/* Col 15: Delivery Date */}
-                    <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
-                      {row.deliveryDate}
-                    </td>
-
-                    {/* Col 16: Remark */}
-                    <td
-                      className={`px-2 py-1 border-r border-slate-200 text-slate-600 text-[11px] ${
-                        autoFitColumns ? 'whitespace-nowrap' : 'max-w-[200px] truncate'
-                      }`}
-                      title={row.remark}
-                    >
-                      {row.remark || '—'}
-                    </td>
-
-                    {/* Col 17: Customer Number */}
-                    <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-700 whitespace-nowrap text-[11px]">
-                      {row.customerNumber || '—'}
-                    </td>
-
-                    {/* Col 18: Billing Address */}
-                    <td
-                      className={`px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] ${
-                        autoFitColumns ? 'whitespace-nowrap' : 'max-w-[220px] truncate'
-                      }`}
-                      title={row.billingAddress}
-                    >
-                      {row.billingAddress || '—'}
-                    </td>
-
-                    {/* Col 19: Delivery Address */}
-                    <td
-                      className={`px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] ${
-                        autoFitColumns ? 'whitespace-nowrap' : 'max-w-[220px] truncate'
-                      }`}
-                      title={row.deliveryAddress}
-                    >
-                      {row.deliveryAddress || '—'}
-                    </td>
-
-                    {/* Col 20: Transporter Name */}
-                    <td className="px-2 py-1 border-r border-slate-200 text-slate-800 whitespace-nowrap text-[11px]">
-                      {row.transporterName || '—'}
-                    </td>
-
-                    {/* Col 21: Sales Person Name */}
-                    <td className="px-2 py-1 border-r border-slate-200 text-slate-800 font-medium whitespace-nowrap text-[11px]">
-                      {row.salesPerson || '—'}
-                    </td>
-
-                    {/* Col 22: Account Status */}
-                    <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
-                      {row.accountStatus || '—'}
-                    </td>
-
-                    {/* Col 23: Branch */}
-                    <td className="px-2 py-1 border-r border-slate-200 font-medium text-slate-800 whitespace-nowrap text-[11px]">
-                      {cleanBranch}
-                    </td>
-
-                    {/* Col 24: Approval Status */}
-                    <td className="px-2 py-1 border-r border-slate-200 whitespace-nowrap text-[11px] text-center">
-                      {row.approvalStatus ? (
-                        <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-[10px]">
-                          {row.approvalStatus}
+                    {/* Col 3 (C): Customer PO */}
+                    {visiblePoCols['customerPO'] !== false && (
+                      <td
+                        className={`px-2 py-1 border-r border-slate-200 font-semibold text-slate-800 whitespace-nowrap text-[11px] ${
+                          freezeColumns >= 3 ? 'sticky left-[150px] z-20 bg-white shadow-[2px_0_4px_-1px_rgba(0,0,0,0.12)]' : ''
+                        }`}
+                      >
+                        <span className={row.customerPO === 'N/A' ? 'text-slate-400 italic' : 'text-slate-900 font-bold'}>
+                          {row.customerPO}
                         </span>
-                      ) : (
-                        <span className="text-slate-300">—</span>
-                      )}
-                    </td>
+                      </td>
+                    )}
 
-                    {/* Col 25: Branch Head Name (Default: Vinay Chhajer when blank) */}
-                    <td className="px-2 py-1 border-r border-slate-200 text-slate-800 font-medium whitespace-nowrap text-[11px]">
-                      {cleanBranchHeadName}
-                    </td>
+                    {/* Col 4 (D): Customer Name */}
+                    {visiblePoCols['customerName'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 font-medium text-slate-900 whitespace-nowrap text-[11px]">
+                        {row.customerName}
+                      </td>
+                    )}
 
-                    {/* Col 26: Branch Head Email (Default: vinay.chhajer@ginzalimited.com when blank) */}
-                    <td className="px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] whitespace-nowrap">
-                      {cleanBranchHeadEmail}
-                    </td>
+                    {/* Col 5 (E): Customer Email */}
+                    {visiblePoCols['customerEmail'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] whitespace-nowrap">
+                        {row.customerEmail || '—'}
+                      </td>
+                    )}
 
-                    {/* Col 27: ORDER NO (O.N GENERATE) - THE CRITICAL AUTOMATION TRIGGER */}
-                    <td className="px-2.5 py-1 border-r border-slate-300 bg-emerald-50/30 whitespace-nowrap">
-                      {hasOrderNo ? (
-                        <div className="flex items-center gap-1.5">
-                          <span className="font-mono font-bold text-slate-900 px-2 py-0.5 rounded bg-white border border-slate-300 shadow-2xs text-[11px]">
-                            {cleanOrderNo}
+                    {/* Col 6 (F): Order Date */}
+                    {visiblePoCols['orderDate'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
+                        {row.orderDate}
+                      </td>
+                    )}
+
+                    {/* Col 7 (G): Unit (Category) */}
+                    {visiblePoCols['unit'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 font-medium text-purple-900 whitespace-nowrap text-[11px]">
+                        <span className="px-1.5 py-0.5 rounded bg-purple-50 text-purple-800 border border-purple-200 text-[10px] font-semibold">
+                          {row.unit}
+                        </span>
+                      </td>
+                    )}
+
+                    {/* Col 8 (H): Item Name */}
+                    {visiblePoCols['itemName'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 font-semibold text-slate-900 whitespace-nowrap text-[11px]">
+                        {row.itemName}
+                      </td>
+                    )}
+
+                    {/* Col 9 (I): Color */}
+                    {visiblePoCols['color'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
+                        {row.color}
+                      </td>
+                    )}
+
+                    {/* Col 10 (J): Width */}
+                    {visiblePoCols['width'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
+                        {row.width}
+                      </td>
+                    )}
+
+                    {/* Col 11 (K): Unit (of item) */}
+                    {visiblePoCols['unitOfItem'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-600 text-center text-[10px] whitespace-nowrap">
+                        {row.unitOfItem}
+                      </td>
+                    )}
+
+                    {/* Col 12 (L): Qty */}
+                    {visiblePoCols['qty'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 font-mono font-bold text-slate-900 text-right text-[11px]">
+                        {Number(row.qty).toLocaleString()}
+                      </td>
+                    )}
+
+                    {/* Col 13 (M): Rate */}
+                    {visiblePoCols['rate'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-700 text-right text-[11px]">
+                        ₹{row.rate}
+                      </td>
+                    )}
+
+                    {/* Col 14 (N): Discount */}
+                    {visiblePoCols['discount'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-600 text-center text-[11px]">
+                        {row.discount}%
+                      </td>
+                    )}
+
+                    {/* Col 15 (O): Delivery Date */}
+                    {visiblePoCols['deliveryDate'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
+                        {row.deliveryDate}
+                      </td>
+                    )}
+
+                    {/* Col 16 (P): Remark */}
+                    {visiblePoCols['remark'] !== false && (
+                      <td
+                        className={`px-2 py-1 border-r border-slate-200 text-slate-600 text-[11px] ${
+                          autoFitColumns ? 'whitespace-nowrap' : 'max-w-[200px] truncate'
+                        }`}
+                        title={row.remark}
+                      >
+                        {row.remark || '—'}
+                      </td>
+                    )}
+
+                    {/* Col 17 (Q): Customer Number */}
+                    {visiblePoCols['customerNumber'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-700 whitespace-nowrap text-[11px]">
+                        {row.customerNumber || '—'}
+                      </td>
+                    )}
+
+                    {/* Col 18 (R): Billing Address */}
+                    {visiblePoCols['billingAddress'] !== false && (
+                      <td
+                        className={`px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] ${
+                          autoFitColumns ? 'whitespace-nowrap' : 'max-w-[220px] truncate'
+                        }`}
+                        title={row.billingAddress}
+                      >
+                        {row.billingAddress || '—'}
+                      </td>
+                    )}
+
+                    {/* Col 19 (S): Delivery Address */}
+                    {visiblePoCols['deliveryAddress'] !== false && (
+                      <td
+                        className={`px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] ${
+                          autoFitColumns ? 'whitespace-nowrap' : 'max-w-[220px] truncate'
+                        }`}
+                        title={row.deliveryAddress}
+                      >
+                        {row.deliveryAddress || '—'}
+                      </td>
+                    )}
+
+                    {/* Col 20 (T): Transporter Name */}
+                    {visiblePoCols['transporterName'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 text-slate-800 whitespace-nowrap text-[11px]">
+                        {row.transporterName || '—'}
+                      </td>
+                    )}
+
+                    {/* Col 21 (U): Sales Person Name */}
+                    {visiblePoCols['salesPerson'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 text-slate-800 font-medium whitespace-nowrap text-[11px]">
+                        {row.salesPerson || '—'}
+                      </td>
+                    )}
+
+                    {/* Col 22 (V): Account Status */}
+                    {visiblePoCols['accountStatus'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
+                        {row.accountStatus || '—'}
+                      </td>
+                    )}
+
+                    {/* Col 23 (W): Branch */}
+                    {visiblePoCols['branch'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 font-medium text-slate-800 whitespace-nowrap text-[11px]">
+                        {cleanBranch}
+                      </td>
+                    )}
+
+                    {/* Col 24 (X): Approval Status */}
+                    {visiblePoCols['approvalStatus'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 whitespace-nowrap text-[11px] text-center">
+                        {row.approvalStatus ? (
+                          <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-[10px]">
+                            {row.approvalStatus}
                           </span>
-                          <span
-                            onClick={onNavigateToAutomation}
-                            className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-800 bg-emerald-100 border border-emerald-300 rounded px-1.5 py-0.5 cursor-pointer hover:bg-emerald-200"
-                            title="Click to view in Product Automation"
-                          >
-                            <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                            <span>Active (Open)</span>
-                            <ExternalLink className="w-2.5 h-2.5 ml-0.5" />
-                          </span>
-                        </div>
-                      ) : (
-                        <div className="flex items-center gap-1.5">
-                          <input
-                            ref={(el) => {
-                              orderInputRefs.current[row.orderId] = el;
-                            }}
-                            type="text"
-                            placeholder="e.g. DLFSO2526-01752"
-                            value={inputOrderNos[row.orderId] ?? ''}
-                            onChange={(e) => setInputOrderNos({ ...inputOrderNos, [row.orderId]: e.target.value })}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
+                        ) : (
+                          <span className="text-slate-300">—</span>
+                        )}
+                      </td>
+                    )}
+
+                    {/* Col 25 (Y): Branch Head Name (Default: Vinay Chhajer when blank) */}
+                    {visiblePoCols['branchHeadName'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 text-slate-800 font-medium whitespace-nowrap text-[11px]">
+                        {cleanBranchHeadName}
+                      </td>
+                    )}
+
+                    {/* Col 26 (Z): Branch Head Email (Default: vinay.chhajer@ginzalimited.com when blank) */}
+                    {visiblePoCols['branchHeadEmail'] !== false && (
+                      <td className="px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] whitespace-nowrap">
+                        {cleanBranchHeadEmail}
+                      </td>
+                    )}
+
+                    {/* Col 27 (AA): ORDER NO (O.N GENERATE) - 2-WAY SYNCED WITH GOOGLE SHEET COL AA */}
+                    {visiblePoCols['orderNo'] !== false && (
+                      <td className="px-2.5 py-1 border-r border-slate-300 bg-emerald-50/30 whitespace-nowrap">
+                        {hasOrderNo && !isEditingThisRow ? (
+                          <div className="flex items-center gap-1.5">
+                            <span
+                              onClick={() => {
+                                setInputOrderNos(prev => ({ ...prev, [row.orderId]: cleanOrderNo }));
+                                setEditingRowOrderId(row.orderId);
+                              }}
+                              className="font-mono font-bold text-slate-900 px-2 py-0.5 rounded bg-white border border-slate-300 hover:border-emerald-500 shadow-2xs text-[11px] cursor-pointer flex items-center gap-1"
+                              title="Click to edit Order No (Syncs with Google Sheet Col AA & Order Automation)"
+                            >
+                              <span>{cleanOrderNo}</span>
+                              <Edit3 className="w-2.5 h-2.5 text-slate-400" />
+                            </span>
+                            <span
+                              onClick={onNavigateToAutomation}
+                              className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-800 bg-emerald-100 border border-emerald-300 rounded px-1.5 py-0.5 cursor-pointer hover:bg-emerald-200"
+                              title="Click to view in Order Automation"
+                            >
+                              <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                              <span>Active (Open)</span>
+                              <ExternalLink className="w-2.5 h-2.5 ml-0.5" />
+                            </span>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-1.5">
+                            <input
+                              ref={(el) => {
+                                orderInputRefs.current[row.orderId] = el;
+                              }}
+                              type="text"
+                              placeholder="e.g. FSO/04599/11/26"
+                              value={inputOrderNos[row.orderId] ?? cleanOrderNo}
+                              onChange={(e) => setInputOrderNos({ ...inputOrderNos, [row.orderId]: e.target.value })}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  onGenerateOrderNo(row.orderId, inputOrderNos[row.orderId]);
+                                  setEditingRowOrderId(null);
+                                } else if (e.key === 'Escape') {
+                                  setEditingRowOrderId(null);
+                                }
+                              }}
+                              className={`w-36 px-1.5 py-0.5 text-[11px] bg-white border rounded font-mono font-semibold focus:outline-none focus:ring-2 ${
+                                isHighlighted
+                                  ? 'border-amber-600 ring-2 ring-amber-400 bg-amber-50'
+                                  : 'border-amber-300 focus:ring-amber-500'
+                              }`}
+                            />
+                            <button
+                              onClick={() => {
                                 onGenerateOrderNo(row.orderId, inputOrderNos[row.orderId]);
-                              }
-                            }}
-                            className={`w-36 px-1.5 py-0.5 text-[11px] bg-white border rounded font-mono font-semibold focus:outline-none focus:ring-2 ${
-                              isHighlighted
-                                ? 'border-amber-600 ring-2 ring-amber-400 bg-amber-50'
-                                : 'border-amber-300 focus:ring-amber-500'
-                            }`}
-                          />
-                          <button
-                            onClick={() => onGenerateOrderNo(row.orderId, inputOrderNos[row.orderId])}
-                            className="px-2 py-0.5 bg-emerald-700 hover:bg-emerald-800 text-white font-bold rounded text-[11px] shadow-2xs flex items-center gap-1 transition-colors cursor-pointer"
-                            title="Assign Order No and push to Product Automation with Col AN default Open"
-                          >
-                            <Sparkles className="w-3 h-3" />
-                            <span>Generate O.N</span>
-                          </button>
-                        </div>
-                      )}
-                    </td>
+                                setEditingRowOrderId(null);
+                              }}
+                              className="px-2 py-0.5 bg-emerald-700 hover:bg-emerald-800 text-white font-bold rounded text-[11px] shadow-2xs flex items-center gap-1 transition-colors cursor-pointer"
+                              title="Save Order No (Col AA) & Timestamp (Col AB) to Sheet & Order Automation"
+                            >
+                              <Sparkles className="w-3 h-3" />
+                              <span>{isEditingThisRow ? 'Save O.N' : 'Generate O.N'}</span>
+                            </button>
+                            {isEditingThisRow && (
+                              <button
+                                type="button"
+                                onClick={() => setEditingRowOrderId(null)}
+                                className="p-0.5 text-slate-400 hover:text-slate-700 cursor-pointer"
+                                title="Cancel"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </td>
+                    )}
 
-                    {/* Col 28: Timestamp ( O.N Generate ) */}
-                    <td className="px-2 py-1 text-slate-600 font-mono whitespace-nowrap text-[10px]">
-                      {displayOrderNoTimestamp}
-                    </td>
+                    {/* Col 28 (AB): Timestamp ( O.N Generate ) - 1:1 from Google Sheet Col AB */}
+                    {visiblePoCols['orderNoTimestamp'] !== false && (
+                      <td className="px-2 py-1 text-slate-700 font-mono whitespace-nowrap text-[10px] bg-emerald-50/10">
+                        {displayOrderNoTimestamp}
+                      </td>
+                    )}
                   </tr>
                 );
               })
@@ -860,7 +986,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
       <div className="px-3 py-1.5 bg-slate-100 border border-slate-300 rounded-lg flex flex-wrap items-center justify-between gap-2 text-xs select-none">
         <div className="flex items-center gap-2 text-slate-600 font-medium">
           <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-blue-100 text-blue-900 border border-blue-200 font-bold">
-            <span>Total Orders (Delhi!A:Z):</span>
+            <span>Total Orders (Product Order A:AB):</span>
             <strong className="font-mono">{orders.length.toLocaleString()}</strong>
           </span>
           <span>
@@ -924,6 +1050,131 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
         </div>
       </div>
 
+      {/* MODAL: PRODUCT ORDER COLUMN VISIBILITY MANAGER (HIDE / SHOW 28 COLUMNS) */}
+      {showPoColManager && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full border border-slate-200 overflow-hidden">
+            <div className="px-5 py-3.5 bg-slate-900 text-white flex items-center justify-between">
+              <div>
+                <h3 className="font-bold text-sm flex items-center gap-2">
+                  <Columns className="w-4 h-4 text-blue-400" />
+                  Customize Product Order Columns (Hide / Show)
+                </h3>
+                <p className="text-[11px] text-slate-300">
+                  Select which columns (1/A to 28/AB) appear in the Product Order tab
+                </p>
+              </div>
+              <button onClick={() => setShowPoColManager(false)} className="text-slate-400 hover:text-white cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-3 max-h-[60vh] overflow-y-auto text-xs">
+              {/* Quick toggle presets */}
+              <div className="flex flex-wrap items-center gap-2 pb-2 border-b border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const all: Record<string, boolean> = {};
+                    productOrderColumns.forEach(c => {
+                      all[c.id] = true;
+                    });
+                    setVisiblePoCols(all);
+                  }}
+                  className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 rounded font-medium text-slate-700 cursor-pointer"
+                >
+                  Show All 28
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const focused: Record<string, boolean> = {};
+                    const hideSet = new Set(['customerEmail', 'billingAddress', 'deliveryAddress', 'branchHeadName', 'branchHeadEmail']);
+                    productOrderColumns.forEach(c => {
+                      focused[c.id] = !hideSet.has(c.id);
+                    });
+                    setVisiblePoCols(focused);
+                  }}
+                  className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 rounded font-medium text-slate-700 cursor-pointer"
+                >
+                  Hide Addresses &amp; Emails (23)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const compact: Record<string, boolean> = {};
+                    const keepSet = new Set([
+                      'referenceNo',
+                      'customerPO',
+                      'customerName',
+                      'orderDate',
+                      'unit',
+                      'itemName',
+                      'color',
+                      'width',
+                      'qty',
+                      'rate',
+                      'salesPerson',
+                      'orderNo',
+                      'orderNoTimestamp'
+                    ]);
+                    productOrderColumns.forEach(c => {
+                      compact[c.id] = keepSet.has(c.id);
+                    });
+                    setVisiblePoCols(compact);
+                  }}
+                  className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 rounded font-medium text-slate-700 cursor-pointer"
+                >
+                  Compact Order Entry (13)
+                </button>
+              </div>
+
+              {/* Grid of all 28 columns */}
+              <div className="grid grid-cols-2 gap-1.5">
+                {productOrderColumns.map((col, idx) => {
+                  const colLetter = getPoSheetColLetter(idx);
+                  const isChecked = visiblePoCols[col.id] !== false;
+                  return (
+                    <label
+                      key={col.id}
+                      className={`flex items-center gap-2 p-1.5 rounded border transition-colors cursor-pointer ${
+                        isChecked
+                          ? 'bg-blue-50/60 border-blue-200 text-slate-900'
+                          : 'bg-slate-50 border-slate-200 text-slate-400'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={(e) => setVisiblePoCols(prev => ({ ...prev, [col.id]: e.target.checked }))}
+                        className="rounded text-blue-600 focus:ring-blue-500"
+                      />
+                      <span className="font-mono font-bold text-[10px] w-11 text-blue-800 shrink-0">
+                        {colLetter} ({idx + 1})
+                      </span>
+                      <span className="truncate text-xs">{col.label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="p-3 bg-slate-50 border-t border-slate-200 flex items-center justify-between">
+              <span className="text-[11px] text-slate-500">
+                {visiblePoColsCount} of 28 columns visible
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowPoColManager(false)}
+                className="px-4 py-1.5 bg-slate-900 text-white rounded-lg text-xs font-semibold hover:bg-slate-800 cursor-pointer"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* MODAL: CLEAR ALL ROWS CONFIRMATION */}
       {showClearConfirmModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
@@ -947,7 +1198,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
               </p>
               <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-[11px] space-y-1">
                 <p className="font-semibold text-rose-900">• Tamam purane sample ya duplicate rows delete ho jayenge (0 rows bachengi).</p>
-                <p>• Iske baad aap apna pura data IMPORTRANGE (Delhi!A:Z) ya Google Sheet / Excel se bina kisi duplication ke 1:1 clean fresh upload kar sakte hain.</p>
+                <p>• Iske baad aap Sync Sheet (AA/AB) se fresh data load kar sakte hain.</p>
               </div>
             </div>
             <div className="px-5 py-3.5 bg-slate-50 border-t border-slate-200 flex items-center justify-end gap-2">

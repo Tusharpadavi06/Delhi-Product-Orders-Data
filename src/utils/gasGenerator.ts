@@ -18,13 +18,13 @@ export interface GasScriptConfig {
 
 export const defaultGasConfig: GasScriptConfig = {
   mode: 'delta-bigdata',
-  spreadsheetId: "14cIoLK1Z8Ihj1DakVtHvk-QPrCfJzQu2hco26MBHiYk",
+  spreadsheetId: "15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0",
   sourceSheetName: "Product Order",
   targetSheetName: "Product Automation",
   archiveSheetName: "Closed Orders",
   supabaseUrl: "https://anlwvumnbppnkkmyvljp.supabase.co",
   supabaseKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFubHd2dW1uYnBwbmtrbXl2bGpwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI1NjU4MDksImV4cCI6MjEwODE0MTgwOX0.PhSQNL3VzaocG7TSYRqmBcvH0cvXH9--INo82QqYvV4",
-  firebaseUrl: "https://ginza-fms-default-rtdb.firebaseio.com",
+  firebaseUrl: "https://delhi-product-order-default-rtdb.firebaseio.com",
   firebaseSecret: "iIElINFgR124ssaG3QWjExz2lT72cRh5g502oP6J",
   useFormulaForBalance: true,
   preserveDispatchData: true,
@@ -2398,6 +2398,7 @@ const FIREBASE_CONFIG = {
   DATABASE_SECRET: "${fbSecret}",
 
   // 3. Tab Names to Sync
+  SOURCE_TAB: "${config.sourceSheetName}",
   AUTOMATION_TAB: "${config.targetSheetName}",
   CLOSED_TAB: "${config.archiveSheetName}",
 
@@ -2406,6 +2407,8 @@ const FIREBASE_CONFIG = {
 
   // 5. Column Indices (1-indexed)
   FIRST_DATA_ROW: 2,
+  SOURCE_ORDER_NO_COL: 27,  // Col AA in "Product Order"
+  SOURCE_TIMESTAMP_COL: 28, // Col AB in "Product Order"
   ORDER_NO_COL: ${config.orderNoColTarget || 24}, // 24 (Col X)
   DISPATCH_COL: 25,         // Col Y
   BALANCE_COL: 26,          // Col Z
@@ -2422,15 +2425,110 @@ const FIREBASE_CONFIG = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("🔥 Firebase Sync")
+    .addItem("🔄 2-Way Sync 'Product Order' (Col AA Order No & Col AB Timestamp)", "syncProductOrderAAABWithFirebase")
     .addItem("🚀 Sync 'Product Automation' to Firebase", "syncProductAutomationToFirebase")
     .addItem("📦 Sync 'Closed Orders' to Firebase", "syncClosedOrdersToFirebase")
     .addSeparator()
-    .addItem("⚡ Full Safe Sync (Both Tabs)", "syncAllTabsToFirebase")
+    .addItem("⚡ Full Safe Sync (All Tabs + 2-Way AA/AB)", "syncAllTabsToFirebase")
     .addItem("🧹 Smart Offload (Move Closed to Firebase & Lighten Sheet)", "smartOffloadClosedOrders")
     .addSeparator()
     .addItem("📡 Test Firebase Connection", "testFirebaseConnection")
     .addItem("⏱️ Setup Hourly Auto-Sync Trigger", "createHourlyFirebaseTrigger")
     .addToUi();
+}
+
+/* =========================================================
+   0. 2-WAY MULTIPURPOSE SYNC: "PRODUCT ORDER" COL AA (27) & COL AB (28) <-> WEB APP
+   - Pulls Order Numbers entered in Web App (/product_order_aa_ab) into Sheet Col AA & Col AB
+   - Pushes Order Numbers entered in Sheet Col AA & Col AB to Firebase (/product_order_aa_ab)
+   ========================================================= */
+
+function syncProductOrderAAABWithFirebase() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(FIREBASE_CONFIG.SOURCE_TAB);
+  if (!sheet) return;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < FIREBASE_CONFIG.FIRST_DATA_ROW) return;
+
+  const baseUrl = FIREBASE_CONFIG.DATABASE_URL.replace(new RegExp('/+$'), '');
+  const authParam = FIREBASE_CONFIG.DATABASE_SECRET ? "?auth=" + encodeURIComponent(FIREBASE_CONFIG.DATABASE_SECRET) : "";
+  const url = baseUrl + "/product_order_aa_ab.json" + authParam;
+
+  const rowCount = lastRow - FIREBASE_CONFIG.FIRST_DATA_ROW + 1;
+  const maxCols = Math.max(sheet.getLastColumn(), 28);
+  const displayValues = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols).getDisplayValues();
+
+  // 1. Fetch existing Web App overrides from Firebase /product_order_aa_ab
+  let cloudAAAB = {};
+  try {
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (res.getResponseCode() >= 200 && res.getResponseCode() < 300) {
+      cloudAAAB = JSON.parse(res.getContentText() || "{}") || {};
+    }
+  } catch (e) {}
+
+  const tz = ss.getSpreadsheetTimeZone() || "Asia/Kolkata";
+  const nowFormatted = Utilities.formatDate(new Date(), tz, "dd/MM/yyyy HH:mm:ss");
+  const outgoingPatch = {};
+  let updatedInSheetCount = 0;
+
+  for (let i = 0; i < displayValues.length; i++) {
+    const row = displayValues[i];
+    const sheetRowNum = FIREBASE_CONFIG.FIRST_DATA_ROW + i;
+    const refNo = String(row[0] || "").trim();
+    const po = String(row[2] || "").trim() || "N/A";
+    const cust = String(row[3] || "").trim();
+    const ordDate = String(row[5] || "").trim();
+    const itemName = String(row[7] || "").trim();
+    if (!cust && !itemName) continue;
+
+    const ordSig = "ord_" + (po.toLowerCase() + "|" + cust.toLowerCase() + "|" + ordDate.toLowerCase()).replace(/[.#$/\[\]\s]+/g, "_");
+    let sheetAA = String(row[26] || "").trim(); // Col AA (27)
+    let sheetAB = String(row[27] || "").trim(); // Col AB (28)
+
+    const cloudEntry = cloudAAAB[ordSig];
+    if ((!sheetAA || sheetAA === "") && cloudEntry && cloudEntry.order_no) {
+      // Order No was entered in Web App -> Write into Google Sheet Col AA (27) & Col AB (28)!
+      sheetAA = String(cloudEntry.order_no).trim();
+      sheetAB = String(cloudEntry.order_no_timestamp || nowFormatted).trim();
+      sheet.getRange(sheetRowNum, 27).setValue(sheetAA);
+      sheet.getRange(sheetRowNum, 28).setValue(sheetAB);
+      updatedInSheetCount++;
+    } else if (sheetAA !== "") {
+      // Order No exists in Google Sheet Col AA -> Ensure Col AB has timestamp and sync to Firebase
+      if (!sheetAB) {
+        sheetAB = nowFormatted;
+        sheet.getRange(sheetRowNum, 28).setValue(sheetAB);
+      }
+      outgoingPatch[ordSig] = {
+        order_no: sheetAA,
+        order_no_timestamp: sheetAB,
+        reference_no: refNo,
+        customer_po: po,
+        customer_name: cust,
+        order_date: ordDate,
+        item_name: itemName,
+        sheet_row: sheetRowNum,
+        updated_at: new Date().toISOString()
+      };
+    }
+  }
+
+  if (Object.keys(outgoingPatch).length > 0) {
+    try {
+      UrlFetchApp.fetch(url, {
+        method: "PATCH",
+        contentType: "application/json",
+        payload: JSON.stringify(outgoingPatch),
+        muteHttpExceptions: true
+      });
+    } catch (e) {}
+  }
+
+  if (updatedInSheetCount > 0) {
+    ss.toast("Updated " + updatedInSheetCount + " Order Numbers in 'Product Order' (Col AA & AB) from Web Application!", "2-Way Sync", 4);
+  }
 }
 
 /* =========================================================
