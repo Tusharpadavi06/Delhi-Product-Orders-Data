@@ -681,28 +681,6 @@ export const Header: React.FC<HeaderProps> = ({
                   </div>
                 )}
               </div>
-
-              {/* Copy Script CTA */}
-              <button
-                onClick={onCopyCode}
-                className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg transition-all whitespace-nowrap shadow-xs cursor-pointer ${
-                  copied
-                    ? 'bg-emerald-600 text-white hover:bg-emerald-700'
-                    : 'bg-emerald-700 text-white hover:bg-emerald-800'
-                }`}
-              >
-                {copied ? (
-                  <>
-                    <Check className="w-3.5 h-3.5" />
-                    <span>Copied!</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Copy Script</span>
-                  </>
-                )}
-              </button>
             </div>
           </div>
         </div>

@@ -29,7 +29,7 @@ import {
 } from '../utils/gasGenerator';
 
 export const FirebaseSyncHub: React.FC = () => {
-  const [firebaseUrl, setFirebaseUrl] = useState("https://ginza-fms-default-rtdb.firebaseio.com");
+  const [firebaseUrl, setFirebaseUrl] = useState("https://delhi-product-order-default-rtdb.firebaseio.com");
   const [firebaseSecret, setFirebaseSecret] = useState("iIElINFgR124ssaG3QWjExz2lT72cRh5g502oP6J");
   const [activeTabName, setActiveTabName] = useState("Order Automation 1");
   const [closedTabName, setClosedTabName] = useState("Closed Orders");

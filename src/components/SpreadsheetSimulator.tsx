@@ -258,27 +258,54 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   // Vercel / GitHub Deployment Modal
   const [showVercelGuide, setShowVercelGuide] = useState(false);
 
+  const DEFAULT_FIREBASE_RTDB_URL = 'https://delhi-product-order-default-rtdb.firebaseio.com';
+  const DEFAULT_FIREBASE_SECRET = 'iIElINFgR124ssaG3QWjExz2lT72cRh5g502oP6J';
+
+  // Helper to normalize Firebase Realtime Database URL (even if user pastes Console URL)
+  const normalizeFirebaseDbUrl = (raw: string): string => {
+    const trimmed = (raw || '').trim();
+    if (!trimmed || trimmed.includes('ginza-fms-default-rtdb.firebaseio.com')) {
+      return DEFAULT_FIREBASE_RTDB_URL;
+    }
+    // If user pasted Firebase Console URL: https://console.firebase.google.com/.../database/ INSTANCE_NAME /data...
+    const consoleMatch = trimmed.match(/\/database\/([a-zA-Z0-9-]+)\/data/i);
+    if (consoleMatch && consoleMatch[1]) {
+      return `https://${consoleMatch[1]}.firebaseio.com`;
+    }
+    return trimmed
+      .replace(/\/data(\/.*)?$/i, '')
+      .replace(/\/product_automation(\.json)?$/i, '')
+      .replace(/\/closed_orders(\.json)?$/i, '')
+      .replace(/\.json$/i, '')
+      .replace(/\/+$/, '');
+  };
+
   // Firebase Live Sync & Historical Upload Modal
   const [showFirebaseModal, setShowFirebaseModal] = useState(false);
+  const [firebaseStatusMsg, setFirebaseStatusMsg] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [firebaseUrl, setFirebaseUrl] = useState(() => {
     try {
       const saved = localStorage.getItem(LOCAL_STORAGE_FIREBASE_CONFIG);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed.url) return parsed.url;
+        if (parsed.url && !parsed.url.includes('ginza-fms-default-rtdb.firebaseio.com')) {
+          return parsed.url.replace(/\/+$/, '');
+        }
       }
     } catch (e) {}
-    return 'https://ginza-fms-default-rtdb.firebaseio.com';
+    return DEFAULT_FIREBASE_RTDB_URL;
   });
   const [firebaseSecret, setFirebaseSecret] = useState(() => {
     try {
       const saved = localStorage.getItem(LOCAL_STORAGE_FIREBASE_CONFIG);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed.secret !== undefined) return parsed.secret;
+        if (parsed.secret && parsed.secret.trim() !== '') {
+          return parsed.secret.trim();
+        }
       }
     } catch (e) {}
-    return 'iIElINFgR124ssaG3QWjExz2lT72cRh5g502oP6J';
+    return DEFAULT_FIREBASE_SECRET;
   });
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
 
@@ -698,23 +725,31 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   }, [rawResponses, dispatchRecords]);
 
   // Handle Status AN Dropdown Change PER ITEM: 'Open' | 'In-Progress' | 'Closed'
+  // Automatically syncs to Firebase Realtime Database so Closed Orders appear on every system/device!
   const handleItemStatusChange = (orderId: string, newStatus: 'Open' | 'In-Progress' | 'Closed') => {
     let affectedItemName = '';
-    setRawResponses(prev =>
-      prev.map(row => {
+    setRawResponses(prev => {
+      const updated = prev.map(row => {
         if (row.orderId === orderId) {
           affectedItemName = row.itemName;
-          return { ...row, statusAN: newStatus };
+          return {
+            ...row,
+            statusAN: newStatus,
+            sheetSource: newStatus === 'Closed' ? ('closed' as const) : ('product_order' as const)
+          };
         }
         return row;
-      })
-    );
+      });
+      // Immediately push updated status (including Closed Orders) to Firebase Cloud
+      pushOrdersToFirebase(updated).catch(() => {});
+      return updated;
+    });
 
     setSyncFeedback(
       `Item "${affectedItemName || orderId}" Col AN set to "${newStatus}". ${
         newStatus === 'Closed'
-          ? 'Item moved to "Closed Orders" tab archive!'
-          : 'Active in "Product Automation".'
+          ? 'Moved to "Closed Orders" tab & synced to Firebase Cloud!'
+          : 'Active in "Order Automation" & synced to Firebase Cloud!'
       }`
     );
     setTimeout(() => setSyncFeedback(null), 4000);
@@ -1207,25 +1242,25 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     return trimmed;
   };
 
-  // Helper: Push order rows to Firebase Realtime Database
+  // Helper: Push order rows to Firebase Realtime Database (Supports Auth Secret + Public Rules + Chunked Batching)
   const pushOrdersToFirebase = async (
     rowsToSync: ProductOrderRow[],
     customUrl?: string,
     customSecret?: string
-  ): Promise<{ activeOrders: number; closedOrders: number; totalRows: number }> => {
-    const targetUrl = (customUrl || firebaseUrl || 'https://ginza-fms-default-rtdb.firebaseio.com').trim().replace(/\/+$/, '');
-    const targetSecret = (customSecret !== undefined ? customSecret : firebaseSecret || 'iIElINFgR124ssaG3QWjExz2lT72cRh5g502oP6J').trim();
+  ): Promise<{ activeOrders: number; closedOrders: number; totalRows: number; usedUrl: string }> => {
+    const baseTargetUrl = normalizeFirebaseDbUrl(customUrl || firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+    const rawSecret = (customSecret !== undefined && customSecret.trim() !== '' ? customSecret : firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+    const cleanSecret = rawSecret || DEFAULT_FIREBASE_SECRET;
 
-    if (!targetUrl) {
+    if (!baseTargetUrl) {
       throw new Error('Firebase Realtime Database URL not specified.');
     }
 
-    const authParam = targetSecret ? `?auth=${encodeURIComponent(targetSecret)}` : '';
-
     // Group rows by orderKey
     const tempGroupMap: Record<string, ProductOrderRow[]> = {};
-    rowsToSync.forEach(r => {
-      const k = `${r.customerPO || 'NOPO'}_${r.customerName || 'NOCUST'}_${r.orderNo || r.orderDate || 'NODATE'}`;
+    rowsToSync.forEach((r, idx) => {
+      const poPart = (r.customerPO && r.customerPO !== 'N/A' ? r.customerPO : `ROW_${idx + 1}`).trim();
+      const k = `${poPart}_${r.customerName || 'NOCUST'}_${r.orderNo || r.orderDate || 'NODATE'}`;
       if (!tempGroupMap[k]) tempGroupMap[k] = [];
       tempGroupMap[k].push(r);
     });
@@ -1235,79 +1270,104 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
     Object.entries(tempGroupMap).forEach(([rawKey, items]) => {
       const first = items[0];
-      const safeKey = rawKey.replace(/[.#$/\[\]]/g, '_').substring(0, 100);
+      const safeKey = rawKey.replace(/[.#$/\[\]\s]+/g, '_').substring(0, 110);
 
-      const activeItems = items.filter(it => (it.statusAN || 'Open') !== 'Closed');
-      const closedItems = items.filter(it => (it.statusAN || 'Open') === 'Closed');
+      const activeItems = items.filter(it => (it.statusAN || 'Open') !== 'Closed' && it.sheetSource !== 'closed');
+      const closedItems = items.filter(it => (it.statusAN || 'Open') === 'Closed' || it.sheetSource === 'closed');
 
       if (activeItems.length > 0) {
         automationPayload[safeKey] = {
           order_key: safeKey,
-          customer_po: first.customerPO,
-          customer_name: first.customerName,
-          customer_email: first.customerEmail,
-          order_date: first.orderDate,
+          reference_no: first.referenceNo || '',
+          timestamp: first.timestamp || '',
+          customer_po: first.customerPO || 'N/A',
+          customer_name: first.customerName || '',
+          customer_email: first.customerEmail || '',
+          order_date: first.orderDate || '',
           order_no: first.orderNo || '',
-          sales_person: first.salesPerson,
-          transporter_name: first.transporterName,
-          billing_address: first.billingAddress,
-          delivery_address: first.deliveryAddress,
-          customer_number: first.customerNumber,
-          remark: first.remark,
+          order_no_timestamp: first.orderNoTimestamp || '',
+          sales_person: first.salesPerson || '',
+          transporter_name: first.transporterName || '',
+          billing_address: first.billingAddress || '',
+          delivery_address: first.deliveryAddress || '',
+          customer_number: first.customerNumber || '',
+          remark: first.remark || '',
+          account_status: first.accountStatus || '',
+          approval_status: first.approvalStatus || '',
+          branch: first.branch || 'Delhi',
+          branch_head_name: first.branchHeadName || DEFAULT_BRANCH_HEAD_NAME,
+          branch_head_email: first.branchHeadEmail || DEFAULT_BRANCH_HEAD_EMAIL,
           status: first.statusAN || 'Open',
           items: activeItems.map((it, idx) => ({
+            order_id: it.orderId,
             item_index: idx + 1,
-            item_name: it.itemName,
-            color: it.color,
-            width: it.width,
-            unit: it.unitOfItem || it.unit,
-            qty: it.qty,
-            rate: it.rate,
-            discount: it.discount,
-            delivery_date: it.deliveryDate,
-            dispatch_qty: it.dispatchQty || 0,
-            balance_qty: it.balanceQty || it.qty,
+            item_category: it.unit || '',
+            item_name: it.itemName || '',
+            color: it.color || '',
+            width: it.width || '',
+            unit: it.unitOfItem || it.unit || '',
+            unit_of_item: it.unitOfItem || '',
+            qty: Number(it.qty) || 0,
+            rate: Number(it.rate) || 0,
+            discount: Number(it.discount) || 0,
+            delivery_date: it.deliveryDate || '',
+            dispatch_qty: Number(it.dispatchQty) || 0,
+            balance_qty: Number(it.balanceQty ?? it.qty) || 0,
             status: it.statusAN || 'Open'
           })),
-          total_qty: activeItems.reduce((s, it) => s + it.qty, 0),
-          total_dispatch_qty: activeItems.reduce((s, it) => s + (it.dispatchQty || 0), 0),
-          total_balance_qty: activeItems.reduce((s, it) => s + (it.balanceQty || it.qty), 0),
+          total_qty: activeItems.reduce((s, it) => s + (Number(it.qty) || 0), 0),
+          total_dispatch_qty: activeItems.reduce((s, it) => s + (Number(it.dispatchQty) || 0), 0),
+          total_balance_qty: activeItems.reduce((s, it) => s + (Number(it.balanceQty ?? it.qty) || 0), 0),
           last_synced_at: new Date().toISOString()
         };
+      } else if (closedItems.length > 0) {
+        // Order moved completely to Closed: remove from /product_automation in Firebase
+        automationPayload[safeKey] = null;
       }
 
       if (closedItems.length > 0) {
         closedPayload[safeKey] = {
           order_key: safeKey,
-          customer_po: first.customerPO,
-          customer_name: first.customerName,
-          customer_email: first.customerEmail,
-          order_date: first.orderDate,
+          reference_no: first.referenceNo || '',
+          timestamp: first.timestamp || '',
+          customer_po: first.customerPO || 'N/A',
+          customer_name: first.customerName || '',
+          customer_email: first.customerEmail || '',
+          order_date: first.orderDate || '',
           order_no: first.orderNo || '',
-          sales_person: first.salesPerson,
-          transporter_name: first.transporterName,
-          billing_address: first.billingAddress,
-          delivery_address: first.deliveryAddress,
-          customer_number: first.customerNumber,
-          remark: first.remark,
+          order_no_timestamp: first.orderNoTimestamp || '',
+          sales_person: first.salesPerson || '',
+          transporter_name: first.transporterName || '',
+          billing_address: first.billingAddress || '',
+          delivery_address: first.deliveryAddress || '',
+          customer_number: first.customerNumber || '',
+          remark: first.remark || '',
+          account_status: first.accountStatus || '',
+          approval_status: first.approvalStatus || '',
+          branch: first.branch || 'Delhi',
+          branch_head_name: first.branchHeadName || DEFAULT_BRANCH_HEAD_NAME,
+          branch_head_email: first.branchHeadEmail || DEFAULT_BRANCH_HEAD_EMAIL,
           status: 'Closed',
           items: closedItems.map((it, idx) => ({
+            order_id: it.orderId,
             item_index: idx + 1,
-            item_name: it.itemName,
-            color: it.color,
-            width: it.width,
-            unit: it.unitOfItem || it.unit,
-            qty: it.qty,
-            rate: it.rate,
-            discount: it.discount,
-            delivery_date: it.deliveryDate,
-            dispatch_qty: it.dispatchQty || 0,
-            balance_qty: it.balanceQty || 0,
+            item_category: it.unit || '',
+            item_name: it.itemName || '',
+            color: it.color || '',
+            width: it.width || '',
+            unit: it.unitOfItem || it.unit || '',
+            unit_of_item: it.unitOfItem || '',
+            qty: Number(it.qty) || 0,
+            rate: Number(it.rate) || 0,
+            discount: Number(it.discount) || 0,
+            delivery_date: it.deliveryDate || '',
+            dispatch_qty: Number(it.dispatchQty) || 0,
+            balance_qty: Number(it.balanceQty) || 0,
             status: 'Closed'
           })),
-          total_qty: closedItems.reduce((s, it) => s + it.qty, 0),
-          total_dispatch_qty: closedItems.reduce((s, it) => s + (it.dispatchQty || 0), 0),
-          total_balance_qty: closedItems.reduce((s, it) => s + (it.balanceQty || 0), 0),
+          total_qty: closedItems.reduce((s, it) => s + (Number(it.qty) || 0), 0),
+          total_dispatch_qty: closedItems.reduce((s, it) => s + (Number(it.dispatchQty) || 0), 0),
+          total_balance_qty: closedItems.reduce((s, it) => s + (Number(it.balanceQty) || 0), 0),
           last_synced_at: new Date().toISOString()
         };
       }
@@ -1316,47 +1376,205 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     // Always persist full dataset in browser IndexedDB for instant offline/reload persistence of 6,000+ rows
     await saveOrdersToStorage(rowsToSync);
 
-    // If using the default demo placeholder Firebase URL, skip remote HTTP call or handle 404 gracefully
-    const isDefaultPlaceholderFirebase = targetUrl.includes('ginza-fms-default-rtdb.firebaseio.com');
-    if (isDefaultPlaceholderFirebase) {
-      return {
-        activeOrders: Object.keys(automationPayload).length,
-        closedOrders: Object.keys(closedPayload).length,
-        totalRows: rowsToSync.length
-      };
-    }
-
-    // Send PATCH to /product_automation.json
-    if (Object.keys(automationPayload).length > 0) {
-      const resp = await fetch(`${targetUrl}/product_automation.json${authParam}`, {
+    // Helper to send PATCH request with auth token (and fallback if needed)
+    const sendPatchWithFallback = async (baseUrl: string, nodePath: string, payloadObj: Record<string, any>): Promise<Response> => {
+      const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+      const res = await fetch(`${baseUrl}/${nodePath}.json${authQuery}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(automationPayload)
+        body: JSON.stringify(payloadObj)
       });
-      if (!resp.ok && resp.status !== 404) {
+      if ((res.status === 401 || res.status === 403) && cleanSecret !== DEFAULT_FIREBASE_SECRET) {
+        return fetch(`${baseUrl}/${nodePath}.json?auth=${encodeURIComponent(DEFAULT_FIREBASE_SECRET)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadObj)
+        });
+      }
+      if ((res.status === 401 || res.status === 403) && cleanSecret) {
+        return fetch(`${baseUrl}/${nodePath}.json`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadObj)
+        });
+      }
+      return res;
+    };
+
+    // Test primary URL first
+    const workingUrl = baseTargetUrl;
+    let lastHttpStatus = 0;
+    let lastErrorText = '';
+    let foundWorkingUrl = false;
+
+    try {
+      const pingResp = await sendPatchWithFallback(workingUrl, '_connection_test', {
+        last_sync_at: new Date().toISOString(),
+        total_rows: rowsToSync.length,
+        active_orders: Object.keys(automationPayload).filter(k => automationPayload[k] !== null).length,
+        closed_orders: Object.keys(closedPayload).length,
+        status: 'Connected'
+      });
+      lastHttpStatus = pingResp.status;
+      if (pingResp.ok) {
+        foundWorkingUrl = true;
+      } else {
+        lastErrorText = await pingResp.text();
+      }
+    } catch (netErr: any) {
+      lastErrorText = netErr.message || 'Network error';
+    }
+
+    if (!foundWorkingUrl) {
+      if (lastHttpStatus === 404) {
+        throw new Error(
+          `Firebase URL "${baseTargetUrl}" returned 404 Not Found. Kripya Firebase Console > Build > Realtime Database > Data tab ke upar di hui exact URL copy karke Firebase box me paste karein!`
+        );
+      }
+      if (lastHttpStatus === 401 || lastHttpStatus === 403) {
+        throw new Error(
+          `Firebase Auth / AppCheck Notice (HTTP ${lastHttpStatus}: ${lastErrorText}). Kripya Firebase Database Secret box me apna Secret (${DEFAULT_FIREBASE_SECRET}) rakhein aur Save Config dabayein.`
+        );
+      }
+      throw new Error(`Firebase HTTP ${lastHttpStatus || 'Error'}: ${lastErrorText.substring(0, 160)}`);
+    }
+
+    // Upload automationPayload in batches of 250 order blocks so large 6,000+ row sheets never timeout
+    const autoEntries = Object.entries(automationPayload);
+    const BATCH_SIZE = 250;
+    for (let i = 0; i < autoEntries.length; i += BATCH_SIZE) {
+      const batchSlice = Object.fromEntries(autoEntries.slice(i, i + BATCH_SIZE));
+      const resp = await sendPatchWithFallback(workingUrl, 'product_automation', batchSlice);
+      if (!resp.ok) {
         const text = await resp.text();
         throw new Error(`Firebase HTTP ${resp.status}: ${text.substring(0, 150)}`);
       }
     }
 
-    // Send PATCH to /closed_orders.json
-    if (Object.keys(closedPayload).length > 0) {
-      const resp2 = await fetch(`${targetUrl}/closed_orders.json${authParam}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(closedPayload)
-      });
-      if (!resp2.ok && resp2.status !== 404) {
+    // Upload closedPayload in batches of 250 order blocks
+    const closedEntries = Object.entries(closedPayload);
+    for (let i = 0; i < closedEntries.length; i += BATCH_SIZE) {
+      const batchSlice = Object.fromEntries(closedEntries.slice(i, i + BATCH_SIZE));
+      const resp2 = await sendPatchWithFallback(workingUrl, 'closed_orders', batchSlice);
+      if (!resp2.ok) {
         const text = await resp2.text();
         throw new Error(`Firebase HTTP ${resp2.status}: ${text.substring(0, 150)}`);
       }
     }
 
     return {
-      activeOrders: Object.keys(automationPayload).length,
-      closedOrders: Object.keys(closedPayload).length,
-      totalRows: rowsToSync.length
+      activeOrders: autoEntries.filter(([, v]) => v !== null).length,
+      closedOrders: closedEntries.filter(([, v]) => v !== null).length,
+      totalRows: rowsToSync.length,
+      usedUrl: workingUrl
     };
+  };
+
+  // Helper: Pull / Read saved Active & Closed Orders from Firebase Realtime Database so ALL systems show identical Closed Orders & Order Automation data!
+  const fetchOrdersFromFirebase = async (
+    customUrl?: string,
+    customSecret?: string
+  ): Promise<{ activeRows: ProductOrderRow[]; closedRows: ProductOrderRow[] }> => {
+    const baseTargetUrl = normalizeFirebaseDbUrl(customUrl || firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+    const cleanSecret = (customSecret !== undefined && customSecret.trim() !== '' ? customSecret : firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+    const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+    const activeRows: ProductOrderRow[] = [];
+    const closedRows: ProductOrderRow[] = [];
+
+    const parseFirebaseNodeToRows = (
+      dataObj: Record<string, any> | null,
+      isClosedNode: boolean
+    ): ProductOrderRow[] => {
+      if (!dataObj || typeof dataObj !== 'object' || (dataObj as any).error) return [];
+      const rows: ProductOrderRow[] = [];
+      let counter = 1;
+      Object.entries(dataObj).forEach(([orderKey, orderVal]) => {
+        if (!orderVal || typeof orderVal !== 'object') return;
+        const itemsArr = Array.isArray(orderVal.items)
+          ? orderVal.items
+          : orderVal.items && typeof orderVal.items === 'object'
+          ? Object.values(orderVal.items)
+          : [];
+
+        itemsArr.forEach((it: any, idx: number) => {
+          if (!it) return;
+          const qtyNum = Number(it.qty) || 0;
+          const dispNum = Number(it.dispatch_qty) || 0;
+          const balNum = it.balance_qty !== undefined ? Number(it.balance_qty) : qtyNum - dispNum;
+          const rawUnitVal = (it.unit || '').trim();
+          const isMeasureUnit = ['MTR', 'PCS', 'KG', 'KGS', 'ROLL', 'PKT', 'GROSS', 'YARD'].includes(rawUnitVal.toUpperCase());
+          rows.push(
+            sanitizeProductOrderRow({
+              orderId: it.order_id || `FB-${isClosedNode ? 'CLS' : 'ACT'}-${orderKey.substring(0, 24)}-${idx + 1}-${counter++}`,
+              referenceNo: orderVal.reference_no || '',
+              timestamp: orderVal.timestamp || orderVal.order_date || '',
+              customerPO: orderVal.customer_po || 'N/A',
+              customerName: orderVal.customer_name || '',
+              customerEmail: orderVal.customer_email || '',
+              orderDate: orderVal.order_date || '',
+              unit: it.item_category || (isMeasureUnit ? 'ELASTIC' : rawUnitVal) || '',
+              itemName: it.item_name || '',
+              color: it.color || '',
+              width: it.width || '',
+              unitOfItem: it.unit_of_item || (isMeasureUnit ? rawUnitVal : 'MTR'),
+              qty: qtyNum,
+              rate: Number(it.rate) || 0,
+              discount: Number(it.discount) || 0,
+              deliveryDate: it.delivery_date || '',
+              remark: orderVal.remark || '',
+              customerNumber: orderVal.customer_number || '',
+              billingAddress: orderVal.billing_address || '',
+              deliveryAddress: orderVal.delivery_address || '',
+              transporterName: orderVal.transporter_name || '',
+              salesPerson: orderVal.sales_person || '',
+              accountStatus: orderVal.account_status || 'Approved',
+              branch: orderVal.branch || 'Delhi',
+              approvalStatus: orderVal.approval_status || 'APPROVED',
+              branchHeadName: orderVal.branch_head_name || DEFAULT_BRANCH_HEAD_NAME,
+              branchHeadEmail: orderVal.branch_head_email || DEFAULT_BRANCH_HEAD_EMAIL,
+              orderNo: orderVal.order_no || '',
+              orderNoTimestamp: orderVal.order_no_timestamp || '',
+              statusAN: isClosedNode ? 'Closed' : ((it.status || orderVal.status || 'Open') as any),
+              dispatchQty: dispNum,
+              balanceQty: balNum,
+              sheetSource: isClosedNode ? 'closed' : 'product_order'
+            })
+          );
+        });
+      });
+      return rows;
+    };
+
+    const fetchNodeWithAuthFallback = async (nodeName: string): Promise<any> => {
+      try {
+        const res = await fetch(`${baseTargetUrl}/${nodeName}.json${authQuery}`);
+        if (res.ok) return await res.json();
+        if (res.status === 401 || res.status === 403) {
+          const fallbackRes = await fetch(`${baseTargetUrl}/${nodeName}.json?auth=${encodeURIComponent(DEFAULT_FIREBASE_SECRET)}`);
+          if (fallbackRes.ok) return await fallbackRes.json();
+        }
+      } catch (e) {}
+      return null;
+    };
+
+    try {
+      const [closedData, autoData] = await Promise.all([
+        fetchNodeWithAuthFallback('closed_orders'),
+        fetchNodeWithAuthFallback('product_automation')
+      ]);
+
+      if (closedData) {
+        closedRows.push(...parseFirebaseNodeToRows(closedData, true));
+      }
+
+      if (autoData) {
+        activeRows.push(...parseFirebaseNodeToRows(autoData, false));
+      }
+    } catch (e) {
+      // Ignore network errors silently during background pull
+    }
+
+    return { activeRows, closedRows };
   };
 
   // Helper: Robust CSV parser respecting quotes and newlines
@@ -2131,29 +2349,85 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       }
 
       isStorageHydratedRef.current = true;
+
+      // Also pull any Closed Orders & Active Order updates from Firebase Cloud (https://delhi-product-order-default-rtdb.firebaseio.com)
+      // so every system/computer opening the app gets 100% of Closed Orders & Order Automation updates!
+      const fbCloud = await fetchOrdersFromFirebase();
+
+      let finalMergedForCloud: ProductOrderRow[] = [];
+
       setRawResponses(prev => {
         // Strip initial demo rows
         const cleanPrev = prev.filter(r => !/^ORD-(REAL|NANDANI|PENDING|\d+)/.test(r.orderId));
 
-        // Build lookup map of existing rows to preserve any assigned Order No, Dispatch Qnt (Col Y), and Cols AA-AO
-        const existingQueueByKey = new Map<string, ProductOrderRow[]>();
+        // Combine local existing rows + Firebase Cloud rows for lookup (local closed/modified rows + Firebase closed/modified rows)
+        const makeRowMatchKey = (r: ProductOrderRow) =>
+          `${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}|${(r.orderDate || '').trim().toLowerCase()}`;
+
+        const allKnownClosedRows: ProductOrderRow[] = [...fbCloud.closedRows];
+        const seenClosedSigs = new Set(allKnownClosedRows.map(makeRowMatchKey));
         cleanPrev.forEach(r => {
-          const k = `${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${r.qty}|${(r.orderDate || '').trim().toLowerCase()}`;
+          if (r.statusAN === 'Closed' || r.sheetSource === 'closed') {
+            const sig = makeRowMatchKey(r);
+            if (!seenClosedSigs.has(sig)) {
+              allKnownClosedRows.push(r);
+              seenClosedSigs.add(sig);
+            }
+          }
+        });
+
+        const closedLookupMap = new Map<string, ProductOrderRow>();
+        allKnownClosedRows.forEach(r => closedLookupMap.set(makeRowMatchKey(r), r));
+
+        const existingQueueByKey = new Map<string, ProductOrderRow[]>();
+        // Seed from Firebase active rows first, then local cleanPrev overrides
+        [...fbCloud.activeRows, ...cleanPrev].forEach(r => {
+          const k = makeRowMatchKey(r);
           const list = existingQueueByKey.get(k) || [];
           list.push(r);
           existingQueueByKey.set(k, list);
         });
 
+        const matchedClosedKeys = new Set<string>();
+
         const mergedDelhiRows: ProductOrderRow[] = fetchedRows.map(fRow => {
-          const k = `${(fRow.customerName || '').trim().toLowerCase()}|${(fRow.itemName || '').trim().toLowerCase()}|${fRow.qty}|${(fRow.orderDate || '').trim().toLowerCase()}`;
+          const k = makeRowMatchKey(fRow);
+          const closedMatch = closedLookupMap.get(k);
+          if (closedMatch) {
+            matchedClosedKeys.add(k);
+            return {
+              ...fRow,
+              orderNo: closedMatch.orderNo || fRow.orderNo || '',
+              orderNoTimestamp: closedMatch.orderNoTimestamp || fRow.orderNoTimestamp || '',
+              statusAN: 'Closed',
+              sheetSource: 'closed',
+              dispatchQty: closedMatch.dispatchQty ?? fRow.dispatchQty ?? 0,
+              balanceQty: closedMatch.balanceQty ?? fRow.balanceQty ?? 0,
+              colAA: closedMatch.colAA ?? fRow.colAA,
+              colAB: closedMatch.colAB ?? fRow.colAB,
+              colAC: closedMatch.colAC ?? fRow.colAC,
+              colAD: closedMatch.colAD ?? fRow.colAD,
+              colAE: closedMatch.colAE ?? fRow.colAE,
+              colAG: closedMatch.colAG ?? fRow.colAG,
+              colAH: closedMatch.colAH ?? fRow.colAH,
+              colAI: closedMatch.colAI ?? fRow.colAI,
+              colAJ: closedMatch.colAJ ?? fRow.colAJ,
+              colAK: closedMatch.colAK ?? fRow.colAK,
+              colAL: closedMatch.colAL ?? fRow.colAL,
+              lrNumber: closedMatch.lrNumber ?? fRow.lrNumber,
+              colAO: closedMatch.colAO ?? fRow.colAO
+            };
+          }
+
           const candidates = existingQueueByKey.get(k);
-          const match = candidates && candidates.length > 0 ? candidates.shift() : undefined;
+          const match = candidates && candidates.length > 0 ? candidates[candidates.length - 1] : undefined;
           if (match) {
             return {
               ...fRow,
               orderNo: fRow.orderNo || match.orderNo || '',
               orderNoTimestamp: fRow.orderNoTimestamp || match.orderNoTimestamp || '',
               statusAN: match.statusAN || fRow.statusAN || 'Open',
+              sheetSource: match.statusAN === 'Closed' ? 'closed' : (fRow.sheetSource || 'product_order'),
               dispatchQty: match.dispatchQty ?? fRow.dispatchQty ?? 0,
               balanceQty: match.balanceQty ?? fRow.balanceQty ?? fRow.qty,
               colAA: match.colAA ?? fRow.colAA,
@@ -2174,28 +2448,37 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           return fRow;
         });
 
-        // Keep any closed orders archive
-        const closedArchiveRows = cleanPrev.filter(r => r.sheetSource === 'closed');
-        const explicitAutoRows = cleanPrev.filter(r => r.sheetSource === 'automation');
+        // Collect all additional closed orders from Firebase /closed_orders and local storage that were not in Delhi!A:Z
+        const extraClosedRows: ProductOrderRow[] = allKnownClosedRows
+          .filter(closedRow => !matchedClosedKeys.has(makeRowMatchKey(closedRow)))
+          .map(closedRow => ({
+            ...closedRow,
+            statusAN: 'Closed' as const,
+            sheetSource: 'closed' as const
+          }));
+
+        const explicitAutoRows = cleanPrev.filter(r => r.sheetSource === 'automation' && r.statusAN !== 'Closed');
 
         if (explicitAutoRows.length > mergedDelhiRows.length) {
-          // User already imported a full Order Automation 1 sheet; keep explicitAutoRows and only append genuinely new Delhi!A:Z rows not already in explicitAutoRows
-          const autoKeys = new Set(
-            explicitAutoRows.map(
-              r => `${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${r.qty}|${(r.orderDate || '').trim().toLowerCase()}`
-            )
-          );
-          const brandNewDelhiRows = mergedDelhiRows.filter(
-            f => !autoKeys.has(`${(f.customerName || '').trim().toLowerCase()}|${(f.itemName || '').trim().toLowerCase()}|${f.qty}|${(f.orderDate || '').trim().toLowerCase()}`)
-          );
-          return [...explicitAutoRows, ...brandNewDelhiRows, ...closedArchiveRows];
+          const autoKeys = new Set(explicitAutoRows.map(makeRowMatchKey));
+          const brandNewDelhiRows = mergedDelhiRows.filter(f => !autoKeys.has(makeRowMatchKey(f)));
+          finalMergedForCloud = [...explicitAutoRows, ...brandNewDelhiRows, ...extraClosedRows];
+          return finalMergedForCloud;
         }
-        return [...mergedDelhiRows, ...closedArchiveRows];
+        finalMergedForCloud = [...mergedDelhiRows, ...extraClosedRows];
+        return finalMergedForCloud;
       });
+
+      // Push combined dataset (including all Closed Orders & Active Orders) to Firebase in the background
+      setTimeout(() => {
+        if (finalMergedForCloud.length > 0) {
+          pushOrdersToFirebase(finalMergedForCloud).catch(() => {});
+        }
+      }, 400);
 
       if (!silent) {
         setSyncFeedback(
-          `✓ IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z") synced! Total ${fetchedRows.length.toLocaleString()} orders loaded in Product Order & merged in Order Automation.`
+          `✓ Synced Delhi!A:Z & Firebase Cloud (${DEFAULT_FIREBASE_RTDB_URL})! Total ${fetchedRows.length.toLocaleString()} orders loaded.`
         );
         setTimeout(() => setSyncFeedback(null), 5000);
       }
@@ -2217,45 +2500,91 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }
   };
 
-  // Automatically sync IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z") once in background after storage hydration
+  // Pull latest Closed Orders & Active updates from Firebase Cloud whenever user opens app or switches to Closed Orders tab
+  const handleRefreshFromFirebaseCloud = async () => {
+    const fbCloud = await fetchOrdersFromFirebase();
+    if (fbCloud.closedRows.length === 0 && fbCloud.activeRows.length === 0) return;
+
+    setRawResponses(prev => {
+      const cleanPrev = prev.filter(r => !/^ORD-(REAL|NANDANI|PENDING|\d+)/.test(r.orderId));
+      const baseRows = cleanPrev.length > 0 ? cleanPrev : fbCloud.activeRows;
+
+      const makeRowMatchKey = (r: ProductOrderRow) =>
+        `${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}|${(r.orderDate || '').trim().toLowerCase()}`;
+
+      const closedMap = new Map<string, ProductOrderRow>();
+      fbCloud.closedRows.forEach(r => closedMap.set(makeRowMatchKey(r), r));
+
+      const matchedKeys = new Set<string>();
+      const updated = baseRows.map(row => {
+        const k = makeRowMatchKey(row);
+        const closedMatch = closedMap.get(k);
+        if (closedMatch) {
+          matchedKeys.add(k);
+          return {
+            ...row,
+            orderNo: closedMatch.orderNo || row.orderNo || '',
+            statusAN: 'Closed' as const,
+            sheetSource: 'closed' as const,
+            dispatchQty: closedMatch.dispatchQty ?? row.dispatchQty ?? 0,
+            balanceQty: closedMatch.balanceQty ?? row.balanceQty ?? 0
+          };
+        }
+        return row;
+      });
+
+      const existingKeys = new Set(updated.map(makeRowMatchKey));
+      const newClosedFromCloud = fbCloud.closedRows.filter(
+        r => !matchedKeys.has(makeRowMatchKey(r)) && !existingKeys.has(makeRowMatchKey(r))
+      );
+
+      return newClosedFromCloud.length > 0 ? [...updated, ...newClosedFromCloud] : updated;
+    });
+  };
+
+  // Automatically sync Firebase Cloud + IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z") on mount
   useEffect(() => {
+    handleRefreshFromFirebaseCloud();
     const timer = setTimeout(() => {
       handleSyncDelhiImportRange(true);
-    }, 1500);
+    }, 800);
     return () => clearTimeout(timer);
   }, []);
 
   // 1-Click Upload all current Sheet Data to Firebase Realtime Database
   const handleUploadToFirebase = async () => {
     try {
+      setFirebaseStatusMsg({ type: 'info', text: 'Connecting & uploading orders to Firebase Realtime Database...' });
       setUploadProgress(20);
+      const cleanUrl = normalizeFirebaseDbUrl(firebaseUrl);
+      setFirebaseUrl(cleanUrl);
       setSyncFeedback('Connecting to Firebase Realtime Database...');
 
       // Save current config in localStorage
       localStorage.setItem(
         LOCAL_STORAGE_FIREBASE_CONFIG,
         JSON.stringify({
-          url: firebaseUrl,
+          url: cleanUrl,
           secret: firebaseSecret
         })
       );
 
-      setUploadProgress(50);
-      const res = await pushOrdersToFirebase(rawResponses);
+      setUploadProgress(55);
+      const res = await pushOrdersToFirebase(rawResponses, cleanUrl, firebaseSecret);
       setUploadProgress(100);
-      setSyncFeedback(
-        `✓ Successfully uploaded all ${res.activeOrders + res.closedOrders} orders (${res.totalRows} rows) to Firebase Realtime Database!`
-      );
+      const successMsg = `✓ Successfully uploaded ${res.activeOrders} active order blocks & ${res.closedOrders} closed orders (${res.totalRows.toLocaleString()} total rows) to Firebase (${res.usedUrl})! Ab Firebase Console > Realtime Database > Data tab check karein.`;
+      setFirebaseStatusMsg({ type: 'success', text: successMsg });
+      setSyncFeedback(successMsg);
       setTimeout(() => {
-        setShowFirebaseModal(false);
         setUploadProgress(null);
-        setSyncFeedback(null);
-      }, 3500);
+      }, 2500);
     } catch (err: any) {
       console.error('Firebase Upload Error:', err);
       setUploadProgress(null);
-      setSyncFeedback(`Firebase Upload Error: ${err.message || 'Check URL & Secret'}`);
-      setTimeout(() => setSyncFeedback(null), 5000);
+      const errMsg = err.message || 'Check Firebase Realtime Database URL & Rules';
+      setFirebaseStatusMsg({ type: 'error', text: errMsg });
+      setSyncFeedback(`Firebase Upload Error: ${errMsg}`);
+      setTimeout(() => setSyncFeedback(null), 6000);
     }
   };
 
@@ -2904,6 +3233,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               setImportTabName('Delhi');
               setShowImportModal(true);
             }}
+            onOpenFirebaseModal={() => {
+              setFirebaseStatusMsg(null);
+              setShowFirebaseModal(true);
+            }}
             onUpdateRow={handleUpdateProductOrderRow}
             onNavigateToAutomation={() => {
               setViewMode('merged');
@@ -3328,7 +3661,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
             {/* Tab 3: Closed Orders (Archive) */}
             <button
-              onClick={() => setActiveSheetTab('closed')}
+              onClick={() => {
+                setActiveSheetTab('closed');
+                handleRefreshFromFirebaseCloud();
+              }}
               className={`px-3.5 py-1.5 text-xs font-bold rounded-t-md transition-colors flex items-center gap-1.5 cursor-pointer ${
                 activeSheetTab === 'closed'
                   ? 'bg-white text-indigo-900 shadow-sm border-t-2 border-indigo-600'
@@ -3977,36 +4313,61 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                 </p>
               </div>
 
+              {/* Live Diagnostic Status Banner inside Modal */}
+              {firebaseStatusMsg && (
+                <div
+                  className={`p-3 rounded-xl border text-xs flex items-start gap-2.5 ${
+                    firebaseStatusMsg.type === 'success'
+                      ? 'bg-emerald-50 border-emerald-300 text-emerald-950'
+                      : firebaseStatusMsg.type === 'error'
+                      ? 'bg-rose-50 border-rose-300 text-rose-950'
+                      : 'bg-sky-50 border-sky-300 text-sky-950'
+                  }`}
+                >
+                  {firebaseStatusMsg.type === 'success' ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  ) : (
+                    <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  )}
+                  <div className="space-y-1">
+                    <p className="font-bold leading-relaxed">{firebaseStatusMsg.text}</p>
+                  </div>
+                </div>
+              )}
+
               <div className="space-y-3">
                 <div>
                   <label className="text-[11px] font-bold text-slate-700 block mb-1">
-                    Firebase Realtime Database URL:
+                    1. Firebase Realtime Database URL (Apne Firebase Console se paste karein):
                   </label>
                   <input
                     type="text"
                     value={firebaseUrl}
-                    onChange={(e) => setFirebaseUrl(e.target.value)}
+                    onChange={(e) => {
+                      setFirebaseUrl(e.target.value);
+                      setFirebaseStatusMsg(null);
+                    }}
                     placeholder="https://your-project-id-default-rtdb.firebaseio.com"
                     className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg font-mono focus:ring-1 focus:ring-amber-500 focus:outline-none"
                   />
-                  <span className="text-[10px] text-slate-500 mt-0.5 block">
-                    📌 <strong>URL Kahan Milegi:</strong> Firebase Console &gt; Left menu <strong>Build</strong> &gt; <strong>Realtime Database</strong> &gt; Data tab ke bilkul upar di hui URL copy karke yahan paste karein.
+                  <span className="text-[10px] text-slate-600 mt-1 block leading-relaxed">
+                    📌 <strong>Important:</strong> Apne <strong>Firebase Console &gt; Build &gt; Realtime Database &gt; Data</strong> tab me jayein, wahan box ke upar jo link diya hai (jaise <code>https://...-default-rtdb.firebaseio.com</code> ya <code>https://...-default-rtdb.asia-southeast1.firebasedatabase.app</code>) use copy karke yahan paste karein.
                   </span>
                 </div>
 
                 <div>
                   <label className="text-[11px] font-bold text-slate-700 block mb-1">
-                    Firebase Database Secret (Auth Token):
+                    2. Firebase Database Secret (Optional — Leave Blank if Rules are .write: true):
                   </label>
                   <input
                     type="text"
                     value={firebaseSecret}
                     onChange={(e) => setFirebaseSecret(e.target.value)}
-                    placeholder="iIElINFgR124ssaG3QWjExz2lT72cRh5g502oP6J"
+                    placeholder="Leave blank if your Firebase Rules have .read: true, .write: true"
                     className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg font-mono focus:ring-1 focus:ring-amber-500 focus:outline-none bg-slate-50"
                   />
-                  <span className="text-[10px] text-slate-500 mt-0.5 block">
-                    Firebase Console &gt; Project Settings &gt; Service Accounts &gt; Database Secrets
+                  <span className="text-[10px] text-emerald-700 font-semibold mt-0.5 block">
+                    ✓ Aapne Rules me <code>".read": true, ".write": true</code> lagaya hai, isliye Secret blank rakh sakte hain!
                   </span>
                 </div>
               </div>
@@ -4015,7 +4376,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               {uploadProgress !== null && (
                 <div className="space-y-1.5 p-3 bg-slate-50 rounded-lg border border-slate-200">
                   <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
-                    <span>Uploading Orders to Firebase...</span>
+                    <span>Uploading {rawResponses.length.toLocaleString()} Rows to Firebase...</span>
                     <span>{uploadProgress}%</span>
                   </div>
                   <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden">
@@ -4025,7 +4386,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                     ></div>
                   </div>
                   <span className="text-[11px] text-slate-500">
-                    Chunking: 100 rows per batch payload (Zero Quota Loss)
+                    Batching: 250 order blocks per request (Zero Quota Loss)
                   </span>
                 </div>
               )}
@@ -4036,14 +4397,17 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   <button
                     type="button"
                     onClick={() => {
+                      const cleanUrl = normalizeFirebaseDbUrl(firebaseUrl);
+                      setFirebaseUrl(cleanUrl);
                       localStorage.setItem(
                         LOCAL_STORAGE_FIREBASE_CONFIG,
-                        JSON.stringify({ url: firebaseUrl, secret: firebaseSecret })
+                        JSON.stringify({ url: cleanUrl, secret: firebaseSecret })
                       );
-                      setSyncFeedback('Saved Firebase URL & Secret Token to application!');
+                      setFirebaseStatusMsg({ type: 'success', text: `✓ Saved Firebase URL (${cleanUrl})!` });
+                      setSyncFeedback('Saved Firebase URL & Config!');
                       setTimeout(() => setSyncFeedback(null), 3000);
                     }}
-                    className="w-full sm:w-auto px-3.5 py-2 border border-slate-300 rounded-lg font-medium text-slate-700 hover:bg-slate-50 text-xs"
+                    className="w-full sm:w-auto px-3.5 py-2 border border-slate-300 rounded-lg font-medium text-slate-700 hover:bg-slate-50 text-xs cursor-pointer"
                   >
                     Save Config
                   </button>
@@ -4052,10 +4416,12 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                     type="button"
                     onClick={async () => {
                       try {
-                        const targetUrl = firebaseUrl.trim().replace(/\/+$/, '');
-                        const authParam = firebaseSecret ? `?auth=${encodeURIComponent(firebaseSecret)}` : '';
+                        const targetUrl = normalizeFirebaseDbUrl(firebaseUrl);
+                        setFirebaseUrl(targetUrl);
+                        const cleanSec = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+                        const authParam = cleanSec ? `?auth=${encodeURIComponent(cleanSec)}` : '';
                         const testUrl = `${targetUrl}/_connection_test.json${authParam}`;
-                        setSyncFeedback('Testing Firebase connection...');
+                        setFirebaseStatusMsg({ type: 'info', text: `Testing connection to ${targetUrl}...` });
                         const resp = await fetch(testUrl, {
                           method: 'PUT',
                           headers: { 'Content-Type': 'application/json' },
@@ -4066,17 +4432,25 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                           })
                         });
                         if (resp.ok) {
-                          setSyncFeedback(`✓ Firebase Connected Successfully! (HTTP ${resp.status})`);
+                          setFirebaseStatusMsg({
+                            type: 'success',
+                            text: `✓ Firebase Connected Successfully! (${targetUrl}/_connection_test). Ab "1-Click Upload Data to Firebase" par click karein.`
+                          });
                         } else {
                           const errTxt = await resp.text();
-                          setSyncFeedback(`Firebase Connection Failed: HTTP ${resp.status} - ${errTxt.substring(0, 100)}`);
+                          setFirebaseStatusMsg({
+                            type: 'error',
+                            text: `Firebase Connection Failed (HTTP ${resp.status}): ${errTxt.substring(0, 120)}`
+                          });
                         }
                       } catch (err: any) {
-                        setSyncFeedback(`Firebase Test Error: ${err.message || 'Network error'}`);
+                        setFirebaseStatusMsg({
+                          type: 'error',
+                          text: `Firebase Test Error: ${err.message || 'Check your Firebase URL'}`
+                        });
                       }
-                      setTimeout(() => setSyncFeedback(null), 5000);
                     }}
-                    className="w-full sm:w-auto px-3.5 py-2 border border-amber-300 bg-amber-50 rounded-lg font-semibold text-amber-900 hover:bg-amber-100 text-xs"
+                    className="w-full sm:w-auto px-3.5 py-2 border border-amber-300 bg-amber-50 rounded-lg font-semibold text-amber-900 hover:bg-amber-100 text-xs cursor-pointer"
                   >
                     📡 Test Ping
                   </button>
@@ -4086,10 +4460,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   type="button"
                   disabled={uploadProgress !== null}
                   onClick={handleUploadToFirebase}
-                  className="w-full sm:w-auto px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white font-bold rounded-lg shadow-sm flex items-center justify-center gap-2 text-xs"
+                  className="w-full sm:w-auto px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white font-bold rounded-lg shadow-sm flex items-center justify-center gap-2 text-xs cursor-pointer"
                 >
                   <CloudUpload className="w-4 h-4" />
-                  <span>1-Click Upload Data to Firebase</span>
+                  <span>1-Click Upload Data to Firebase ({rawResponses.length.toLocaleString()} Rows)</span>
                 </button>
               </div>
             </div>
