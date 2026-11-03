@@ -468,6 +468,18 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   // Quick edit modal for Order No (Col X)
   const [editingOrderNo, setEditingOrderNo] = useState<{ key: string; po: string; value: string } | null>(null);
 
+  // Multi-select item IDs in Order Automation / Closed Orders for fast bulk Close / Reopen
+  const [selectedAutoItemIds, setSelectedAutoItemIds] = useState<Set<string>>(new Set());
+
+  // Confirmation modal for Bulk Close / Bulk Reopen (Filtered or Selected orders)
+  const [bulkStatusModal, setBulkStatusModal] = useState<{
+    mode: 'selected' | 'filtered';
+    targetStatus: 'Closed' | 'Open';
+    itemIds: string[];
+    orderCount: number;
+    filterSummary: string;
+  } | null>(null);
+
   // Debounced safe saving to IndexedDB (supports 10,000+ items without 3,000 cap)
   useEffect(() => {
     if (!isStorageHydratedRef.current) return;
@@ -753,6 +765,55 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       }`
     );
     setTimeout(() => setSyncFeedback(null), 4000);
+  };
+
+  // Bulk Close / Reopen multiple orders at once (e.g., Month-wise filtered Open orders or checkbox-selected orders)
+  const handleBulkStatusChange = (targetItemIds: string[], newStatus: 'Open' | 'In-Progress' | 'Closed') => {
+    if (!targetItemIds || targetItemIds.length === 0) return;
+    const idSet = new Set(targetItemIds);
+    let updatedCount = 0;
+
+    setRawResponses(prev => {
+      const updated = prev.map(row => {
+        if (idSet.has(row.orderId)) {
+          updatedCount++;
+          return {
+            ...row,
+            statusAN: newStatus,
+            sheetSource: newStatus === 'Closed' ? ('closed' as const) : ('product_order' as const)
+          };
+        }
+        return row;
+      });
+      // Immediately push all updated orders (including newly Closed Orders) to Firebase Cloud
+      pushOrdersToFirebase(updated).catch(() => {});
+      return updated;
+    });
+
+    setSelectedAutoItemIds(new Set());
+    setBulkStatusModal(null);
+    setSyncFeedback(
+      `✓ Bulk Updated ${updatedCount.toLocaleString()} item rows to "${newStatus}"! ${
+        newStatus === 'Closed'
+          ? 'All moved to "Closed Orders" tab & synced to Firebase Cloud!'
+          : 'All moved back to "Order Automation" & synced to Firebase Cloud!'
+      }`
+    );
+    setTimeout(() => setSyncFeedback(null), 5000);
+  };
+
+  // Toggle selection of one or multiple item IDs (e.g. clicking an order block checkbox)
+  const handleToggleSelectAutoItems = (itemIds: string[]) => {
+    setSelectedAutoItemIds(prev => {
+      const next = new Set(prev);
+      const allSelected = itemIds.every(id => next.has(id));
+      if (allSelected) {
+        itemIds.forEach(id => next.delete(id));
+      } else {
+        itemIds.forEach(id => next.add(id));
+      }
+      return next;
+    });
   };
 
   // Handle changing Dispatch Qty in Col Y
@@ -2974,356 +3035,474 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     <div className="space-y-4">
       {/* SPREADSHEET TOOLBAR & CONTROLS */}
       <div className="bg-white rounded-xl border border-slate-300 shadow-xs overflow-hidden">
-        {/* Top Control Bar - ALL IN ONE SINGLE LINE */}
-        <div className="px-2.5 py-1.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 overflow-x-auto select-none scrollbar-none whitespace-nowrap">
-          {/* Left Controls Group in Single Line */}
-          <div className="flex items-center gap-2 shrink-0">
-            {/* Search Box */}
-            <div className="relative w-48 sm:w-56 shrink-0">
-              <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
-              <input
-                type="text"
-                placeholder="Search PO, Customer, Item, Order No..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-7 pr-6 py-1 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-1 focus:ring-emerald-500 text-slate-800 placeholder-slate-400"
-              />
-              {searchTerm && (
+        {/* Top Control Bar - Shown on Order Automation & Closed Orders tabs (avoids duplicate Month/Year filter on Product Order tab) */}
+        {activeSheetTab !== 'product_order' && (
+          <div className="px-2.5 py-1.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 overflow-x-auto select-none scrollbar-none whitespace-nowrap">
+            {/* Left Controls Group in Single Line */}
+            <div className="flex items-center gap-2 shrink-0">
+              {/* Search Box */}
+              <div className="relative w-48 sm:w-56 shrink-0">
+                <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder="Search PO, Customer, Item, Order No..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className="w-full pl-7 pr-6 py-1 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-1 focus:ring-emerald-500 text-slate-800 placeholder-slate-400"
+                />
+                {searchTerm && (
+                  <button
+                    onClick={() => setSearchTerm('')}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
+
+              {/* Month Filter */}
+              <div className="flex items-center gap-1 bg-white px-2 py-1 rounded-md border border-slate-300 shadow-2xs shrink-0">
+                <Calendar className="w-3 h-3 text-blue-600 shrink-0" />
+                <span className="text-[11px] font-bold text-slate-600">Month:</span>
+                <select
+                  value={automationMonth}
+                  onChange={(e) => {
+                    setAutomationMonth(e.target.value);
+                    setAutomationPage(1);
+                    setSelectedAutoItemIds(new Set());
+                  }}
+                  className="text-xs font-bold text-slate-800 bg-transparent focus:outline-none cursor-pointer pr-1"
+                >
+                  {MONTH_OPTIONS.map(m => (
+                    <option key={m.value} value={m.value}>{m.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Year Filter */}
+              <div className="flex items-center gap-1 bg-white px-2 py-1 rounded-md border border-slate-300 shadow-2xs shrink-0">
+                <span className="text-[11px] font-bold text-slate-600">Year:</span>
+                <select
+                  value={automationYear}
+                  onChange={(e) => {
+                    setAutomationYear(e.target.value);
+                    setAutomationPage(1);
+                    setSelectedAutoItemIds(new Set());
+                  }}
+                  className="text-xs font-bold text-slate-800 bg-transparent focus:outline-none cursor-pointer pr-1"
+                >
+                  <option value="ALL">All Years</option>
+                  {availableAutomationYears.map(yr => (
+                    <option key={yr} value={yr}>{yr}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Clear Month/Year Filter if active */}
+              {(automationMonth !== 'ALL' || automationYear !== 'ALL') && (
                 <button
-                  onClick={() => setSearchTerm('')}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs"
+                  type="button"
+                  onClick={() => {
+                    setAutomationMonth('ALL');
+                    setAutomationYear('ALL');
+                    setAutomationPage(1);
+                    setSelectedAutoItemIds(new Set());
+                  }}
+                  className="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-md font-bold text-[11px] flex items-center gap-1 cursor-pointer shrink-0"
                 >
                   <X className="w-3 h-3" />
+                  <span>Clear Date</span>
+                </button>
+              )}
+
+              {/* Quick Status Filter */}
+              <div className="flex items-center gap-1 text-xs shrink-0">
+                <span className="text-slate-500 font-medium text-[11px] flex items-center gap-0.5">
+                  <Filter className="w-3 h-3" />
+                  Status:
+                </span>
+                <select
+                  value={statusFilter}
+                  onChange={(e) => {
+                    setStatusFilter(e.target.value as any);
+                    setSelectedAutoItemIds(new Set());
+                  }}
+                  className="bg-white border border-slate-300 rounded-md px-2 py-1 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                >
+                  <option value="ALL">All Statuses ({totalOrdersCount})</option>
+                  <option value="Open">🔵 Open Only ({groupedOrders.filter(o => o.statusAN === 'Open').length})</option>
+                  <option value="In-Progress">🟡 In-Progress Only ({groupedOrders.filter(o => o.statusAN === 'In-Progress').length})</option>
+                  <option value="Closed">🟢 Closed Only ({groupedOrders.filter(o => o.statusAN === 'Closed').length})</option>
+                </select>
+              </div>
+
+              {/* BULK SELECT & 1-CLICK BULK CLOSE / REOPEN CONTROLS */}
+              {filteredOrders.length > 0 && (() => {
+                const allFilteredIds: string[] = [];
+                filteredOrders.forEach(o => o.items.forEach(it => allFilteredIds.push(it.id)));
+                const isAllFilteredSelected = allFilteredIds.length > 0 && allFilteredIds.every(id => selectedAutoItemIds.has(id));
+                const monthLabel = MONTH_OPTIONS.find(m => m.value === automationMonth)?.label || 'All Months';
+                const yearLabel = automationYear === 'ALL' ? 'All Years' : automationYear;
+                const filterDesc = `${monthLabel} / ${yearLabel}${searchTerm ? ` · Search: "${searchTerm}"` : ''}`;
+
+                return (
+                  <div className="flex items-center gap-1.5 shrink-0 bg-emerald-50/90 border border-emerald-300 px-2 py-0.5 rounded-lg shadow-2xs">
+                    {/* Select All Filtered Checkbox */}
+                    <label
+                      className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-950 cursor-pointer pr-1 border-r border-emerald-200"
+                      title="Select or deselect all currently filtered orders (including Month/Year filter)"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isAllFilteredSelected}
+                        onChange={() => {
+                          if (isAllFilteredSelected) {
+                            setSelectedAutoItemIds(new Set());
+                          } else {
+                            setSelectedAutoItemIds(new Set(allFilteredIds));
+                          }
+                        }}
+                        className="w-3.5 h-3.5 rounded border-emerald-400 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
+                      />
+                      <span>Select All ({allFilteredIds.length})</span>
+                    </label>
+
+                    {/* If user has checked specific orders, show Close Selected button */}
+                    {selectedAutoItemIds.size > 0 ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const selectedIds = Array.from(selectedAutoItemIds);
+                            const matchingOrders = filteredOrders.filter(o => o.items.some(it => selectedAutoItemIds.has(it.id))).length;
+                            setBulkStatusModal({
+                              mode: 'selected',
+                              targetStatus: activeSheetTab === 'closed' ? 'Open' : 'Closed',
+                              itemIds: selectedIds,
+                              orderCount: matchingOrders || selectedIds.length,
+                              filterSummary: `${selectedIds.length} Selected Rows (${filterDesc})`
+                            });
+                          }}
+                          className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-extrabold text-white shadow-xs transition-all cursor-pointer ${
+                            activeSheetTab === 'closed'
+                              ? 'bg-sky-600 hover:bg-sky-700'
+                              : 'bg-emerald-600 hover:bg-emerald-700'
+                          }`}
+                          title={
+                            activeSheetTab === 'closed'
+                              ? 'Reopen all selected orders and move to Order Automation'
+                              : 'Close all selected orders at once and move to Closed Orders'
+                          }
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>
+                            {activeSheetTab === 'closed'
+                              ? `Reopen Selected (${selectedAutoItemIds.size})`
+                              : `Close Selected (${selectedAutoItemIds.size} Rows)`}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedAutoItemIds(new Set())}
+                          className="text-[10px] font-bold text-slate-500 hover:text-rose-600 px-1 cursor-pointer"
+                          title="Clear selection"
+                        >
+                          Clear
+                        </button>
+                      </>
+                    ) : (
+                      /* Direct 1-Click Button to Close All Currently Filtered Orders (e.g. Month-wise Open Orders) */
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setBulkStatusModal({
+                            mode: 'filtered',
+                            targetStatus: activeSheetTab === 'closed' ? 'Open' : 'Closed',
+                            itemIds: allFilteredIds,
+                            orderCount: filteredOrders.length,
+                            filterSummary: filterDesc
+                          });
+                        }}
+                        className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-extrabold text-white shadow-xs transition-all cursor-pointer ${
+                          activeSheetTab === 'closed'
+                            ? 'bg-sky-600 hover:bg-sky-700'
+                            : 'bg-emerald-600 hover:bg-emerald-700'
+                        }`}
+                        title={
+                          activeSheetTab === 'closed'
+                            ? `Reopen all ${filteredOrders.length} filtered orders (${allFilteredIds.length} rows)`
+                            : `Close all ${filteredOrders.length} filtered open orders (${allFilteredIds.length} rows) in 1 click`
+                        }
+                      >
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>
+                          {activeSheetTab === 'closed'
+                            ? `Bulk Reopen Filtered (${filteredOrders.length} Orders / ${allFilteredIds.length} Rows)`
+                            : `Bulk Close Filtered (${filteredOrders.length} Orders / ${allFilteredIds.length} Rows)`}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* ONLY Order Status Badge (Shows Exact Row Counts matching Google Sheet) */}
+              <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-sky-50 border border-sky-200 text-sky-950 text-xs shadow-2xs shrink-0">
+                <span className="w-1.5 h-1.5 rounded-full bg-sky-500 animate-pulse"></span>
+                <span className="text-[11px] font-bold text-sky-800">Sheet Rows :</span>
+                <span className="font-mono font-bold text-xs">{activeItemsCount.toLocaleString()} Active / {closedItemsCount.toLocaleString()} Closed</span>
+              </div>
+
+              {/* Duplicate Rows Color Filter Indicator */}
+              <button
+                type="button"
+                onClick={() => {
+                  setShowDuplicatesOnly(prev => !prev);
+                  setAutomationPage(1);
+                }}
+                className={`inline-flex items-center gap-1 px-2 py-1 rounded-md border text-xs font-bold transition-all cursor-pointer shrink-0 ${
+                  showDuplicatesOnly
+                    ? 'bg-rose-600 text-white border-rose-700 shadow-xs'
+                    : duplicateItemsCount > 0
+                    ? 'bg-rose-100 text-rose-900 border-rose-400 hover:bg-rose-200'
+                    : 'bg-slate-100 text-slate-600 border-slate-300 hover:bg-slate-200'
+                }`}
+                title="Highlight and filter duplicate rows in Action column"
+              >
+                <span className={`w-2 h-2 rounded-full ${duplicateItemsCount > 0 ? 'bg-rose-500 animate-ping' : 'bg-slate-400'}`} />
+                <span>Duplicates: {duplicateItemsCount}</span>
+                {showDuplicatesOnly && <span className="text-[10px] underline ml-0.5">(Showing Only Duplicates)</span>}
+              </button>
+
+              {/* Clear active filters button */}
+              {Object.keys(colFilters).length > 0 && (
+                <button
+                  onClick={() => setColFilters({})}
+                  className="px-1.5 py-1 text-[11px] font-semibold text-rose-700 bg-rose-50 border border-rose-200 rounded hover:bg-rose-100 flex items-center gap-1 shrink-0"
+                >
+                  <X className="w-3 h-3" />
+                  <span>Reset ({Object.keys(colFilters).length})</span>
                 </button>
               )}
             </div>
 
-            {/* Month Filter */}
-            <div className="flex items-center gap-1 bg-white px-2 py-1 rounded-md border border-slate-300 shadow-2xs shrink-0">
-              <Calendar className="w-3 h-3 text-blue-600 shrink-0" />
-              <span className="text-[11px] font-bold text-slate-600">Month:</span>
-              <select
-                value={automationMonth}
-                onChange={(e) => {
-                  setAutomationMonth(e.target.value);
-                  setAutomationPage(1);
-                }}
-                className="text-xs font-bold text-slate-800 bg-transparent focus:outline-none cursor-pointer pr-1"
-              >
-                {MONTH_OPTIONS.map(m => (
-                  <option key={m.value} value={m.value}>{m.label}</option>
-                ))}
-              </select>
-            </div>
+            <div className="h-4 w-px bg-slate-300 shrink-0 mx-0.5" />
 
-            {/* Year Filter */}
-            <div className="flex items-center gap-1 bg-white px-2 py-1 rounded-md border border-slate-300 shadow-2xs shrink-0">
-              <span className="text-[11px] font-bold text-slate-600">Year:</span>
-              <select
-                value={automationYear}
-                onChange={(e) => {
-                  setAutomationYear(e.target.value);
-                  setAutomationPage(1);
-                }}
-                className="text-xs font-bold text-slate-800 bg-transparent focus:outline-none cursor-pointer pr-1"
-              >
-                <option value="ALL">All Years</option>
-                {availableAutomationYears.map(yr => (
-                  <option key={yr} value={yr}>{yr}</option>
-                ))}
-              </select>
-            </div>
+            {/* Right Controls Group in Single Line */}
+            <div className="flex items-center gap-1.5 shrink-0">
+              {/* View Mode Switch */}
+              <div className="flex items-center p-0.5 bg-slate-200/80 rounded-lg text-xs shrink-0">
+                <button
+                  onClick={() => setViewMode('merged')}
+                  className={`px-2 py-1 rounded-md transition-all font-semibold ${
+                    viewMode === 'merged'
+                      ? 'bg-white text-emerald-800 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                  title="A-E & N-X Vertically Merged with Individual Product Item Rows"
+                >
+                  ⚡ Merged Visual View
+                </button>
+                <button
+                  onClick={() => setViewMode('unmerged')}
+                  className={`px-2 py-1 rounded-md transition-all font-medium ${
+                    viewMode === 'unmerged'
+                      ? 'bg-white text-slate-900 shadow-xs font-semibold'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                  title="100% Flat Row-Wise View (Independent Row Data)"
+                >
+                  Flat Unmerged
+                </button>
+              </div>
 
-            {/* Clear Month/Year Filter if active */}
-            {(automationMonth !== 'ALL' || automationYear !== 'ALL') && (
-              <button
-                type="button"
-                onClick={() => {
-                  setAutomationMonth('ALL');
-                  setAutomationYear('ALL');
-                  setAutomationPage(1);
-                }}
-                className="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-md font-bold text-[11px] flex items-center gap-1 cursor-pointer shrink-0"
-              >
-                <X className="w-3 h-3" />
-                <span>Clear Date</span>
-              </button>
-            )}
-
-            {/* Quick Status Filter */}
-            <div className="flex items-center gap-1 text-xs shrink-0">
-              <span className="text-slate-500 font-medium text-[11px] flex items-center gap-0.5">
-                <Filter className="w-3 h-3" />
-                Status:
-              </span>
-              <select
-                value={statusFilter}
-                onChange={(e) => setStatusFilter(e.target.value as any)}
-                className="bg-white border border-slate-300 rounded-md px-2 py-1 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-              >
-                <option value="ALL">All Statuses ({totalOrdersCount})</option>
-                <option value="Open">🔵 Open Only ({groupedOrders.filter(o => o.statusAN === 'Open').length})</option>
-                <option value="In-Progress">🟡 In-Progress Only ({groupedOrders.filter(o => o.statusAN === 'In-Progress').length})</option>
-                <option value="Closed">🟢 Closed Only ({groupedOrders.filter(o => o.statusAN === 'Closed').length})</option>
-              </select>
-            </div>
-
-            {/* ONLY Order Status Badge (Shows Exact Row Counts matching Google Sheet) */}
-            <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-sky-50 border border-sky-200 text-sky-950 text-xs shadow-2xs shrink-0">
-              <span className="w-1.5 h-1.5 rounded-full bg-sky-500 animate-pulse"></span>
-              <span className="text-[11px] font-bold text-sky-800">Sheet Rows :</span>
-              <span className="font-mono font-bold text-xs">{activeItemsCount.toLocaleString()} Active / {closedItemsCount.toLocaleString()} Closed</span>
-            </div>
-
-            {/* Duplicate Rows Color Filter Indicator */}
-            <button
-              type="button"
-              onClick={() => {
-                setShowDuplicatesOnly(prev => !prev);
-                setAutomationPage(1);
-              }}
-              className={`inline-flex items-center gap-1 px-2 py-1 rounded-md border text-xs font-bold transition-all cursor-pointer shrink-0 ${
-                showDuplicatesOnly
-                  ? 'bg-rose-600 text-white border-rose-700 shadow-xs'
-                  : duplicateItemsCount > 0
-                  ? 'bg-rose-100 text-rose-900 border-rose-400 hover:bg-rose-200'
-                  : 'bg-slate-100 text-slate-600 border-slate-300 hover:bg-slate-200'
-              }`}
-              title="Highlight and filter duplicate rows in Action column"
-            >
-              <span className={`w-2 h-2 rounded-full ${duplicateItemsCount > 0 ? 'bg-rose-500 animate-ping' : 'bg-slate-400'}`} />
-              <span>Duplicates: {duplicateItemsCount}</span>
-              {showDuplicatesOnly && <span className="text-[10px] underline ml-0.5">(Showing Only Duplicates)</span>}
-            </button>
-
-            {/* Clear active filters button */}
-            {Object.keys(colFilters).length > 0 && (
-              <button
-                onClick={() => setColFilters({})}
-                className="px-1.5 py-1 text-[11px] font-semibold text-rose-700 bg-rose-50 border border-rose-200 rounded hover:bg-rose-100 flex items-center gap-1 shrink-0"
-              >
-                <X className="w-3 h-3" />
-                <span>Reset ({Object.keys(colFilters).length})</span>
-              </button>
-            )}
-          </div>
-
-          <div className="h-4 w-px bg-slate-300 shrink-0 mx-0.5" />
-
-          {/* Right Controls Group in Single Line */}
-          <div className="flex items-center gap-1.5 shrink-0">
-            {/* View Mode Switch */}
-            <div className="flex items-center p-0.5 bg-slate-200/80 rounded-lg text-xs shrink-0">
-              <button
-                onClick={() => setViewMode('merged')}
-                className={`px-2 py-1 rounded-md transition-all font-semibold ${
-                  viewMode === 'merged'
-                    ? 'bg-white text-emerald-800 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-                title="A-E & N-X Vertically Merged with Individual Product Item Rows"
-              >
-                ⚡ Merged Visual View
-              </button>
-              <button
-                onClick={() => setViewMode('unmerged')}
-                className={`px-2 py-1 rounded-md transition-all font-medium ${
-                  viewMode === 'unmerged'
-                    ? 'bg-white text-slate-900 shadow-xs font-semibold'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-                title="100% Flat Row-Wise View (Independent Row Data)"
-              >
-                Flat Unmerged
-              </button>
-            </div>
-
-            {/* FREEZE / UNFREEZE PANES SPLIT BUTTON (Direct click toggles Freeze (2) <-> Unfreeze) */}
-            <div className="relative shrink-0 inline-flex items-center">
-              <button
-                type="button"
-                onClick={() => {
-                  if (freezeColumns > 0 || freezeRows > 0) {
-                    setFreezeColumns(0);
-                    setFreezeRows(0);
-                    setShowFreezeMenu(false);
-                    setSyncFeedback('🔓 Unfrozen all columns and header rows!');
-                  } else {
-                    setFreezeColumns(2);
-                    setFreezeRows(1);
-                    setShowFreezeMenu(false);
-                    setSyncFeedback('📌 Frozen 2 columns (# + PO) and Header Row!');
-                  }
-                  setTimeout(() => setSyncFeedback(null), 3000);
-                }}
-                className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-l-lg border transition-colors shadow-2xs cursor-pointer ${
-                  freezeColumns > 0 || freezeRows > 0
-                    ? 'bg-emerald-50 text-emerald-900 border-emerald-300 hover:bg-rose-50 hover:text-rose-800 hover:border-rose-300'
-                    : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-                }`}
-                title={
-                  freezeColumns > 0 || freezeRows > 0
-                    ? 'Click to Unfreeze all columns & rows'
-                    : 'Click to Freeze 2 columns (# + PO) & Header Row'
-                }
-              >
-                <Pin className={`w-3 h-3 ${freezeColumns > 0 || freezeRows > 0 ? 'text-emerald-700' : 'text-slate-400'}`} />
-                <span>
-                  {freezeColumns > 0 || freezeRows > 0
-                    ? `Freeze (${freezeColumns}) · Click to Unfreeze`
-                    : 'Unfrozen (Click to Freeze)'}
-                </span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowFreezeMenu(!showFreezeMenu)}
-                className={`px-1.5 py-1 text-xs font-semibold rounded-r-lg border-y border-r transition-colors shadow-2xs cursor-pointer ${
-                  freezeColumns > 0 || freezeRows > 0
-                    ? 'bg-emerald-50 text-emerald-900 border-emerald-300 hover:bg-emerald-100'
-                    : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-                }`}
-                title="More Freeze / Unfreeze Options"
-              >
-                <ChevronDown className="w-3 h-3 text-slate-500" />
-              </button>
-
-              {showFreezeMenu && (
-                <div className="absolute right-0 top-full mt-1 w-56 bg-white rounded-xl shadow-xl border border-slate-200 p-2 z-50 text-xs space-y-1.5">
-                  {/* Direct 1-Click Unfreeze All Button */}
-                  <button
-                    type="button"
-                    onClick={() => {
+              {/* FREEZE / UNFREEZE PANES SPLIT BUTTON (Direct click toggles Freeze (2) <-> Unfreeze) */}
+              <div className="relative shrink-0 inline-flex items-center">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (freezeColumns > 0 || freezeRows > 0) {
                       setFreezeColumns(0);
                       setFreezeRows(0);
                       setShowFreezeMenu(false);
-                      setSyncFeedback('🔓 Unfrozen all columns and rows!');
-                      setTimeout(() => setSyncFeedback(null), 3000);
-                    }}
-                    className={`w-full text-left px-2.5 py-1.5 rounded-lg font-bold flex items-center justify-between cursor-pointer ${
-                      freezeColumns === 0 && freezeRows === 0
-                        ? 'bg-rose-100 text-rose-900 border border-rose-300'
-                        : 'bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200'
-                    }`}
-                  >
-                    <span>🔓 Unfreeze All (Cols &amp; Rows)</span>
-                    {freezeColumns === 0 && freezeRows === 0 && <span>✓</span>}
-                  </button>
+                      setSyncFeedback('🔓 Unfrozen all columns and header rows!');
+                    } else {
+                      setFreezeColumns(2);
+                      setFreezeRows(1);
+                      setShowFreezeMenu(false);
+                      setSyncFeedback('📌 Frozen 2 columns (# + PO) and Header Row!');
+                    }
+                    setTimeout(() => setSyncFeedback(null), 3000);
+                  }}
+                  className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-l-lg border transition-colors shadow-2xs cursor-pointer ${
+                    freezeColumns > 0 || freezeRows > 0
+                      ? 'bg-emerald-50 text-emerald-900 border-emerald-300 hover:bg-rose-50 hover:text-rose-800 hover:border-rose-300'
+                      : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                  }`}
+                  title={
+                    freezeColumns > 0 || freezeRows > 0
+                      ? 'Click to Unfreeze all columns & rows'
+                      : 'Click to Freeze 2 columns (# + PO) & Header Row'
+                  }
+                >
+                  <Pin className={`w-3 h-3 ${freezeColumns > 0 || freezeRows > 0 ? 'text-emerald-700' : 'text-slate-400'}`} />
+                  <span>
+                    {freezeColumns > 0 || freezeRows > 0
+                      ? `Freeze (${freezeColumns}) · Click to Unfreeze`
+                      : 'Unfrozen (Click to Freeze)'}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowFreezeMenu(!showFreezeMenu)}
+                  className={`px-1.5 py-1 text-xs font-semibold rounded-r-lg border-y border-r transition-colors shadow-2xs cursor-pointer ${
+                    freezeColumns > 0 || freezeRows > 0
+                      ? 'bg-emerald-50 text-emerald-900 border-emerald-300 hover:bg-emerald-100'
+                      : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                  }`}
+                  title="More Freeze / Unfreeze Options"
+                >
+                  <ChevronDown className="w-3 h-3 text-slate-500" />
+                </button>
 
-                  <span className="text-[10px] uppercase font-bold text-slate-400 block px-1 pt-1 border-t border-slate-100">
-                    Freeze Columns
-                  </span>
-                  <div className="space-y-0.5">
+                {showFreezeMenu && (
+                  <div className="absolute right-0 top-full mt-1 w-56 bg-white rounded-xl shadow-xl border border-slate-200 p-2 z-50 text-xs space-y-1.5">
+                    {/* Direct 1-Click Unfreeze All Button */}
                     <button
-                      onClick={() => { setFreezeColumns(0); setShowFreezeMenu(false); }}
-                      className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeColumns === 0 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
+                      type="button"
+                      onClick={() => {
+                        setFreezeColumns(0);
+                        setFreezeRows(0);
+                        setShowFreezeMenu(false);
+                        setSyncFeedback('🔓 Unfrozen all columns and rows!');
+                        setTimeout(() => setSyncFeedback(null), 3000);
+                      }}
+                      className={`w-full text-left px-2.5 py-1.5 rounded-lg font-bold flex items-center justify-between cursor-pointer ${
+                        freezeColumns === 0 && freezeRows === 0
+                          ? 'bg-rose-100 text-rose-900 border border-rose-300'
+                          : 'bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200'
+                      }`}
                     >
-                      Unfreeze Columns (0)
+                      <span>🔓 Unfreeze All (Cols &amp; Rows)</span>
+                      {freezeColumns === 0 && freezeRows === 0 && <span>✓</span>}
                     </button>
-                    <button
-                      onClick={() => { setFreezeColumns(1); setShowFreezeMenu(false); }}
-                      className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeColumns === 1 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
-                    >
-                      Freeze 1 Col (#)
-                    </button>
-                    <button
-                      onClick={() => { setFreezeColumns(2); setShowFreezeMenu(false); }}
-                      className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeColumns === 2 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
-                    >
-                      Freeze 2 Cols (# + PO) ★
-                    </button>
-                    <button
-                      onClick={() => { setFreezeColumns(3); setShowFreezeMenu(false); }}
-                      className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeColumns === 3 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
-                    >
-                      Freeze 3 Cols (# + PO + Name)
-                    </button>
+
+                    <span className="text-[10px] uppercase font-bold text-slate-400 block px-1 pt-1 border-t border-slate-100">
+                      Freeze Columns
+                    </span>
+                    <div className="space-y-0.5">
+                      <button
+                        onClick={() => { setFreezeColumns(0); setShowFreezeMenu(false); }}
+                        className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeColumns === 0 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
+                      >
+                        Unfreeze Columns (0)
+                      </button>
+                      <button
+                        onClick={() => { setFreezeColumns(1); setShowFreezeMenu(false); }}
+                        className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeColumns === 1 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
+                      >
+                        Freeze 1 Col (#)
+                      </button>
+                      <button
+                        onClick={() => { setFreezeColumns(2); setShowFreezeMenu(false); }}
+                        className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeColumns === 2 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
+                      >
+                        Freeze 2 Cols (# + PO) ★
+                      </button>
+                      <button
+                        onClick={() => { setFreezeColumns(3); setShowFreezeMenu(false); }}
+                        className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeColumns === 3 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
+                      >
+                        Freeze 3 Cols (# + PO + Name)
+                      </button>
+                    </div>
+                    <span className="text-[10px] uppercase font-bold text-slate-400 block px-1 pt-1 border-t border-slate-100">
+                      Freeze Rows
+                    </span>
+                    <div className="space-y-0.5">
+                      <button
+                        onClick={() => { setFreezeRows(1); setShowFreezeMenu(false); }}
+                        className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeRows === 1 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
+                      >
+                        Freeze Header Row ★
+                      </button>
+                      <button
+                        onClick={() => { setFreezeRows(0); setShowFreezeMenu(false); }}
+                        className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeRows === 0 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
+                      >
+                        Unfreeze Header Row (0)
+                      </button>
+                    </div>
                   </div>
-                  <span className="text-[10px] uppercase font-bold text-slate-400 block px-1 pt-1 border-t border-slate-100">
-                    Freeze Rows
-                  </span>
-                  <div className="space-y-0.5">
-                    <button
-                      onClick={() => { setFreezeRows(1); setShowFreezeMenu(false); }}
-                      className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeRows === 1 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
-                    >
-                      Freeze Header Row ★
-                    </button>
-                    <button
-                      onClick={() => { setFreezeRows(0); setShowFreezeMenu(false); }}
-                      className={`w-full text-left px-2 py-1 rounded cursor-pointer ${freezeRows === 0 ? 'bg-emerald-50 font-bold text-emerald-900' : 'hover:bg-slate-50 text-slate-700'}`}
-                    >
-                      Unfreeze Header Row (0)
-                    </button>
-                  </div>
-                </div>
+                )}
+              </div>
+
+              {/* Columns Hide / Show Button */}
+              <button
+                onClick={() => setShowColManager(true)}
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-lg shadow-2xs transition-colors shrink-0 cursor-pointer"
+                title="Hide / Show Specific Columns"
+              >
+                <Columns className="w-3 h-3 text-emerald-700" />
+                <span>Columns ({Object.values(visibleCols).filter(Boolean).length}/45)</span>
+              </button>
+
+              {/* Clear Product Automation Tab Button */}
+              <button
+                onClick={() => setShowClearAutomationModal(true)}
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-300 rounded-lg shadow-2xs transition-colors shrink-0 cursor-pointer"
+                title="Clear all rows in Product Automation & upload fresh new data"
+              >
+                <Trash2 className="w-3 h-3 text-rose-600" />
+                <span>Clear Tab</span>
+              </button>
+
+              {/* Export CSV */}
+              <button
+                onClick={handleExportCSV}
+                className="p-1 text-slate-600 hover:text-slate-900 hover:bg-slate-200 rounded border border-slate-300 shrink-0 cursor-pointer"
+                title="Export CSV / Excel"
+              >
+                <Download className="w-3.5 h-3.5" />
+              </button>
+
+              {/* Firebase Cloud Sync Button */}
+              <button
+                onClick={() => setShowFirebaseModal(true)}
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold bg-amber-500 hover:bg-amber-600 text-white rounded-lg shadow-2xs transition-colors shrink-0 cursor-pointer"
+                title="Upload historical data to Firebase"
+              >
+                <Flame className="w-3 h-3 fill-white" />
+                <span>Firebase</span>
+              </button>
+
+              {/* Reset data */}
+              <button
+                onClick={handleReset}
+                className="p-1 text-slate-500 hover:text-slate-700 hover:bg-slate-200 rounded shrink-0 cursor-pointer"
+                title="Reset to default sample data"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+              </button>
+
+              {/* FULL SIZE ON BUTTON IN THE FAR RIGHT CORNER */}
+              {setIsFullWidth && (
+                <button
+                  onClick={() => setIsFullWidth(!isFullWidth)}
+                  className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border text-xs font-bold transition-all shadow-xs shrink-0 ${
+                    isFullWidth
+                      ? 'bg-emerald-700 text-white border-emerald-800 hover:bg-emerald-800'
+                      : 'bg-white text-slate-800 border-slate-300 hover:bg-slate-100'
+                  }`}
+                  title={isFullWidth ? "Click for Boxed View" : "Click for Full Screen View"}
+                >
+                  {isFullWidth ? <Minimize2 className="w-3 h-3" /> : <Maximize2 className="w-3 h-3" />}
+                  <span>{isFullWidth ? 'Full Size ON' : 'Full Size OFF'}</span>
+                </button>
               )}
             </div>
-
-            {/* Columns Hide / Show Button */}
-            <button
-              onClick={() => setShowColManager(true)}
-              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-lg shadow-2xs transition-colors shrink-0 cursor-pointer"
-              title="Hide / Show Specific Columns"
-            >
-              <Columns className="w-3 h-3 text-emerald-700" />
-              <span>Columns ({Object.values(visibleCols).filter(Boolean).length}/45)</span>
-            </button>
-
-            {/* Clear Product Automation Tab Button */}
-            <button
-              onClick={() => setShowClearAutomationModal(true)}
-              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-300 rounded-lg shadow-2xs transition-colors shrink-0 cursor-pointer"
-              title="Clear all rows in Product Automation & upload fresh new data"
-            >
-              <Trash2 className="w-3 h-3 text-rose-600" />
-              <span>Clear Tab</span>
-            </button>
-
-            {/* Export CSV */}
-            <button
-              onClick={handleExportCSV}
-              className="p-1 text-slate-600 hover:text-slate-900 hover:bg-slate-200 rounded border border-slate-300 shrink-0 cursor-pointer"
-              title="Export CSV / Excel"
-            >
-              <Download className="w-3.5 h-3.5" />
-            </button>
-
-            {/* Firebase Cloud Sync Button */}
-            <button
-              onClick={() => setShowFirebaseModal(true)}
-              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold bg-amber-500 hover:bg-amber-600 text-white rounded-lg shadow-2xs transition-colors shrink-0 cursor-pointer"
-              title="Upload historical data to Firebase"
-            >
-              <Flame className="w-3 h-3 fill-white" />
-              <span>Firebase</span>
-            </button>
-
-            {/* Reset data */}
-            <button
-              onClick={handleReset}
-              className="p-1 text-slate-500 hover:text-slate-700 hover:bg-slate-200 rounded shrink-0 cursor-pointer"
-              title="Reset to default sample data"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-            </button>
-
-            {/* FULL SIZE ON BUTTON IN THE FAR RIGHT CORNER */}
-            {setIsFullWidth && (
-              <button
-                onClick={() => setIsFullWidth(!isFullWidth)}
-                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border text-xs font-bold transition-all shadow-xs shrink-0 ${
-                  isFullWidth
-                    ? 'bg-emerald-700 text-white border-emerald-800 hover:bg-emerald-800'
-                    : 'bg-white text-slate-800 border-slate-300 hover:bg-slate-100'
-                }`}
-                title={isFullWidth ? "Click for Boxed View" : "Click for Full Screen View"}
-              >
-                {isFullWidth ? <Minimize2 className="w-3 h-3" /> : <Maximize2 className="w-3 h-3" />}
-                <span>{isFullWidth ? 'Full Size ON' : 'Full Size OFF'}</span>
-              </button>
-            )}
           </div>
-        </div>
+        )}
 
         {/* Sync feedback notification */}
         {syncFeedback && (
@@ -3454,7 +3633,23 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   1
                 </th>
                 <th className="px-2 py-1 text-center bg-slate-900 text-slate-400 border-r border-slate-700 text-[10px]">
-                  Action
+                  <div className="flex items-center justify-center gap-1">
+                    <input
+                      type="checkbox"
+                      checked={
+                        paginatedOrders.length > 0 &&
+                        paginatedOrders.every(o => o.items.every(it => selectedAutoItemIds.has(it.id)))
+                      }
+                      onChange={() => {
+                        const pageIds: string[] = [];
+                        paginatedOrders.forEach(o => o.items.forEach(it => pageIds.push(it.id)));
+                        handleToggleSelectAutoItems(pageIds);
+                      }}
+                      className="w-3.5 h-3.5 rounded border-slate-500 text-emerald-500 focus:ring-emerald-500 cursor-pointer"
+                      title="Select / Deselect all orders on this page"
+                    />
+                    <span>Action</span>
+                  </div>
                 </th>
 
                 {fmsColumnMapping.map(col => {
@@ -3574,7 +3769,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                     onToggleColAJ: handleToggleColAJ,
                     colAKTimestamps,
                     colALRemarks,
-                    onUpdateColAL: handleUpdateColAL
+                    onUpdateColAL: handleUpdateColAL,
+                    selectedAutoItemIds,
+                    onToggleSelectAutoItems: handleToggleSelectAutoItems
                   },
                   startRowNumber,
                   autoFitColumns
@@ -4889,6 +5086,98 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           </div>
         );
       })()}
+
+      {/* MODAL: BULK CLOSE / BULK REOPEN CONFIRMATION (Month-Wise Filtered or Selected Orders) */}
+      {bulkStatusModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full overflow-hidden border border-slate-200">
+            <div className={`px-5 py-4 text-white flex items-center justify-between ${
+              bulkStatusModal.targetStatus === 'Closed' ? 'bg-emerald-700' : 'bg-sky-700'
+            }`}>
+              <div className="flex items-center gap-2.5">
+                <span className={`p-1.5 rounded-lg text-white ${
+                  bulkStatusModal.targetStatus === 'Closed' ? 'bg-emerald-800' : 'bg-sky-800'
+                }`}>
+                  <CheckCircle2 className="w-5 h-5" />
+                </span>
+                <div>
+                  <h3 className="font-bold text-sm">
+                    {bulkStatusModal.targetStatus === 'Closed'
+                      ? 'Bulk Close Multiple Orders (Col AN ➔ Closed)'
+                      : 'Bulk Reopen Multiple Orders (Col AN ➔ Open)'}
+                  </h3>
+                  <p className="text-[11px] text-white/80">
+                    Instant batch update &amp; Firebase Cloud sync
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setBulkStatusModal(null)}
+                className="p-1 rounded-lg text-white/80 hover:text-white hover:bg-black/20 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500 font-medium">Filter / Selection:</span>
+                  <span className="font-bold text-slate-800">{bulkStatusModal.filterSummary}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500 font-medium">Total Orders Affected:</span>
+                  <span className="font-mono font-extrabold text-emerald-700 text-sm">
+                    {bulkStatusModal.orderCount.toLocaleString()} Orders ({bulkStatusModal.itemIds.length.toLocaleString()} Item Rows)
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500 font-medium">New Status (Col AN):</span>
+                  <span className={`px-2 py-0.5 rounded font-bold ${
+                    bulkStatusModal.targetStatus === 'Closed'
+                      ? 'bg-emerald-100 text-emerald-900 border border-emerald-300'
+                      : 'bg-sky-100 text-sky-900 border border-sky-300'
+                  }`}>
+                    {bulkStatusModal.targetStatus === 'Closed' ? '🟢 Closed (Move to Closed Orders)' : '🔵 Open (Move to Order Automation)'}
+                  </span>
+                </div>
+              </div>
+
+              <p className="text-xs text-slate-600 leading-relaxed">
+                {bulkStatusModal.targetStatus === 'Closed'
+                  ? `Kya aap in sabhi ${bulkStatusModal.itemIds.length.toLocaleString()} item rows (${bulkStatusModal.orderCount.toLocaleString()} orders) ko ek sath "Closed" karna chahte hain? Ye turant "Closed Orders" tab aur Firebase Cloud me save ho jayenge.`
+                  : `Kya aap in sabhi ${bulkStatusModal.itemIds.length.toLocaleString()} item rows ko wapas "Open" karke "Order Automation" tab me bhejna chahte hain?`}
+              </p>
+            </div>
+
+            <div className="px-5 py-3.5 bg-slate-50 border-t border-slate-200 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setBulkStatusModal(null)}
+                className="px-3.5 py-1.5 text-xs font-semibold text-slate-600 hover:text-slate-900 hover:bg-slate-200/70 rounded-lg transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => handleBulkStatusChange(bulkStatusModal.itemIds, bulkStatusModal.targetStatus)}
+                className={`inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-extrabold rounded-lg text-white shadow-xs transition-colors cursor-pointer ${
+                  bulkStatusModal.targetStatus === 'Closed'
+                    ? 'bg-emerald-600 hover:bg-emerald-700'
+                    : 'bg-sky-600 hover:bg-sky-700'
+                }`}
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                <span>
+                  {bulkStatusModal.targetStatus === 'Closed'
+                    ? `Confirm & Close All (${bulkStatusModal.itemIds.length.toLocaleString()} Rows)`
+                    : `Confirm & Reopen All (${bulkStatusModal.itemIds.length.toLocaleString()} Rows)`}
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -4929,6 +5218,8 @@ function renderSpreadsheetRows(
     colAKTimestamps: Record<string, string>;
     colALRemarks: Record<string, string>;
     onUpdateColAL: (orderKey: string, val: string) => void;
+    selectedAutoItemIds: Set<string>;
+    onToggleSelectAutoItems: (itemIds: string[]) => void;
   },
   startRowIndex: number = 2,
   autoFitColumns: boolean = true
@@ -4957,12 +5248,15 @@ function renderSpreadsheetRows(
       const numSticky = freezeColumns >= 1 ? 'sticky left-0 z-20 bg-slate-50 shadow-[2px_0_4px_-1px_rgba(0,0,0,0.15)]' : '';
       const poSticky = freezeColumns >= 2 ? 'sticky left-[48px] z-20 bg-blue-50/90 shadow-[2px_0_4px_-1px_rgba(0,0,0,0.15)]' : '';
       const nameSticky = freezeColumns >= 3 ? 'sticky left-[158px] z-20 bg-blue-50/90 shadow-[2px_0_4px_-1px_rgba(0,0,0,0.15)]' : '';
+      const isRowSelected = handlers.selectedAutoItemIds.has(item.id);
 
       rows.push(
         <tr
           key={`${order.orderKey}_${item.id}_${itemIdx}`}
           className={`transition-colors ${
-            item.isDuplicate
+            isRowSelected
+              ? 'bg-emerald-50/90 hover:bg-emerald-100/80'
+              : item.isDuplicate
               ? 'bg-rose-50/60 hover:bg-rose-100/70'
               : 'hover:bg-slate-50'
           } ${bottomBorderClass}`}
@@ -4978,20 +5272,36 @@ function renderSpreadsheetRows(
             {thisRow}
           </td>
 
-          {/* Action Column (Per-Row Duplicate Color Indicator + Delete Action) */}
+          {/* Action Column (Checkbox for Multi-Select Bulk Close + Duplicate Indicator + Delete Action) */}
           <td
             className={`px-1.5 py-0.5 text-center border-r border-slate-300 align-middle whitespace-nowrap ${
               item.isDuplicate
                 ? 'bg-rose-500 text-white font-extrabold shadow-inner'
+                : isRowSelected
+                ? 'bg-emerald-100 text-emerald-950'
                 : 'bg-emerald-50/70 text-emerald-800'
             } ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             title={
               item.isDuplicate
                 ? `⚠️ DUPLICATE ROW DETECTED (Copy #${item.duplicateGroupIndex} of ${item.duplicateCount} identical rows for ${order.customerName} - ${item.itemName})`
-                : 'Unique Row (No Duplicate)'
+                : 'Select row for Bulk Close / Reopen'
             }
           >
             <div className="flex items-center justify-center gap-1">
+              <input
+                type="checkbox"
+                checked={isRowSelected}
+                onChange={() => {
+                  // If clicking first row in Merged View, toggle all items of this order block together
+                  if (useMerge && isFirst && order.items.length > 1) {
+                    handlers.onToggleSelectAutoItems(order.items.map(it => it.id));
+                  } else {
+                    handlers.onToggleSelectAutoItems([item.id]);
+                  }
+                }}
+                className="w-3.5 h-3.5 rounded border-slate-400 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
+                title={useMerge && isFirst && order.items.length > 1 ? `Select all ${order.items.length} items in this order` : 'Select this item row'}
+              />
               {item.isDuplicate ? (
                 <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-rose-700 text-amber-200 text-[9px] font-mono font-extrabold tracking-tight border border-amber-300/80 shadow-2xs">
                   DUP ×{item.duplicateCount}
