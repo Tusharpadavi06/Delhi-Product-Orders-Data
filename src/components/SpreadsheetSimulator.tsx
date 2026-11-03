@@ -2698,6 +2698,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
     setRawResponses(prev => {
       const cleanPrev = prev.filter(r => !/^ORD-(REAL|NANDANI|PENDING|\d+)/.test(r.orderId));
+      // If full Product Order sheet hasn't loaded yet and Firebase only has closed rows, wait for handleSyncDelhiImportRange to merge all 6k+ rows
+      if (cleanPrev.length === 0 && fbCloud.activeRows.length === 0) {
+        return prev;
+      }
       const baseRows = cleanPrev.length > 0 ? cleanPrev : fbCloud.activeRows;
 
       const makeRowMatchKey = (r: ProductOrderRow) =>
@@ -2943,9 +2947,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   }, [filteredOrders, safeAutomationPage, automationPageSize]);
 
   // Total Orders for Product Order tab (as per =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z"))
+  // Always displays 100% of all rows (6,490+ rows) in Product Order — Open/Closed status is strictly for Order Automation -> Closed Orders!
   const productOrderRows = useMemo(() => {
-    const activeRows = rawResponses.filter(r => r.sheetSource !== 'closed' && r.statusAN !== 'Closed');
-    return activeRows.length > 0 ? activeRows : rawResponses;
+    return rawResponses;
   }, [rawResponses]);
 
   // Aggregate metrics (Exact Row Counts matching Google Sheets 1:1)
@@ -3552,17 +3556,17 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             <table className={`${autoFitColumns ? 'w-max min-w-full table-auto' : 'w-full'} border-collapse text-xs text-left`}>
             {/* The Sticky Column Letters Header with Rich Fill Colors */}
             <thead className={`${freezeRows === 1 ? 'sticky top-0 z-30' : ''} select-none border-b-2 border-slate-900`}>
-              <tr className="font-mono text-[11px]">
+              <tr className="font-mono text-[10px]">
                 {/* # Column */}
                 <th
-                  className={`w-12 px-2 py-1 text-center bg-slate-900 text-slate-300 border-r border-slate-800 font-bold ${
+                  className={`w-10 px-1.5 py-0.5 text-center bg-slate-900 text-slate-300 border-r border-slate-800 font-bold ${
                     freezeColumns >= 1 ? 'sticky left-0 z-40 bg-slate-900 shadow-[2px_0_4px_-1px_rgba(0,0,0,0.3)]' : ''
                   }`}
                 >
                   #
                 </th>
                 {/* Action Column */}
-                <th className="w-14 px-2 py-1 text-center bg-slate-900 text-slate-300 border-r border-slate-800 font-bold">
+                <th className="w-14 px-1.5 py-0.5 text-center bg-slate-900 text-slate-300 border-r border-slate-800 font-bold">
                   Action
                 </th>
 
@@ -3605,7 +3609,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   return (
                     <th
                       key={col.sheetCol}
-                      className={`px-2 py-1 text-center font-bold ${bgColor} ${stickyStyle}`}
+                      className={`px-1.5 py-0.5 text-center font-bold leading-tight ${bgColor} ${stickyStyle}`}
                     >
                       <div className="flex items-center justify-center gap-1">
                         <span>{col.sheetCol}</span>
@@ -3626,13 +3630,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               {/* Row 2: Human Readable Column Names with Filters & Elegant Fill Color */}
               <tr className="bg-slate-800 text-slate-100 font-sans text-[11px] font-semibold border-b-2 border-slate-950">
                 <th
-                  className={`px-2 py-1 text-center bg-slate-900 text-slate-400 border-r border-slate-700 ${
+                  className={`px-1.5 py-0.5 text-center bg-slate-900 text-slate-400 border-r border-slate-700 leading-tight ${
                     freezeColumns >= 1 ? 'sticky left-0 z-40 bg-slate-900 shadow-[2px_0_4px_-1px_rgba(0,0,0,0.3)]' : ''
                   }`}
                 >
                   1
                 </th>
-                <th className="px-2 py-1 text-center bg-slate-900 text-slate-400 border-r border-slate-700 text-[10px]">
+                <th className="px-1.5 py-0.5 text-center bg-slate-900 text-slate-400 border-r border-slate-700 text-[10px] leading-tight">
                   <div className="flex items-center justify-center gap-1">
                     <input
                       type="checkbox"
@@ -3645,7 +3649,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                         paginatedOrders.forEach(o => o.items.forEach(it => pageIds.push(it.id)));
                         handleToggleSelectAutoItems(pageIds);
                       }}
-                      className="w-3.5 h-3.5 rounded border-slate-500 text-emerald-500 focus:ring-emerald-500 cursor-pointer"
+                      className="w-3 h-3 rounded border-slate-500 text-emerald-500 focus:ring-emerald-500 cursor-pointer"
                       title="Select / Deselect all orders on this page"
                     />
                     <span>Action</span>
@@ -3685,9 +3689,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   return (
                     <th
                       key={col.sheetCol}
-                      className={`px-2.5 py-1 whitespace-nowrap ${bgHead} ${stickyStyle}`}
+                      className={`px-2 py-0.5 whitespace-nowrap leading-tight ${bgHead} ${stickyStyle}`}
                     >
-                      <div className="flex items-center justify-between gap-1.5">
+                      <div className="flex items-center justify-between gap-1">
                         <span className="whitespace-nowrap">{col.name}</span>
                         {/* Filter on EVERY column */}
                         <button
@@ -3697,7 +3701,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                           }`}
                           title={`Filter, Sort or Hide ${col.name} (${col.sheetCol})`}
                         >
-                          <Filter className="w-3 h-3" />
+                          <Filter className="w-2.5 h-2.5" />
                         </button>
                       </div>
                     </th>
@@ -3782,32 +3786,32 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         </div>
         )}
 
-        {/* FAST VIRTUAL PAGINATION BAR (Prevents browser freeze & unresponsive page notifications) */}
+        {/* COMPACT PAGINATION BAR */}
         {(activeSheetTab === 'automation' || activeSheetTab === 'closed') && filteredOrders.length > 0 && (
-          <div className="shrink-0 flex items-center justify-between px-3 py-1.5 bg-slate-100 border-t border-slate-300 text-xs text-slate-700 select-none">
-            <div className="flex items-center gap-3">
+          <div className="shrink-0 flex items-center justify-between px-2 py-0.5 bg-slate-100 border-t border-slate-300 text-[10px] text-slate-700 select-none">
+            <div className="flex items-center gap-2">
               <span className="font-semibold text-slate-800">
-                Showing <span className="font-bold text-emerald-700 font-mono">{totalItemRows.toLocaleString()}</span> exact sheet rows
+                Rows: <span className="font-bold text-emerald-700 font-mono">{totalItemRows.toLocaleString()}</span>
                 <span className="text-slate-500 font-normal ml-1">
-                  (Page {safeAutomationPage} of {totalAutomationPages} · {filteredOrders.length.toLocaleString()} order blocks)
+                  ({filteredOrders.length.toLocaleString()} orders · Pg {safeAutomationPage}/{totalAutomationPages})
                 </span>
               </span>
 
-              <div className="flex items-center gap-1.5 ml-2 pl-3 border-l border-slate-300">
-                <span className="text-[11px] text-slate-500">Orders per page:</span>
+              <div className="flex items-center gap-1 ml-1 pl-2 border-l border-slate-300">
+                <span className="text-[10px] text-slate-500">Show:</span>
                 <select
                   value={automationPageSize}
                   onChange={(e) => {
                     setAutomationPageSize(Number(e.target.value));
                     setAutomationPage(1);
                   }}
-                  className="px-2 py-0.5 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-700 focus:outline-none focus:ring-1 focus:ring-emerald-500 cursor-pointer"
+                  className="px-1 py-0 h-5 bg-white border border-slate-300 rounded text-[10px] font-semibold text-slate-700 focus:outline-none cursor-pointer"
                 >
-                  <option value={20}>20 orders</option>
-                  <option value={25}>25 orders (Recommended)</option>
-                  <option value={50}>50 orders</option>
-                  <option value={100}>100 orders</option>
-                  <option value={0}>All (May lag if &gt;500)</option>
+                  <option value={20}>20</option>
+                  <option value={25}>25</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                  <option value={0}>All</option>
                 </select>
               </div>
             </div>
@@ -3818,22 +3822,22 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   type="button"
                   onClick={() => setAutomationPage(p => Math.max(1, p - 1))}
                   disabled={safeAutomationPage <= 1}
-                  className="px-2 py-1 rounded bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1 text-xs font-medium cursor-pointer"
+                  className="px-1.5 py-0 h-5 rounded bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-medium cursor-pointer"
                 >
-                  <ChevronLeft className="w-3.5 h-3.5" /> Prev
+                  <ChevronLeft className="w-3 h-3" /> Prev
                 </button>
 
-                <span className="px-2 text-xs font-medium text-slate-600">
-                  Page <strong className="text-slate-900">{safeAutomationPage}</strong> of <strong>{totalAutomationPages}</strong>
+                <span className="px-1 text-[10px] font-mono text-slate-600">
+                  {safeAutomationPage}/{totalAutomationPages}
                 </span>
 
                 <button
                   type="button"
                   onClick={() => setAutomationPage(p => Math.min(totalAutomationPages, p + 1))}
                   disabled={safeAutomationPage >= totalAutomationPages}
-                  className="px-2 py-1 rounded bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1 text-xs font-medium cursor-pointer"
+                  className="px-1.5 py-0 h-5 rounded bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-medium cursor-pointer"
                 >
-                  Next <ChevronRight className="w-3.5 h-3.5" />
+                  Next <ChevronRight className="w-3 h-3" />
                 </button>
               </div>
             )}
@@ -3941,23 +3945,23 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           </div>
         )}
 
-        {/* GOOGLE SHEETS BOTTOM TABS BAR */}
-        <div className="bg-slate-200 border-t border-slate-300 px-3 py-2 flex flex-wrap items-center justify-between gap-3 select-none">
+        {/* COMPACT GOOGLE SHEETS BOTTOM TABS BAR */}
+        <div className="bg-slate-200 border-t border-slate-300 px-2 py-1 flex flex-wrap items-center justify-between gap-2 select-none">
           {/* Tabs */}
           <div className="flex items-center gap-1">
-            {/* Tab 1: Product Order (28-Col Flat Sheet - Shows Total Orders as per =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")) */}
+            {/* Tab 1: Product Order (28-Col Flat Sheet - Shows ALL 6,000+ Total Orders) */}
             <button
               onClick={() => setActiveSheetTab('product_order')}
-              className={`px-3.5 py-1.5 text-xs font-bold rounded-t-md transition-colors flex items-center gap-1.5 cursor-pointer ${
+              className={`px-2.5 py-1 text-[11px] font-bold rounded-t-md transition-colors flex items-center gap-1 cursor-pointer ${
                 activeSheetTab === 'product_order'
-                  ? 'bg-white text-blue-900 shadow-sm border-t-2 border-blue-600'
+                  ? 'bg-white text-blue-900 shadow-2xs border-t-2 border-blue-600'
                   : 'bg-slate-300/80 text-slate-700 hover:bg-slate-300'
               }`}
             >
-              <FileSpreadsheet className="w-3.5 h-3.5 text-blue-600" />
-              <span>Product Order (Total Orders)</span>
-              <span className="ml-1 text-[10px] px-1.5 py-0.2 rounded-full bg-blue-100 text-blue-800 font-mono font-bold">
-                {productOrderRows.length.toLocaleString()} orders
+              <FileSpreadsheet className="w-3 h-3 text-blue-600" />
+              <span>Product Order</span>
+              <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-blue-100 text-blue-800 font-mono font-bold">
+                {productOrderRows.length.toLocaleString()}
               </span>
             </button>
 
@@ -3967,16 +3971,16 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                 setViewMode('merged');
                 setActiveSheetTab('automation');
               }}
-              className={`px-3.5 py-1.5 text-xs font-bold rounded-t-md transition-colors flex items-center gap-1.5 cursor-pointer ${
+              className={`px-2.5 py-1 text-[11px] font-bold rounded-t-md transition-colors flex items-center gap-1 cursor-pointer ${
                 activeSheetTab === 'automation'
-                  ? 'bg-white text-emerald-800 shadow-sm border-t-2 border-emerald-600'
+                  ? 'bg-white text-emerald-800 shadow-2xs border-t-2 border-emerald-600'
                   : 'bg-slate-300/80 text-slate-700 hover:bg-slate-300'
               }`}
             >
-              <Layers className="w-3.5 h-3.5 text-emerald-600" />
+              <Layers className="w-3 h-3 text-emerald-600" />
               <span>Order Automation</span>
-              <span className="ml-1 text-[10px] px-1.5 py-0.2 rounded-full bg-emerald-100 text-emerald-800 font-mono font-bold">
-                {activeItemsCount.toLocaleString()} rows
+              <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-emerald-100 text-emerald-800 font-mono font-bold">
+                {activeItemsCount.toLocaleString()}
               </span>
             </button>
 
@@ -3986,28 +3990,24 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                 setActiveSheetTab('closed');
                 handleRefreshFromFirebaseCloud();
               }}
-              className={`px-3.5 py-1.5 text-xs font-bold rounded-t-md transition-colors flex items-center gap-1.5 cursor-pointer ${
+              className={`px-2.5 py-1 text-[11px] font-bold rounded-t-md transition-colors flex items-center gap-1 cursor-pointer ${
                 activeSheetTab === 'closed'
-                  ? 'bg-white text-indigo-900 shadow-sm border-t-2 border-indigo-600'
+                  ? 'bg-white text-indigo-900 shadow-2xs border-t-2 border-indigo-600'
                   : 'bg-slate-300/80 text-slate-700 hover:bg-slate-300'
               }`}
             >
-              <Archive className="w-3.5 h-3.5 text-indigo-600" />
-              <span>Closed Orders (Archive)</span>
-              <span className="ml-1 text-[10px] px-1.5 py-0.2 rounded-full bg-indigo-100 text-indigo-800 font-mono font-bold">
-                {closedItemsCount.toLocaleString()} rows
+              <Archive className="w-3 h-3 text-indigo-600" />
+              <span>Closed Orders</span>
+              <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-indigo-100 text-indigo-800 font-mono font-bold">
+                {closedItemsCount.toLocaleString()}
               </span>
             </button>
           </div>
 
-          {/* Status info */}
-          <div className="text-[11px] text-slate-600 flex items-center gap-2">
-            <span className="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-            <span>Live Web Sheet Workspace</span>
-            <span>·</span>
-            <span>{freezeColumns > 0 || freezeRows > 0 ? `Freeze (${freezeColumns}) Active` : 'Unfrozen'}</span>
-            <span>·</span>
-            <span className="font-mono text-emerald-800 font-semibold">Vercel Ready</span>
+          {/* Compact Status indicator */}
+          <div className="text-[10px] text-slate-600 flex items-center gap-1.5">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+            <span className="font-semibold text-emerald-800">Live Web</span>
           </div>
         </div>
       </div>
@@ -5253,7 +5253,7 @@ function renderSpreadsheetRows(
       rows.push(
         <tr
           key={`${order.orderKey}_${item.id}_${itemIdx}`}
-          className={`transition-colors ${
+          className={`transition-colors leading-tight ${
             isRowSelected
               ? 'bg-emerald-50/90 hover:bg-emerald-100/80'
               : item.isDuplicate
@@ -5263,7 +5263,7 @@ function renderSpreadsheetRows(
         >
           {/* Row Number */}
           <td
-            className={`px-1.5 py-0.5 text-center border-r border-slate-300 font-mono text-[10px] ${
+            className={`px-1 py-0 text-center border-r border-slate-300 font-mono text-[10px] leading-tight ${
               item.isDuplicate
                 ? 'bg-rose-200 text-rose-950 font-extrabold'
                 : 'bg-slate-50 text-slate-500'
@@ -5274,7 +5274,7 @@ function renderSpreadsheetRows(
 
           {/* Action Column (Checkbox for Multi-Select Bulk Close + Duplicate Indicator + Delete Action) */}
           <td
-            className={`px-1.5 py-0.5 text-center border-r border-slate-300 align-middle whitespace-nowrap ${
+            className={`px-1 py-0 text-center border-r border-slate-300 align-middle whitespace-nowrap leading-tight ${
               item.isDuplicate
                 ? 'bg-rose-500 text-white font-extrabold shadow-inner'
                 : isRowSelected
@@ -5299,26 +5299,26 @@ function renderSpreadsheetRows(
                     handlers.onToggleSelectAutoItems([item.id]);
                   }
                 }}
-                className="w-3.5 h-3.5 rounded border-slate-400 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
+                className="w-3 h-3 rounded border-slate-400 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
                 title={useMerge && isFirst && order.items.length > 1 ? `Select all ${order.items.length} items in this order` : 'Select this item row'}
               />
               {item.isDuplicate ? (
-                <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-rose-700 text-amber-200 text-[9px] font-mono font-extrabold tracking-tight border border-amber-300/80 shadow-2xs">
+                <span className="inline-flex items-center gap-0.5 px-1 py-0 rounded bg-rose-700 text-amber-200 text-[9px] font-mono font-extrabold tracking-tight border border-amber-300/80 shadow-2xs">
                   DUP ×{item.duplicateCount}
                 </span>
               ) : (
-                <span className="inline-block w-2 h-2 rounded-full bg-emerald-500" title="Unique Row ✓" />
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500" title="Unique Row ✓" />
               )}
               <button
                 onClick={() => handlers.onDeleteItem(item.id)}
-                className={`p-0.5 rounded transition-colors cursor-pointer ${
+                className={`p-0 rounded transition-colors cursor-pointer ${
                   item.isDuplicate
                     ? 'text-white hover:bg-rose-700 hover:text-amber-200'
                     : 'text-slate-400 hover:text-rose-600 hover:bg-rose-50'
                 }`}
                 title={item.isDuplicate ? 'Delete this duplicate row' : 'Delete this row'}
               >
-                <Trash2 className="w-3 h-3" />
+                <Trash2 className="w-2.5 h-2.5" />
               </button>
             </div>
           </td>
@@ -5330,7 +5330,7 @@ function renderSpreadsheetRows(
               {visibleCols['A'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 whitespace-nowrap text-[10px] leading-tight ${cellBottomBorder}`}
                 >
                   {order.timestamp}
                 </td>
@@ -5340,12 +5340,12 @@ function renderSpreadsheetRows(
               {visibleCols['B'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 font-bold text-slate-900 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] ${poSticky} ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 font-bold text-slate-900 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] leading-tight ${poSticky} ${cellBottomBorder}`}
                 >
                   <div className="flex items-center gap-1">
                     <span className={order.customerPO === '5281' ? 'text-emerald-700 font-extrabold' : ''}>{order.customerPO}</span>
                     {useMerge && order.items.length > 1 && (
-                      <span className="text-[9px] px-1 py-0.1 rounded-full bg-blue-100 text-blue-800 font-mono font-bold">
+                      <span className="text-[9px] px-1 py-0 rounded-full bg-blue-100 text-blue-800 font-mono font-bold">
                         {order.items.length} itm
                       </span>
                     )}
@@ -5357,7 +5357,7 @@ function renderSpreadsheetRows(
               {visibleCols['C'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 font-semibold text-slate-800 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] ${nameSticky} ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 font-semibold text-slate-800 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] leading-tight ${nameSticky} ${cellBottomBorder}`}
                 >
                   {order.customerName}
                 </td>
@@ -5367,7 +5367,7 @@ function renderSpreadsheetRows(
               {visibleCols['D'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 whitespace-nowrap text-[10px] ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 whitespace-nowrap text-[10px] leading-tight ${cellBottomBorder}`}
                 >
                   {order.customerEmail}
                 </td>
@@ -5377,7 +5377,7 @@ function renderSpreadsheetRows(
               {visibleCols['E'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 whitespace-nowrap text-[10px] leading-tight ${cellBottomBorder}`}
                 >
                   {order.orderDate}
                 </td>
@@ -5389,7 +5389,7 @@ function renderSpreadsheetRows(
           {/* Col F: Unit */}
           {visibleCols['F'] && (
             <td
-              className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-700 whitespace-nowrap font-medium text-[11px] ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-700 whitespace-nowrap font-medium text-[10px] leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             >
               {item.unit}
             </td>
@@ -5398,7 +5398,7 @@ function renderSpreadsheetRows(
           {/* Col G: Item Name */}
           {visibleCols['G'] && (
             <td
-              className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 font-semibold text-slate-900 whitespace-nowrap text-[11px] ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              className={`px-1.5 py-0.5 border-r border-slate-300 font-semibold text-slate-900 whitespace-nowrap text-[11px] leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             >
               <div className="flex items-center justify-between gap-1">
                 <span>{item.itemName}</span>
@@ -5408,7 +5408,7 @@ function renderSpreadsheetRows(
                       e.stopPropagation();
                       handlers.onDeleteItem(item.id);
                     }}
-                    className="opacity-0 group-hover:opacity-100 hover:text-rose-600 text-slate-300 p-0.5 rounded"
+                    className="opacity-0 group-hover:opacity-100 hover:text-rose-600 text-slate-300 p-0 rounded"
                     title="Delete item row"
                   >
                     <X className="w-2.5 h-2.5" />
@@ -5421,7 +5421,7 @@ function renderSpreadsheetRows(
           {/* Col H: Color */}
           {visibleCols['H'] && (
             <td
-              className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-700 whitespace-nowrap text-[11px] ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-700 whitespace-nowrap text-[11px] leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             >
               {item.color}
             </td>
@@ -5430,7 +5430,7 @@ function renderSpreadsheetRows(
           {/* Col I: Width */}
           {visibleCols['I'] && (
             <td
-              className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-700 whitespace-nowrap text-[11px] ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-700 whitespace-nowrap text-[11px] leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             >
               {item.width}
             </td>
@@ -5439,7 +5439,7 @@ function renderSpreadsheetRows(
           {/* Col J: Unit (of Item) */}
           {visibleCols['J'] && (
             <td
-              className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-600 whitespace-nowrap text-[11px] ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-600 whitespace-nowrap text-[10px] leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             >
               {item.unitOfItem}
             </td>
@@ -5448,7 +5448,7 @@ function renderSpreadsheetRows(
           {/* Col K: Qty */}
           {visibleCols['K'] && (
             <td
-              className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 font-mono font-bold text-slate-900 text-right whitespace-nowrap text-[11px] ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              className={`px-1.5 py-0.5 border-r border-slate-300 font-mono font-bold text-slate-900 text-right whitespace-nowrap text-[11px] leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             >
               {item.qty.toLocaleString()}
             </td>
@@ -5457,7 +5457,7 @@ function renderSpreadsheetRows(
           {/* Col L: Rate */}
           {visibleCols['L'] && (
             <td
-              className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 font-mono text-slate-700 text-right whitespace-nowrap text-[11px] ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              className={`px-1.5 py-0.5 border-r border-slate-300 font-mono text-slate-700 text-right whitespace-nowrap text-[11px] leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             >
               ₹{item.rate}
             </td>
@@ -5466,7 +5466,7 @@ function renderSpreadsheetRows(
           {/* Col M: Discount */}
           {visibleCols['M'] && (
             <td
-              className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 font-mono text-slate-700 text-right whitespace-nowrap text-[11px] ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              className={`px-1.5 py-0.5 border-r border-slate-300 font-mono text-slate-700 text-right whitespace-nowrap text-[11px] leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             >
               {item.discount}%
             </td>
@@ -5475,7 +5475,7 @@ function renderSpreadsheetRows(
           {/* Col N: Delivery Date */}
           {visibleCols['N'] && (
             <td
-              className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-600 whitespace-nowrap text-[11px] ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-600 whitespace-nowrap text-[10px] leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             >
               {item.deliveryDate}
             </td>
@@ -5488,7 +5488,7 @@ function renderSpreadsheetRows(
               {visibleCols['O'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 text-[11px] ${
+                  className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 text-[10px] leading-tight ${
                     autoFitColumns ? 'whitespace-nowrap' : 'whitespace-nowrap max-w-[180px] truncate'
                   } ${cellBottomBorder}`}
                   title={order.remark}
@@ -5501,7 +5501,7 @@ function renderSpreadsheetRows(
               {visibleCols['P'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 font-mono text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 font-mono text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap text-[10px] leading-tight ${cellBottomBorder}`}
                 >
                   {order.customerNumber}
                 </td>
@@ -5511,7 +5511,7 @@ function renderSpreadsheetRows(
               {visibleCols['Q'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 text-[11px] ${
+                  className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 text-[10px] leading-tight ${
                     autoFitColumns ? 'whitespace-nowrap' : 'whitespace-nowrap max-w-[180px] truncate'
                   } ${cellBottomBorder}`}
                   title={order.billingAddress}
@@ -5524,7 +5524,7 @@ function renderSpreadsheetRows(
               {visibleCols['R'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 text-[11px] ${
+                  className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-600 align-middle bg-blue-50/20 text-[10px] leading-tight ${
                     autoFitColumns ? 'whitespace-nowrap' : 'whitespace-nowrap max-w-[180px] truncate'
                   } ${cellBottomBorder}`}
                   title={order.deliveryAddress}
@@ -5537,7 +5537,7 @@ function renderSpreadsheetRows(
               {visibleCols['S'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap text-[10px] leading-tight ${cellBottomBorder}`}
                 >
                   {order.transporterName}
                 </td>
@@ -5547,7 +5547,7 @@ function renderSpreadsheetRows(
               {visibleCols['T'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap text-[10px] leading-tight ${cellBottomBorder}`}
                 >
                   {order.salesPerson}
                 </td>
@@ -5557,9 +5557,9 @@ function renderSpreadsheetRows(
               {visibleCols['U'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap leading-tight ${cellBottomBorder}`}
                 >
-                  <span className="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-800 text-[10px] font-medium">
+                  <span className="px-1 py-0 rounded bg-emerald-100 text-emerald-800 text-[9px] font-medium">
                     {order.accountStatus || 'Approved'}
                   </span>
                 </td>
@@ -5569,7 +5569,7 @@ function renderSpreadsheetRows(
               {visibleCols['V'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap text-[10px] leading-tight ${cellBottomBorder}`}
                 >
                   {order.approvalStatus}
                 </td>
@@ -5579,7 +5579,7 @@ function renderSpreadsheetRows(
               {visibleCols['W'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap text-[10px] ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-700 align-middle bg-blue-50/20 whitespace-nowrap text-[10px] leading-tight ${cellBottomBorder}`}
                 >
                   {order.branch}
                 </td>
@@ -5589,7 +5589,7 @@ function renderSpreadsheetRows(
               {visibleCols['X'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 font-mono font-medium text-slate-900 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] ${cellBottomBorder}`}
+                  className={`px-1.5 py-0.5 border-r border-slate-300 font-mono font-medium text-slate-900 align-middle bg-blue-50/20 whitespace-nowrap text-[11px] leading-tight ${cellBottomBorder}`}
                 >
                   <div className="flex items-center gap-1">
                     <span className={order.orderNo ? 'font-bold text-slate-900' : 'text-slate-400 italic'}>
@@ -5600,7 +5600,7 @@ function renderSpreadsheetRows(
                         e.stopPropagation();
                         handlers.onOpenOrderNoModal({ key: order.orderKey, po: order.customerPO, value: order.orderNo });
                       }}
-                      className="text-slate-400 hover:text-emerald-700 p-0.5 rounded transition-colors"
+                      className="text-slate-400 hover:text-emerald-700 p-0 rounded transition-colors"
                       title="Edit Order Number in Col X"
                     >
                       <Edit3 className="w-2.5 h-2.5" />
@@ -5614,7 +5614,7 @@ function renderSpreadsheetRows(
           {/* COLUMN Y: DISPATCH QNT (MANUAL USER ENTRY PER ITEM ROW) */}
           {visibleCols['Y'] && (
             <td
-              className={`px-1.5 py-0.5 border-r border-slate-300 bg-amber-50/40 whitespace-nowrap text-right ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              className={`px-1 py-0 border-r border-slate-300 bg-amber-50/40 whitespace-nowrap text-right leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             >
               <div className="flex items-center justify-end gap-1">
                 <input
@@ -5623,7 +5623,7 @@ function renderSpreadsheetRows(
                   value={item.dispatchQty || ''}
                   placeholder="0"
                   onChange={(e) => handlers.onDispatchChange(order.orderKey, item, e.target.value)}
-                  className="w-18 px-1.5 py-0.5 text-right font-mono text-[11px] font-bold text-amber-950 bg-white border border-amber-300 rounded focus:ring-1 focus:ring-amber-500 focus:outline-none h-6"
+                  className="w-16 px-1 py-0 text-right font-mono text-[10px] font-bold text-amber-950 bg-white border border-amber-300 rounded focus:ring-1 focus:ring-amber-500 focus:outline-none h-5"
                 />
               </div>
             </td>
@@ -5632,11 +5632,11 @@ function renderSpreadsheetRows(
           {/* COLUMN Z: BALANCE QNT (= K - Y) */}
           {visibleCols['Z'] && (
             <td
-              className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 bg-emerald-50/40 whitespace-nowrap text-right text-[11px] ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              className={`px-1.5 py-0.5 border-r border-slate-300 bg-emerald-50/40 whitespace-nowrap text-right text-[10px] leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
             >
-              <div className="flex items-center justify-end gap-1.5">
+              <div className="flex items-center justify-end gap-1">
                 <span
-                  className={`font-mono font-bold text-[11px] tabular-nums ${
+                  className={`font-mono font-bold text-[10px] tabular-nums ${
                     (item.balanceQty || 0) <= 0
                       ? 'text-emerald-700'
                       : (item.dispatchQty || 0) > 0
@@ -5647,16 +5647,16 @@ function renderSpreadsheetRows(
                   {item.balanceQty?.toLocaleString()}
                 </span>
                 {(item.balanceQty || 0) <= 0 ? (
-                  <span className="text-[9px] px-1 py-0.1 rounded bg-emerald-100 text-emerald-800 font-bold">
+                  <span className="text-[9px] px-1 py-0 rounded bg-emerald-100 text-emerald-800 font-bold">
                     Done
                   </span>
                 ) : (item.dispatchQty || 0) > 0 ? (
-                  <span className="text-[9px] px-1 py-0.1 rounded bg-amber-100 text-amber-800 font-bold">
+                  <span className="text-[9px] px-1 py-0 rounded bg-amber-100 text-amber-800 font-bold">
                     Partial
                   </span>
                 ) : (
-                  <span className="text-[9px] px-1 py-0.1 rounded bg-slate-100 text-slate-600 font-medium">
-                    Pending
+                  <span className="text-[9px] px-1 py-0 rounded bg-slate-100 text-slate-600 font-medium">
+                    Pend
                   </span>
                 )}
               </div>
@@ -5668,14 +5668,14 @@ function renderSpreadsheetRows(
             <>
               {/* Col AA: Status (Manual User Text Edit with Auto-Save) */}
               {visibleCols['AA'] && (
-                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 align-middle whitespace-nowrap ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1 py-0 border-r border-slate-300 align-middle whitespace-nowrap leading-tight ${cellBottomBorder}`}>
                   <input
                     type="text"
                     placeholder="Status..."
                     size={autoFitColumns ? Math.max((handlers.colAAStatuses[currentOrderKey] ?? order.colAA ?? '').length + 2, 12) : undefined}
                     value={handlers.colAAStatuses[currentOrderKey] ?? order.colAA ?? ''}
                     onChange={(e) => handlers.onUpdateColAA(currentOrderKey, e.target.value)}
-                    className={`${autoFitColumns ? 'w-auto min-w-[95px]' : 'w-28'} px-1.5 py-0.5 border border-teal-300 rounded text-[11px] font-semibold text-slate-800 bg-teal-50/20 focus:bg-white focus:outline-none focus:ring-1 focus:ring-teal-500 h-6 shadow-2xs`}
+                    className={`${autoFitColumns ? 'w-auto min-w-[90px]' : 'w-24'} px-1 py-0 border border-teal-300 rounded text-[10px] font-semibold text-slate-800 bg-teal-50/20 focus:bg-white focus:outline-none focus:ring-1 focus:ring-teal-500 h-5 shadow-2xs`}
                     title="Col AA: Editable Status (Auto-saved)"
                   />
                 </td>
@@ -5683,31 +5683,31 @@ function renderSpreadsheetRows(
 
               {/* Col AB: Remark (Manual User Text Edit with Auto-Save) */}
               {visibleCols['AB'] && (
-                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 align-middle whitespace-nowrap ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1 py-0 border-r border-slate-300 align-middle whitespace-nowrap leading-tight ${cellBottomBorder}`}>
                   <input
                     type="text"
                     placeholder="Remark..."
                     size={autoFitColumns ? Math.max((handlers.colABRemarks[currentOrderKey] ?? order.colAB ?? '').length + 2, 12) : undefined}
                     value={handlers.colABRemarks[currentOrderKey] ?? order.colAB ?? ''}
                     onChange={(e) => handlers.onUpdateColAB(currentOrderKey, e.target.value)}
-                    className={`${autoFitColumns ? 'w-auto min-w-[100px]' : 'w-32'} px-1.5 py-0.5 border border-slate-300 rounded text-[11px] text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-emerald-500 h-6 shadow-2xs`}
+                    className={`${autoFitColumns ? 'w-auto min-w-[95px]' : 'w-28'} px-1 py-0 border border-slate-300 rounded text-[10px] text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-emerald-500 h-5 shadow-2xs`}
                     title="Col AB: Editable Logistics Remark (Auto-saved)"
                   />
                 </td>
               )}
               {visibleCols['AC'] && (
-                <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-700 align-middle text-[11px] ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-700 align-middle text-[10px] leading-tight ${cellBottomBorder}`}>
                   {order.colAC || 'Sent'}
                 </td>
               )}
               {visibleCols['AD'] && (
-                <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-emerald-700 font-medium align-middle text-[11px] ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 text-emerald-700 font-medium align-middle text-[10px] leading-tight ${cellBottomBorder}`}>
                   {order.colAD || 'Delivered'}
                 </td>
               )}
               {/* Col AE: Instant Confirmation Msg */}
               {visibleCols['AE'] && (
-                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 text-center align-middle bg-blue-50/20 whitespace-nowrap ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1 py-0 border-r border-slate-300 text-center align-middle bg-blue-50/20 whitespace-nowrap leading-tight ${cellBottomBorder}`}>
                   <select
                     value={handlers.aeStatuses[currentOrderKey] ?? order.colAE ?? 'Pending'}
                     onChange={(e) => {
@@ -5716,7 +5716,7 @@ function renderSpreadsheetRows(
                       handlers.setSyncFeedback(`Col AE Confirmation set to "${val}". ${val === 'Message Sent' ? 'Instant WhatsApp link active in Col AF!' : 'Pending status.'}`);
                       setTimeout(() => handlers.setSyncFeedback(null), 3500);
                     }}
-                    className="text-[10px] bg-white border border-blue-300 rounded px-1.5 py-0.5 font-medium text-slate-800 focus:ring-1 focus:ring-blue-500 focus:outline-none h-6"
+                    className="text-[10px] bg-white border border-blue-300 rounded px-1 py-0 font-medium text-slate-800 focus:ring-1 focus:ring-blue-500 focus:outline-none h-5"
                   >
                     <option value="Pending">Pending</option>
                     <option value="Message Sent">Message Sent</option>
@@ -5726,16 +5726,15 @@ function renderSpreadsheetRows(
 
               {/* Col AF: Whatspp Link (Instant Confirmation AE ➔ AF) */}
               {visibleCols['AF'] && (
-                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 text-center align-middle bg-emerald-50/20 whitespace-nowrap ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1 py-0 border-r border-slate-300 text-center align-middle bg-emerald-50/20 whitespace-nowrap leading-tight ${cellBottomBorder}`}>
                   {(handlers.aeStatuses[currentOrderKey] ?? order.colAE ?? 'Pending') === 'Message Sent' ? (
                     <button
                       onClick={() => handlers.onOpenConfirmWhatsAppModal(order)}
-                      className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-600 text-white hover:bg-emerald-700 transition-colors shadow-2xs"
+                      className="inline-flex items-center gap-0.5 px-1.5 py-0 h-5 text-[10px] font-bold rounded bg-emerald-600 text-white hover:bg-emerald-700 transition-colors shadow-2xs"
                       title="Send Instant Order Confirmation WhatsApp (AE ➔ AF)"
                     >
-                      <MessageSquare className="w-3 h-3" />
+                      <MessageSquare className="w-2.5 h-2.5" />
                       <span>Send WA</span>
-                      <ExternalLink className="w-2.5 h-2.5 ml-0.5" />
                     </button>
                   ) : (
                     <span className="text-slate-400 font-mono text-[10px] italic">—</span>
@@ -5745,13 +5744,13 @@ function renderSpreadsheetRows(
 
               {/* Col AG: Follow-up 1 (Checkbox - when clicked, timestamp comes in Col AH) */}
               {visibleCols['AG'] && (
-                <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-center align-middle ${cellBottomBorder} bg-emerald-50/30`}>
-                  <label className="inline-flex items-center justify-center cursor-pointer p-0.5" title="Check to record Follow-up 1 timestamp in Col AH">
+                <td rowSpan={rowSpan} className={`px-1.5 py-0 border-r border-slate-300 text-center align-middle leading-tight ${cellBottomBorder} bg-emerald-50/30`}>
+                  <label className="inline-flex items-center justify-center cursor-pointer p-0" title="Check to record Follow-up 1 timestamp in Col AH">
                     <input
                       type="checkbox"
                       checked={Boolean(handlers.colAGChecks[currentOrderKey] ?? order.colAG)}
                       onChange={(e) => handlers.onToggleColAG(currentOrderKey, e.target.checked)}
-                      className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer shadow-2xs"
+                      className="w-3.5 h-3.5 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer shadow-2xs"
                     />
                   </label>
                 </td>
@@ -5759,10 +5758,10 @@ function renderSpreadsheetRows(
 
               {/* Col AH: Timestamp (Auto-generated from Col AG Checkbox) */}
               {visibleCols['AH'] && (
-                <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 align-middle text-[10px] font-mono ${cellBottomBorder} whitespace-nowrap bg-emerald-50/10`}>
+                <td rowSpan={rowSpan} className={`px-1.5 py-0 border-r border-slate-300 align-middle text-[10px] font-mono leading-tight ${cellBottomBorder} whitespace-nowrap bg-emerald-50/10`}>
                   {(handlers.colAHTimestamps[currentOrderKey] ?? order.colAH) ? (
-                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold">
-                      <Clock className="w-3 h-3 text-emerald-600 shrink-0" />
+                    <span className="inline-flex items-center gap-0.5 px-1 py-0 rounded bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-[9px]">
+                      <Clock className="w-2.5 h-2.5 text-emerald-600 shrink-0" />
                       <span>{handlers.colAHTimestamps[currentOrderKey] ?? order.colAH}</span>
                     </span>
                   ) : (
@@ -5773,14 +5772,14 @@ function renderSpreadsheetRows(
 
               {/* Col AI: Follow-up 1 Remark (Manual User Text Edit with Auto-Save) */}
               {visibleCols['AI'] && (
-                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 align-middle whitespace-nowrap ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1 py-0 border-r border-slate-300 align-middle whitespace-nowrap leading-tight ${cellBottomBorder}`}>
                   <input
                     type="text"
                     placeholder="Follow-up 1 remark..."
                     size={autoFitColumns ? Math.max((handlers.colAIRemarks[currentOrderKey] ?? order.colAI ?? '').length + 2, 16) : undefined}
                     value={handlers.colAIRemarks[currentOrderKey] ?? order.colAI ?? ''}
                     onChange={(e) => handlers.onUpdateColAI(currentOrderKey, e.target.value)}
-                    className={`${autoFitColumns ? 'w-auto min-w-[120px]' : 'w-36'} px-1.5 py-0.5 border border-slate-300 rounded text-[11px] text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-emerald-500 h-6 shadow-2xs`}
+                    className={`${autoFitColumns ? 'w-auto min-w-[110px]' : 'w-32'} px-1 py-0 border border-slate-300 rounded text-[10px] text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-emerald-500 h-5 shadow-2xs`}
                     title="Col AI: Editable Follow-up 1 Remark (Auto-saved)"
                   />
                 </td>
@@ -5788,13 +5787,13 @@ function renderSpreadsheetRows(
 
               {/* Col AJ: Follow-up 2 (Checkbox - when clicked, timestamp comes in Col AK) */}
               {visibleCols['AJ'] && (
-                <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-center align-middle ${cellBottomBorder} bg-sky-50/30`}>
-                  <label className="inline-flex items-center justify-center cursor-pointer p-0.5" title="Check to record Follow-up 2 timestamp in Col AK">
+                <td rowSpan={rowSpan} className={`px-1.5 py-0 border-r border-slate-300 text-center align-middle leading-tight ${cellBottomBorder} bg-sky-50/30`}>
+                  <label className="inline-flex items-center justify-center cursor-pointer p-0" title="Check to record Follow-up 2 timestamp in Col AK">
                     <input
                       type="checkbox"
                       checked={Boolean(handlers.colAJChecks[currentOrderKey] ?? order.colAJ)}
                       onChange={(e) => handlers.onToggleColAJ(currentOrderKey, e.target.checked)}
-                      className="w-4 h-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500 cursor-pointer shadow-2xs"
+                      className="w-3.5 h-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500 cursor-pointer shadow-2xs"
                     />
                   </label>
                 </td>
@@ -5802,10 +5801,10 @@ function renderSpreadsheetRows(
 
               {/* Col AK: Timestamp (Auto-generated from Col AJ Checkbox) */}
               {visibleCols['AK'] && (
-                <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 align-middle text-[10px] font-mono ${cellBottomBorder} whitespace-nowrap bg-sky-50/10`}>
+                <td rowSpan={rowSpan} className={`px-1.5 py-0 border-r border-slate-300 align-middle text-[10px] font-mono leading-tight ${cellBottomBorder} whitespace-nowrap bg-sky-50/10`}>
                   {(handlers.colAKTimestamps[currentOrderKey] ?? order.colAK) ? (
-                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-sky-100 text-sky-900 border border-sky-300 font-bold">
-                      <Clock className="w-3 h-3 text-sky-600 shrink-0" />
+                    <span className="inline-flex items-center gap-0.5 px-1 py-0 rounded bg-sky-100 text-sky-900 border border-sky-300 font-bold text-[9px]">
+                      <Clock className="w-2.5 h-2.5 text-sky-600 shrink-0" />
                       <span>{handlers.colAKTimestamps[currentOrderKey] ?? order.colAK}</span>
                     </span>
                   ) : (
@@ -5816,21 +5815,21 @@ function renderSpreadsheetRows(
 
               {/* Col AL: Follow-up 2 Remark (Manual User Text Edit with Auto-Save) */}
               {visibleCols['AL'] && (
-                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 align-middle whitespace-nowrap ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1 py-0 border-r border-slate-300 align-middle whitespace-nowrap leading-tight ${cellBottomBorder}`}>
                   <input
                     type="text"
                     placeholder="Follow-up 2 remark..."
                     size={autoFitColumns ? Math.max((handlers.colALRemarks[currentOrderKey] ?? order.colAL ?? '').length + 2, 16) : undefined}
                     value={handlers.colALRemarks[currentOrderKey] ?? order.colAL ?? ''}
                     onChange={(e) => handlers.onUpdateColAL(currentOrderKey, e.target.value)}
-                    className={`${autoFitColumns ? 'w-auto min-w-[120px]' : 'w-36'} px-1.5 py-0.5 border border-slate-300 rounded text-[11px] text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-sky-500 h-6 shadow-2xs`}
+                    className={`${autoFitColumns ? 'w-auto min-w-[110px]' : 'w-32'} px-1 py-0 border border-slate-300 rounded text-[10px] text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-sky-500 h-5 shadow-2xs`}
                     title="Col AL: Editable Follow-up 2 Remark (Auto-saved)"
                   />
                 </td>
               )}
               {/* Col AM: LR- Number */}
               {visibleCols['AM'] && (
-                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 font-mono text-slate-800 align-middle whitespace-nowrap ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1 py-0 border-r border-slate-300 font-mono text-slate-800 align-middle whitespace-nowrap leading-tight ${cellBottomBorder}`}>
                   <input
                     type="text"
                     placeholder="e.g. MEHTA-0041"
@@ -5840,7 +5839,7 @@ function renderSpreadsheetRows(
                       const val = e.target.value;
                       handlers.setLrNumbers(prev => ({ ...prev, [currentOrderKey]: val }));
                     }}
-                    className={`${autoFitColumns ? 'w-auto min-w-[95px]' : 'w-24'} px-1.5 py-0.5 border border-slate-300 rounded font-mono text-[11px] h-6`}
+                    className={`${autoFitColumns ? 'w-auto min-w-[90px]' : 'w-20'} px-1 py-0 border border-slate-300 rounded font-mono text-[10px] h-5`}
                   />
                 </td>
               )}
@@ -5850,7 +5849,7 @@ function renderSpreadsheetRows(
           {/* COLUMN AN: OPEN / CLOSE (INDIVIDUAL PRODUCT ITEM ROW - NEVER MERGED, LIKE F-N AND Y-Z) */}
           {visibleCols['AN'] && (
             <td
-              className={`px-1.5 py-0.5 border-r border-slate-300 text-center align-middle bg-sky-50/20 whitespace-nowrap ${
+              className={`px-1 py-0 border-r border-slate-300 text-center align-middle bg-sky-50/20 whitespace-nowrap leading-tight ${
                 useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''
               }`}
             >
@@ -5858,7 +5857,7 @@ function renderSpreadsheetRows(
                 <select
                   value={item.statusAN || 'Open'}
                   onChange={(e) => handlers.onItemStatusChange(item.id, e.target.value as any)}
-                  className={`text-[11px] font-bold rounded px-1.5 py-0.5 border transition-all cursor-pointer focus:outline-none focus:ring-1 h-6 shadow-2xs ${
+                  className={`text-[10px] font-bold rounded px-1 py-0 border transition-all cursor-pointer focus:outline-none focus:ring-1 h-5 shadow-2xs ${
                     (item.statusAN || 'Open') === 'Closed'
                       ? 'bg-emerald-100 text-emerald-900 border-emerald-400 focus:ring-emerald-500'
                       : (item.statusAN || 'Open') === 'In-Progress'
@@ -5881,7 +5880,7 @@ function renderSpreadsheetRows(
               {visibleCols['AO'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-1.5 py-0.5 border-r border-slate-300 text-center align-middle bg-purple-50/20 whitespace-nowrap ${cellBottomBorder}`}
+                  className={`px-1 py-0 border-r border-slate-300 text-center align-middle bg-purple-50/20 whitespace-nowrap leading-tight ${cellBottomBorder}`}
                 >
                   <select
                     value={handlers.aoStatuses[currentOrderKey] ?? order.colAO ?? 'Pending'}
@@ -5891,7 +5890,7 @@ function renderSpreadsheetRows(
                       handlers.setSyncFeedback(`Col AO set to "${val}". ${val === 'Message Sent' ? 'WhatsApp button activated in Col AP!' : 'Pending status.'}`);
                       setTimeout(() => handlers.setSyncFeedback(null), 3500);
                     }}
-                    className="text-[10px] bg-white border border-purple-300 rounded px-1.5 py-0.5 font-medium text-slate-800 focus:ring-1 focus:ring-purple-500 focus:outline-none h-6"
+                    className="text-[10px] bg-white border border-purple-300 rounded px-1 py-0 font-medium text-slate-800 focus:ring-1 focus:ring-purple-500 focus:outline-none h-5"
                   >
                     <option value="Pending">Pending</option>
                     <option value="Message Sent">Message Sent</option>
@@ -5903,17 +5902,16 @@ function renderSpreadsheetRows(
               {visibleCols['AP'] && (
                 <td
                   rowSpan={rowSpan}
-                  className={`px-1.5 py-0.5 border-r border-slate-300 text-center align-middle bg-emerald-50/20 whitespace-nowrap ${cellBottomBorder}`}
+                  className={`px-1 py-0 border-r border-slate-300 text-center align-middle bg-emerald-50/20 whitespace-nowrap leading-tight ${cellBottomBorder}`}
                 >
                   {(handlers.aoStatuses[currentOrderKey] || 'Pending') === 'Message Sent' ? (
                     <button
                       onClick={() => handlers.onOpenWhatsAppModal(order)}
-                      className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-600 text-white hover:bg-emerald-700 transition-colors shadow-2xs"
+                      className="inline-flex items-center gap-0.5 px-1.5 py-0 h-5 text-[10px] font-bold rounded bg-emerald-600 text-white hover:bg-emerald-700 transition-colors shadow-2xs"
                       title="Send WhatsApp Dispatch Notice"
                     >
-                      <MessageSquare className="w-3 h-3" />
+                      <MessageSquare className="w-2.5 h-2.5" />
                       <span>Send WA</span>
-                      <ExternalLink className="w-2.5 h-2.5 ml-0.5" />
                     </button>
                   ) : (
                     <span className="text-slate-400 font-mono text-[10px] italic">—</span>
@@ -5923,17 +5921,17 @@ function renderSpreadsheetRows(
 
               {/* COLUMNS AQ TO AS IF VISIBLE */}
               {visibleCols['AQ'] && (
-                <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-slate-600 align-middle text-[10px] ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 text-slate-600 align-middle text-[10px] leading-tight ${cellBottomBorder}`}>
                   {order.customerEmail || '—'}
                 </td>
               )}
               {visibleCols['AR'] && (
-                <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-blue-600 align-middle text-center text-[10px] ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 text-blue-600 align-middle text-center text-[10px] leading-tight ${cellBottomBorder}`}>
                   <span className="underline cursor-pointer">Email</span>
                 </td>
               )}
               {visibleCols['AS'] && (
-                <td rowSpan={rowSpan} className={`px-2 py-0.5 sm:py-1 border-r border-slate-300 text-emerald-700 align-middle text-center text-[10px] ${cellBottomBorder}`}>
+                <td rowSpan={rowSpan} className={`px-1.5 py-0.5 border-r border-slate-300 text-emerald-700 align-middle text-center text-[10px] leading-tight ${cellBottomBorder}`}>
                   Sent
                 </td>
               )}

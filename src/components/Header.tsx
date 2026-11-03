@@ -472,87 +472,8 @@ export const Header: React.FC<HeaderProps> = ({
               </div>
             </div>
 
-            {/* Zone 3: Google Sheets-Style Active Alphabet IDs & User Profile */}
+            {/* Zone 3: User Profile */}
             <div className="flex items-center gap-3 shrink-0">
-              {/* GOOGLE SHEETS STYLE COLLABORATOR ALPHABET CIRCLES (M, T, D, L, V) */}
-              <div className="flex items-center gap-1.5 bg-slate-50 px-2.5 py-1 rounded-full border border-slate-200/90 shadow-2xs">
-                <span className="hidden lg:inline-flex items-center gap-1 text-[10px] font-bold text-emerald-700 mr-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping" />
-                  <span>Active IDs:</span>
-                </span>
-
-                <div className="flex items-center -space-x-1.5">
-                  {connectedUsers.map((u, idx) => {
-                    const initial = getProperInitial(u.name.replace(' (You)', ''), u.email);
-                    const isYou = u.id === 'usr_active_you' || u.email.toLowerCase() === currentUser.email.toLowerCase();
-
-                    return (
-                      <div
-                        key={u.id}
-                        className="relative"
-                        onMouseEnter={() => setHoveredAvatarId(u.id)}
-                        onMouseLeave={() => setHoveredAvatarId(null)}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => setShowConnectedUsersModal(true)}
-                          className={`w-7 h-7 rounded-full ${u.avatarColor} text-white font-extrabold text-xs flex items-center justify-center transition-transform hover:scale-110 hover:z-30 cursor-pointer shadow-xs ${
-                            isYou
-                              ? 'ring-2 ring-emerald-400 ring-offset-1 z-20'
-                              : 'ring-2 ring-white'
-                          }`}
-                          style={{ zIndex: isYou ? 25 : 20 - idx }}
-                          title={`${initial} — ${u.name} (${u.email})`}
-                        >
-                          {initial}
-                          <span
-                            className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-white ${
-                              isYou ? 'bg-emerald-400' : u.status === 'editing' ? 'bg-amber-400' : 'bg-emerald-500'
-                            }`}
-                          />
-                        </button>
-
-                        {/* Google Sheets Hover Card */}
-                        {hoveredAvatarId === u.id && (
-                          <div className="absolute right-0 top-full mt-2 w-60 bg-slate-900 text-white rounded-xl p-2.5 shadow-xl border border-slate-700 z-50 text-xs pointer-events-none animate-in fade-in duration-100">
-                            <div className="flex items-center gap-2.5">
-                              <div className={`w-8 h-8 rounded-full ${u.avatarColor} text-white font-extrabold text-sm flex items-center justify-center shrink-0 ring-2 ring-white/40`}>
-                                {initial}
-                              </div>
-                              <div className="min-w-0 flex-1">
-                                <div className="font-bold text-white truncate flex items-center gap-1">
-                                  <span>{u.name}</span>
-                                  {isYou && (
-                                    <span className="text-[9px] px-1 py-0.1 rounded bg-emerald-500/30 text-emerald-300 border border-emerald-400/40">
-                                      ACTIVE
-                                    </span>
-                                  )}
-                                </div>
-                                <div className="text-[10px] text-slate-300 font-mono truncate">{u.email}</div>
-                              </div>
-                            </div>
-                            <div className="mt-2 pt-1.5 border-t border-slate-800 flex items-center justify-between text-[10px] text-slate-300">
-                              <span>{u.branch}</span>
-                              <span className="text-emerald-400 font-mono">{u.activeCell}</span>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-
-                {/* Add / View All Connected IDs Button */}
-                <button
-                  type="button"
-                  onClick={() => setShowConnectedUsersModal(true)}
-                  className="ml-1 px-1.5 py-0.5 rounded-full bg-white hover:bg-emerald-50 text-slate-700 hover:text-emerald-800 border border-slate-200 text-[10px] font-bold transition-colors cursor-pointer"
-                  title="View all active Google Sheet IDs or add team member"
-                >
-                  +{connectedUsers.length}
-                </button>
-              </div>
-
               {/* CURRENT LOGGED-IN USER PILL (Shows Active Alphabet + Name + Switch Login Button) */}
               <div className="relative">
                 <button
@@ -648,16 +569,6 @@ export const Header: React.FC<HeaderProps> = ({
                     </div>
 
                     <div className="pt-1 border-t border-slate-100 space-y-1">
-                      <button
-                        onClick={() => {
-                          setShowProfileMenu(false);
-                          setShowConnectedUsersModal(true);
-                        }}
-                        className="w-full text-left px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-50 rounded-lg font-medium flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <Users className="w-3.5 h-3.5 text-emerald-600" />
-                        <span>View All Connected IDs ({connectedUsers.length})</span>
-                      </button>
 
                       <button
                         onClick={() => {

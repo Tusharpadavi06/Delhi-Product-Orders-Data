@@ -548,7 +548,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
             {/* Column Names Strip */}
             <tr className="border-t border-slate-700">
               <th
-                className={`w-10 px-2 py-1.5 text-center bg-slate-900 text-slate-100 border-r border-slate-800 font-bold ${
+                className={`w-10 px-1.5 py-0.5 text-center bg-slate-900 text-slate-100 border-r border-slate-800 font-bold ${
                   freezeColumns >= 1 ? 'sticky left-0 z-40' : ''
                 }`}
               >
@@ -573,7 +573,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                   <th
                     key={col.id}
                     style={autoFitColumns ? undefined : { minWidth: col.minWidth || '110px' }}
-                    className={`px-2.5 py-1.5 whitespace-nowrap ${bgHead} ${stickyHead}`}
+                    className={`px-2 py-0.5 whitespace-nowrap leading-tight ${bgHead} ${stickyHead}`}
                   >
                     <div className="flex items-center justify-between gap-1">
                       <span className="font-semibold">{col.label}</span>
@@ -647,17 +647,19 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                     ? row.orderNoTimestamp.trim()
                     : '—';
 
+                const isClosedInAutomation = row.statusAN === 'Closed' || row.sheetSource === 'closed';
+
                 return (
                   <tr
                     key={row.orderId}
                     ref={(el) => {
                       rowRefs.current[row.orderId] = el;
                     }}
-                    className={`border-b border-slate-200 transition-colors hover:bg-sky-50/40 ${rowBg}`}
+                    className={`border-b border-slate-200 transition-colors hover:bg-sky-50/40 leading-tight ${rowBg}`}
                   >
                     {/* # Index Column */}
                     <td
-                      className={`w-10 px-2 py-1 text-center font-mono font-bold text-slate-400 bg-slate-50/95 border-r border-slate-200 text-[11px] ${
+                      className={`w-10 px-1.5 py-0.5 text-center font-mono font-bold text-slate-400 bg-slate-50/95 border-r border-slate-200 text-[10px] leading-tight ${
                         freezeColumns >= 1 ? 'sticky left-0 z-20' : ''
                       }`}
                     >
@@ -667,7 +669,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                     {/* Col 1 (A): Order No (Reference / GNZ - Never shows date/time format) */}
                     {visiblePoCols['referenceNo'] !== false && (
                       <td
-                        className={`px-2 py-1 border-r border-slate-200 font-mono font-bold text-blue-900 whitespace-nowrap text-[11px] ${
+                        className={`px-1.5 py-0.5 border-r border-slate-200 font-mono font-bold text-blue-900 whitespace-nowrap text-[11px] leading-tight ${
                           freezeColumns >= 2 ? 'sticky left-[40px] z-20 bg-white shadow-[2px_0_4px_-1px_rgba(0,0,0,0.12)]' : ''
                         }`}
                       >
@@ -676,10 +678,10 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                             <span>{cleanRefNo}</span>
                             <button
                               onClick={() => handleCopyText(cleanRefNo, row.orderId)}
-                              className="opacity-0 group-hover:opacity-100 hover:opacity-100 text-slate-400 hover:text-slate-700 p-0.5 cursor-pointer"
+                              className="opacity-0 group-hover:opacity-100 hover:opacity-100 text-slate-400 hover:text-slate-700 p-0 cursor-pointer"
                               title="Copy Reference"
                             >
-                              {copiedId === row.orderId ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                              {copiedId === row.orderId ? <Check className="w-2.5 h-2.5 text-emerald-600" /> : <Copy className="w-2.5 h-2.5" />}
                             </button>
                           </div>
                         ) : (
@@ -690,7 +692,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
 
                     {/* Col 2 (B): Timestamp */}
                     {visiblePoCols['timestamp'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 text-slate-600 font-mono whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 text-slate-600 font-mono whitespace-nowrap text-[10px] leading-tight">
                         {row.timestamp}
                       </td>
                     )}
@@ -698,7 +700,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                     {/* Col 3 (C): Customer PO */}
                     {visiblePoCols['customerPO'] !== false && (
                       <td
-                        className={`px-2 py-1 border-r border-slate-200 font-semibold text-slate-800 whitespace-nowrap text-[11px] ${
+                        className={`px-1.5 py-0.5 border-r border-slate-200 font-semibold text-slate-800 whitespace-nowrap text-[11px] leading-tight ${
                           freezeColumns >= 3 ? 'sticky left-[150px] z-20 bg-white shadow-[2px_0_4px_-1px_rgba(0,0,0,0.12)]' : ''
                         }`}
                       >
@@ -710,29 +712,29 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
 
                     {/* Col 4 (D): Customer Name */}
                     {visiblePoCols['customerName'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 font-medium text-slate-900 whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 font-medium text-slate-900 whitespace-nowrap text-[11px] leading-tight">
                         {row.customerName}
                       </td>
                     )}
 
                     {/* Col 5 (E): Customer Email */}
                     {visiblePoCols['customerEmail'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] whitespace-nowrap">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 text-slate-600 text-[10px] whitespace-nowrap leading-tight">
                         {row.customerEmail || '—'}
                       </td>
                     )}
 
                     {/* Col 6 (F): Order Date */}
                     {visiblePoCols['orderDate'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[10px] leading-tight">
                         {row.orderDate}
                       </td>
                     )}
 
                     {/* Col 7 (G): Unit (Category) */}
                     {visiblePoCols['unit'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 font-medium text-purple-900 whitespace-nowrap text-[11px]">
-                        <span className="px-1.5 py-0.5 rounded bg-purple-50 text-purple-800 border border-purple-200 text-[10px] font-semibold">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 font-medium text-purple-900 whitespace-nowrap text-[10px] leading-tight">
+                        <span className="px-1 py-0 rounded bg-purple-50 text-purple-800 border border-purple-200 text-[9px] font-semibold">
                           {row.unit}
                         </span>
                       </td>
@@ -740,56 +742,56 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
 
                     {/* Col 8 (H): Item Name */}
                     {visiblePoCols['itemName'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 font-semibold text-slate-900 whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 font-semibold text-slate-900 whitespace-nowrap text-[11px] leading-tight">
                         {row.itemName}
                       </td>
                     )}
 
                     {/* Col 9 (I): Color */}
                     {visiblePoCols['color'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px] leading-tight">
                         {row.color}
                       </td>
                     )}
 
                     {/* Col 10 (J): Width */}
                     {visiblePoCols['width'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px] leading-tight">
                         {row.width}
                       </td>
                     )}
 
                     {/* Col 11 (K): Unit (of item) */}
                     {visiblePoCols['unitOfItem'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-600 text-center text-[10px] whitespace-nowrap">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 font-mono text-slate-600 text-center text-[10px] whitespace-nowrap leading-tight">
                         {row.unitOfItem}
                       </td>
                     )}
 
                     {/* Col 12 (L): Qty */}
                     {visiblePoCols['qty'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 font-mono font-bold text-slate-900 text-right text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 font-mono font-bold text-slate-900 text-right text-[11px] leading-tight">
                         {Number(row.qty).toLocaleString()}
                       </td>
                     )}
 
                     {/* Col 13 (M): Rate */}
                     {visiblePoCols['rate'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-700 text-right text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 font-mono text-slate-700 text-right text-[11px] leading-tight">
                         ₹{row.rate}
                       </td>
                     )}
 
                     {/* Col 14 (N): Discount */}
                     {visiblePoCols['discount'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-600 text-center text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 font-mono text-slate-600 text-center text-[11px] leading-tight">
                         {row.discount}%
                       </td>
                     )}
 
                     {/* Col 15 (O): Delivery Date */}
                     {visiblePoCols['deliveryDate'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[10px] leading-tight">
                         {row.deliveryDate}
                       </td>
                     )}
@@ -797,7 +799,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                     {/* Col 16 (P): Remark */}
                     {visiblePoCols['remark'] !== false && (
                       <td
-                        className={`px-2 py-1 border-r border-slate-200 text-slate-600 text-[11px] ${
+                        className={`px-1.5 py-0.5 border-r border-slate-200 text-slate-600 text-[10px] leading-tight ${
                           autoFitColumns ? 'whitespace-nowrap' : 'max-w-[200px] truncate'
                         }`}
                         title={row.remark}
@@ -808,7 +810,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
 
                     {/* Col 17 (Q): Customer Number */}
                     {visiblePoCols['customerNumber'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 font-mono text-slate-700 whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 font-mono text-slate-700 whitespace-nowrap text-[10px] leading-tight">
                         {row.customerNumber || '—'}
                       </td>
                     )}
@@ -816,7 +818,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                     {/* Col 18 (R): Billing Address */}
                     {visiblePoCols['billingAddress'] !== false && (
                       <td
-                        className={`px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] ${
+                        className={`px-1.5 py-0.5 border-r border-slate-200 text-slate-600 text-[10px] leading-tight ${
                           autoFitColumns ? 'whitespace-nowrap' : 'max-w-[220px] truncate'
                         }`}
                         title={row.billingAddress}
@@ -828,7 +830,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                     {/* Col 19 (S): Delivery Address */}
                     {visiblePoCols['deliveryAddress'] !== false && (
                       <td
-                        className={`px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] ${
+                        className={`px-1.5 py-0.5 border-r border-slate-200 text-slate-600 text-[10px] leading-tight ${
                           autoFitColumns ? 'whitespace-nowrap' : 'max-w-[220px] truncate'
                         }`}
                         title={row.deliveryAddress}
@@ -839,37 +841,37 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
 
                     {/* Col 20 (T): Transporter Name */}
                     {visiblePoCols['transporterName'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 text-slate-800 whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 text-slate-800 whitespace-nowrap text-[10px] leading-tight">
                         {row.transporterName || '—'}
                       </td>
                     )}
 
                     {/* Col 21 (U): Sales Person Name */}
                     {visiblePoCols['salesPerson'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 text-slate-800 font-medium whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 text-slate-800 font-medium whitespace-nowrap text-[10px] leading-tight">
                         {row.salesPerson || '—'}
                       </td>
                     )}
 
                     {/* Col 22 (V): Account Status */}
                     {visiblePoCols['accountStatus'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 text-slate-700 whitespace-nowrap text-[10px] leading-tight">
                         {row.accountStatus || '—'}
                       </td>
                     )}
 
                     {/* Col 23 (W): Branch */}
                     {visiblePoCols['branch'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 font-medium text-slate-800 whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 font-medium text-slate-800 whitespace-nowrap text-[10px] leading-tight">
                         {cleanBranch}
                       </td>
                     )}
 
                     {/* Col 24 (X): Approval Status */}
                     {visiblePoCols['approvalStatus'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 whitespace-nowrap text-[11px] text-center">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 whitespace-nowrap text-[10px] text-center leading-tight">
                         {row.approvalStatus ? (
-                          <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-[10px]">
+                          <span className="px-1 py-0 rounded bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold text-[9px]">
                             {row.approvalStatus}
                           </span>
                         ) : (
@@ -880,29 +882,29 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
 
                     {/* Col 25 (Y): Branch Head Name (Default: Vinay Chhajer when blank) */}
                     {visiblePoCols['branchHeadName'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 text-slate-800 font-medium whitespace-nowrap text-[11px]">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 text-slate-800 font-medium whitespace-nowrap text-[10px] leading-tight">
                         {cleanBranchHeadName}
                       </td>
                     )}
 
                     {/* Col 26 (Z): Branch Head Email (Default: vinay.chhajer@ginzalimited.com when blank) */}
                     {visiblePoCols['branchHeadEmail'] !== false && (
-                      <td className="px-2 py-1 border-r border-slate-200 text-slate-600 text-[10px] whitespace-nowrap">
+                      <td className="px-1.5 py-0.5 border-r border-slate-200 text-slate-600 text-[10px] whitespace-nowrap leading-tight">
                         {cleanBranchHeadEmail}
                       </td>
                     )}
 
                     {/* Col 27 (AA): ORDER NO (O.N GENERATE) - 2-WAY SYNCED WITH GOOGLE SHEET COL AA */}
                     {visiblePoCols['orderNo'] !== false && (
-                      <td className="px-2.5 py-1 border-r border-slate-300 bg-emerald-50/30 whitespace-nowrap">
+                      <td className="px-1.5 py-0.5 border-r border-slate-300 bg-emerald-50/30 whitespace-nowrap leading-tight">
                         {hasOrderNo && !isEditingThisRow ? (
-                          <div className="flex items-center gap-1.5">
+                          <div className="flex items-center gap-1">
                             <span
                               onClick={() => {
                                 setInputOrderNos(prev => ({ ...prev, [row.orderId]: cleanOrderNo }));
                                 setEditingRowOrderId(row.orderId);
                               }}
-                              className="font-mono font-bold text-slate-900 px-2 py-0.5 rounded bg-white border border-slate-300 hover:border-emerald-500 shadow-2xs text-[11px] cursor-pointer flex items-center gap-1"
+                              className="font-mono font-bold text-slate-900 px-1.5 py-0 rounded bg-white border border-slate-300 hover:border-emerald-500 shadow-2xs text-[10px] cursor-pointer flex items-center gap-1"
                               title="Click to edit Order No (Syncs with Google Sheet Col AA & Order Automation)"
                             >
                               <span>{cleanOrderNo}</span>
@@ -910,16 +912,19 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                             </span>
                             <span
                               onClick={onNavigateToAutomation}
-                              className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-800 bg-emerald-100 border border-emerald-300 rounded px-1.5 py-0.5 cursor-pointer hover:bg-emerald-200"
+                              className={`inline-flex items-center gap-0.5 text-[9px] font-bold rounded px-1 py-0 cursor-pointer border ${
+                                isClosedInAutomation
+                                  ? 'text-indigo-800 bg-indigo-100 border-indigo-300 hover:bg-indigo-200'
+                                  : 'text-emerald-800 bg-emerald-100 border-emerald-300 hover:bg-emerald-200'
+                              }`}
                               title="Click to view in Order Automation"
                             >
-                              <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                              <span>Active (Open)</span>
-                              <ExternalLink className="w-2.5 h-2.5 ml-0.5" />
+                              <CheckCircle2 className={`w-2.5 h-2.5 ${isClosedInAutomation ? 'text-indigo-600' : 'text-emerald-600'}`} />
+                              <span>{isClosedInAutomation ? 'Closed' : 'Active'}</span>
                             </span>
                           </div>
                         ) : (
-                          <div className="flex items-center gap-1.5">
+                          <div className="flex items-center gap-1">
                             <input
                               ref={(el) => {
                                 orderInputRefs.current[row.orderId] = el;
@@ -936,9 +941,9 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                                   setEditingRowOrderId(null);
                                 }
                               }}
-                              className={`w-36 px-1.5 py-0.5 text-[11px] bg-white border rounded font-mono font-semibold focus:outline-none focus:ring-2 ${
+                              className={`w-32 px-1 py-0 h-5 text-[10px] bg-white border rounded font-mono font-semibold focus:outline-none focus:ring-1 ${
                                 isHighlighted
-                                  ? 'border-amber-600 ring-2 ring-amber-400 bg-amber-50'
+                                  ? 'border-amber-600 ring-1 ring-amber-400 bg-amber-50'
                                   : 'border-amber-300 focus:ring-amber-500'
                               }`}
                             />
@@ -947,11 +952,11 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                                 onGenerateOrderNo(row.orderId, inputOrderNos[row.orderId]);
                                 setEditingRowOrderId(null);
                               }}
-                              className="px-2 py-0.5 bg-emerald-700 hover:bg-emerald-800 text-white font-bold rounded text-[11px] shadow-2xs flex items-center gap-1 transition-colors cursor-pointer"
+                              className="px-1.5 py-0 h-5 bg-emerald-700 hover:bg-emerald-800 text-white font-bold rounded text-[10px] shadow-2xs flex items-center gap-0.5 transition-colors cursor-pointer"
                               title="Save Order No (Col AA) & Timestamp (Col AB) to Sheet & Order Automation"
                             >
-                              <Sparkles className="w-3 h-3" />
-                              <span>{isEditingThisRow ? 'Save O.N' : 'Generate O.N'}</span>
+                              <Sparkles className="w-2.5 h-2.5" />
+                              <span>{isEditingThisRow ? 'Save' : 'Gen O.N'}</span>
                             </button>
                             {isEditingThisRow && (
                               <button
@@ -960,7 +965,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                                 className="p-0.5 text-slate-400 hover:text-slate-700 cursor-pointer"
                                 title="Cancel"
                               >
-                                <X className="w-3.5 h-3.5" />
+                                <X className="w-3 h-3" />
                               </button>
                             )}
                           </div>
@@ -970,7 +975,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
 
                     {/* Col 28 (AB): Timestamp ( O.N Generate ) - 1:1 from Google Sheet Col AB */}
                     {visiblePoCols['orderNoTimestamp'] !== false && (
-                      <td className="px-2 py-1 text-slate-700 font-mono whitespace-nowrap text-[10px] bg-emerald-50/10">
+                      <td className="px-1.5 py-0.5 text-slate-700 font-mono whitespace-nowrap text-[10px] bg-emerald-50/10 leading-tight">
                         {displayOrderNoTimestamp}
                       </td>
                     )}
@@ -982,45 +987,39 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
         </table>
       </div>
 
-      {/* Pagination Controls Strip for Zero-Lag Performance */}
-      <div className="px-3 py-1.5 bg-slate-100 border border-slate-300 rounded-lg flex flex-wrap items-center justify-between gap-2 text-xs select-none">
-        <div className="flex items-center gap-2 text-slate-600 font-medium">
-          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-blue-100 text-blue-900 border border-blue-200 font-bold">
-            <span>Total Orders (Product Order A:AB):</span>
+      {/* Compact Pagination Strip */}
+      <div className="px-2 py-0.5 bg-slate-100 border border-slate-300 rounded flex flex-wrap items-center justify-between gap-2 text-[10px] select-none">
+        <div className="flex items-center gap-1.5 text-slate-600 font-medium">
+          <span className="inline-flex items-center gap-1 px-1.5 py-0 rounded bg-blue-100 text-blue-900 border border-blue-200 font-bold">
+            <span>Total:</span>
             <strong className="font-mono">{orders.length.toLocaleString()}</strong>
           </span>
           <span>
-            Showing rows <strong className="text-slate-900 font-mono font-bold">{filteredRows.length === 0 ? 0 : (safeCurrentPage - 1) * (pageSize || filteredRows.length) + 1}</strong> to{' '}
-            <strong className="text-slate-900 font-mono font-bold">{Math.min(safeCurrentPage * (pageSize || filteredRows.length), filteredRows.length)}</strong> of{' '}
+            Rows <strong className="text-slate-900 font-mono font-bold">{filteredRows.length === 0 ? 0 : (safeCurrentPage - 1) * (pageSize || filteredRows.length) + 1}</strong>–<strong className="text-slate-900 font-mono font-bold">{Math.min(safeCurrentPage * (pageSize || filteredRows.length), filteredRows.length)}</strong> of{' '}
             <strong className="text-slate-900 font-mono font-bold">{filteredRows.length.toLocaleString()}</strong>
           </span>
-          {pageSize > 0 && totalPages > 1 && (
-            <span className="text-[11px] text-slate-500 font-medium bg-white px-2 py-0.5 rounded border border-slate-200">
-              Page {safeCurrentPage} of {totalPages}
-            </span>
-          )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5">
           {/* Page Size Selector */}
-          <div className="flex items-center gap-1 text-[11px] text-slate-500">
-            <span>Rows per page:</span>
+          <div className="flex items-center gap-1 text-[10px] text-slate-500">
+            <span>Rows:</span>
             <select
               value={pageSize}
               onChange={(e) => {
                 setPageSize(Number(e.target.value));
                 setCurrentPage(1);
               }}
-              className="px-1.5 py-0.5 bg-white border border-slate-300 rounded text-xs font-semibold text-slate-800 focus:outline-none cursor-pointer"
+              className="px-1 py-0 bg-white border border-slate-300 rounded text-[10px] font-semibold text-slate-800 focus:outline-none cursor-pointer h-5"
             >
-              <option value={20}>20 rows</option>
-              <option value={30}>30 rows</option>
-              <option value={50}>50 rows</option>
-              <option value={100}>100 rows</option>
-              <option value={250}>250 rows</option>
-              <option value={500}>500 rows</option>
-              <option value={1000}>1,000 rows</option>
-              <option value={0}>All rows ({filteredRows.length.toLocaleString()})</option>
+              <option value={20}>20</option>
+              <option value={30}>30</option>
+              <option value={50}>50</option>
+              <option value={100}>100</option>
+              <option value={250}>250</option>
+              <option value={500}>500</option>
+              <option value={1000}>1,000</option>
+              <option value={0}>All ({filteredRows.length.toLocaleString()})</option>
             </select>
           </div>
 
@@ -1031,19 +1030,22 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                 type="button"
                 disabled={safeCurrentPage <= 1}
                 onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
-                className="px-2 py-0.5 rounded border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-xs font-semibold text-slate-700 cursor-pointer"
+                className="px-1.5 py-0 h-5 rounded border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-semibold text-slate-700 cursor-pointer"
               >
-                <ChevronLeft className="w-3.5 h-3.5" />
+                <ChevronLeft className="w-3 h-3" />
                 <span>Prev</span>
               </button>
+              <span className="text-[10px] font-mono text-slate-600">
+                {safeCurrentPage}/{totalPages}
+              </span>
               <button
                 type="button"
                 disabled={safeCurrentPage >= totalPages}
                 onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
-                className="px-2 py-0.5 rounded border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-xs font-semibold text-slate-700 cursor-pointer"
+                className="px-1.5 py-0 h-5 rounded border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-semibold text-slate-700 cursor-pointer"
               >
                 <span>Next</span>
-                <ChevronRight className="w-3.5 h-3.5" />
+                <ChevronRight className="w-3 h-3" />
               </button>
             </div>
           )}
