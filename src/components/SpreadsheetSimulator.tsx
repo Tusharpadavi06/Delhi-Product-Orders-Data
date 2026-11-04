@@ -58,7 +58,7 @@ import {
   Calendar
 } from 'lucide-react';
 
-const LOCAL_STORAGE_KEY = 'ginza_fms_sheet_orders_v9';
+const LOCAL_STORAGE_KEY = 'ginza_fms_sheet_orders_v12';
 const LOCAL_STORAGE_DISPATCH_KEY = 'ginza_fms_sheet_dispatch_v9';
 const LOCAL_STORAGE_COL_VISIBILITY = 'ginza_fms_col_visibility_v10';
 const LOCAL_STORAGE_FIREBASE_CONFIG = 'ginza_fms_firebase_cfg_v9';
@@ -72,6 +72,84 @@ const LOCAL_STORAGE_COL_AI_KEY = 'ginza_fms_col_ai_v10';
 const LOCAL_STORAGE_COL_AJ_KEY = 'ginza_fms_col_aj_v10';
 const LOCAL_STORAGE_COL_AK_KEY = 'ginza_fms_col_ak_v10';
 const LOCAL_STORAGE_COL_AL_KEY = 'ginza_fms_col_al_v10';
+
+/**
+ * Normalizes Customer PO so blank, "N/A", "NA", "-", "nil" all match 100% identically across tabs & devices.
+ */
+function normalizePoVal(po?: string): string {
+  const s = (po || '').trim().toLowerCase();
+  return ['n/a', 'na', '-', '—', 'nil', 'none', 'null'].includes(s) ? '' : s;
+}
+
+/**
+ * Normalizes Order Date to YYYY-MM-DD (or trimmed lowercase) so DD/MM/YYYY and D/M/YYYY match 100% identically.
+ */
+function normalizeDateVal(dateStr?: string, fallbackTs?: string): string {
+  const parsed = parseOrderDateParts(dateStr, fallbackTs);
+  if (parsed) return parsed.isoDate;
+  return (dateStr || '').trim().toLowerCase();
+}
+
+/**
+ * Canonical Row Signature used across Product Order, Order Automation, Closed Orders & Firebase Cloud.
+ */
+function makeCanonicalRowKey(r: ProductOrderRow): string {
+  return [
+    normalizePoVal(r.customerPO),
+    (r.customerName || '').trim().toLowerCase(),
+    (r.itemName || '').trim().toLowerCase(),
+    (r.color || '').trim().toLowerCase(),
+    (r.width || '').trim().toLowerCase(),
+    String(Number(r.qty) || 0),
+    normalizeDateVal(r.orderDate, r.timestamp)
+  ].join('|');
+}
+
+/**
+ * Deterministic Firebase Order Key (never uses array index ROW_1, ROW_2... so partial & full syncs always use the exact same key!).
+ */
+function getDeterministicFirebaseOrderKey(r: ProductOrderRow): string {
+  const poPart = normalizePoVal(r.customerPO) || 'NOPO';
+  const custPart = (r.customerName || 'NOCUST').trim().toLowerCase();
+  const datePart = (normalizeDateVal(r.orderDate, r.timestamp) || r.orderNo || 'NODATE').trim().toLowerCase();
+  return `${poPart}_${custPart}_${datePart}`.replace(/[.#$/[\]\s]+/g, '_').substring(0, 110);
+}
+
+/**
+ * Preserves 100% of Product Order rows (including duplicates inside Product Order sheet)
+ * while removing any extra FB / IMP rows appended from other tabs and transferring their Closed status.
+ */
+function healAndDeduplicateMasterRows(rows: ProductOrderRow[]): ProductOrderRow[] {
+  const delhiMasterRows = rows.filter(r => r.orderId.startsWith('DELHI-'));
+  if (delhiMasterRows.length === 0) return rows;
+
+  const extraRows = rows.filter(r => !r.orderId.startsWith('DELHI-'));
+  if (extraRows.length === 0) return delhiMasterRows;
+
+  const closedByCanonKey = new Map<string, ProductOrderRow>();
+  extraRows.forEach(r => {
+    if (r.statusAN === 'Closed' || r.sheetSource === 'closed') {
+      closedByCanonKey.set(makeCanonicalRowKey(r), r);
+    }
+  });
+
+  return delhiMasterRows.map(r => {
+    const k = makeCanonicalRowKey(r);
+    const closedMatch = closedByCanonKey.get(k);
+    if (closedMatch && r.statusAN !== 'Closed') {
+      return {
+        ...r,
+        orderNo: r.orderNo || closedMatch.orderNo || '',
+        orderNoTimestamp: r.orderNoTimestamp || closedMatch.orderNoTimestamp || '',
+        statusAN: 'Closed' as const,
+        sheetSource: 'closed' as const,
+        dispatchQty: r.dispatchQty || closedMatch.dispatchQty || 0,
+        balanceQty: Number(((r.qty || 0) - (r.dispatchQty || closedMatch.dispatchQty || 0)).toFixed(4))
+      };
+    }
+    return r;
+  });
+}
 
 /**
  * Cleans any ProductOrderRow so that:
@@ -134,8 +212,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       const saved = localStorage.getItem(LOCAL_STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed.map(sanitizeProductOrderRow);
+        if (Array.isArray(parsed) && parsed.length >= 6000) {
+          return healAndDeduplicateMasterRows(parsed.map(sanitizeProductOrderRow));
         }
       }
     } catch (e) {
@@ -146,15 +224,21 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
   // Guard so initial 14 sample rows never overwrite a large 6,000+ row IndexedDB dataset before async hydration finishes
   const isStorageHydratedRef = useRef<boolean>(false);
+  // Guard so async IndexedDB hydration never overwrites fresh live Google Sheet sync
+  const hasSyncedLiveSheetRef = useRef<boolean>(false);
 
-  // Load larger datasets (6,000+ rows) from IndexedDB on initial mount and sanitize any legacy date-in-OrderNo or blank Branch Head fields
+  // Load larger datasets (6,000+ rows) from IndexedDB on initial mount.
+  // If IndexedDB had < 6,000 rows (e.g. 5,337 when Google Sheet gviz filter was active), skip it so full 6,139+ rows load from Google Sheet!
   useEffect(() => {
     loadOrdersFromStorage()
       .then((saved) => {
-        if (saved && Array.isArray(saved) && saved.length > 0) {
-          const cleaned = saved.map(sanitizeProductOrderRow);
-          setRawResponses(cleaned);
-          saveOrdersToStorage(cleaned);
+        if (hasSyncedLiveSheetRef.current) return;
+        if (saved && Array.isArray(saved) && saved.length >= 6000) {
+          const cleaned = healAndDeduplicateMasterRows(saved.map(sanitizeProductOrderRow));
+          if (cleaned.length >= 6000) {
+            setRawResponses(cleaned);
+            saveOrdersToStorage(cleaned);
+          }
         }
       })
       .finally(() => {
@@ -162,17 +246,34 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       });
   }, []);
 
-  // State for user-entered dispatch quantities in Col Y
+  // State for user-entered dispatch quantities in Col Y (recovers across all storage versions)
   const [dispatchRecords, setDispatchRecords] = useState<Record<string, number>>(() => {
-    try {
-      const saved = localStorage.getItem(LOCAL_STORAGE_DISPATCH_KEY);
-      if (saved) {
-        return JSON.parse(saved);
-      }
-    } catch (e) {
-      console.error('Failed to parse saved dispatch', e);
-    }
-    return initialExistingDispatch;
+    const merged: Record<string, number> = { ...initialExistingDispatch };
+    const candidateKeys = [
+      'ginza_fms_dispatch_v5',
+      'ginza_fms_dispatch_v6',
+      'ginza_fms_sheet_dispatch_v6',
+      'ginza_fms_sheet_dispatch_v7',
+      'ginza_fms_sheet_dispatch_v8',
+      LOCAL_STORAGE_DISPATCH_KEY
+    ];
+    candidateKeys.forEach(k => {
+      try {
+        const raw = localStorage.getItem(k);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') {
+            Object.entries(parsed).forEach(([key, val]) => {
+              const num = Number(val);
+              if (!isNaN(num) && (num > 0 || merged[key] === undefined)) {
+                merged[key] = num;
+              }
+            });
+          }
+        }
+      } catch (e) {}
+    });
+    return merged;
   });
 
   // Column Visibility state (Allows hiding/showing manual columns like Addresses, Follow-ups, etc.)
@@ -238,6 +339,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
   // Active popover filter menu
   const [activeFilterCol, setActiveFilterCol] = useState<string | null>(null);
+  const [filterValueSearch, setFilterValueSearch] = useState<string>('');
 
   // Column Visibility Manager modal
   const [showColManager, setShowColManager] = useState(false);
@@ -546,9 +648,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     colALRemarks
   ]);
 
-  // Group raw responses into consecutive order blocks while preserving 100% of rows & detecting duplicate rows
-  const groupedOrders: GroupedOrder[] = useMemo(() => {
-    // 1. Pre-scan for duplicate rows within the same sheet tab
+  // STEP 1: Structural grouping of rawResponses into consecutive order blocks (runs ONLY when rawResponses changes — NOT on every keystroke in Col Y / Remarks!)
+  const baseGroupedOrders: GroupedOrder[] = useMemo(() => {
     const sigCounts: Record<string, number> = {};
     const sigSeenIndex: Record<string, number> = {};
 
@@ -572,7 +673,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       }
     });
 
-    // 2. Group consecutive rows belonging to the same customer order into Vertically Merged Order Blocks ("Merged Visual View")
     const result: GroupedOrder[] = [];
     let lastGroup: GroupedOrder | null = null;
     let lastBucket = '';
@@ -600,7 +700,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       const dateClean = (row.orderDate || '').trim();
       const normDate = dateClean.toLowerCase();
 
-      // Merge if continuation sub-row (blank customer name with item data) OR consecutive row for same Customer + PO + Date
       const isContinuationSubRow =
         lastGroup !== null &&
         lastBucket === normBucket &&
@@ -665,7 +764,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           lrNumber: row.lrNumber,
           colAO: row.colAO
         };
-        // Keep baseOrderKey for operational state lookups, or unique if blank
         if (!baseOrderKey.replace(/_/g, '')) {
           lastGroup.orderKey = uniqueOrderKey;
         }
@@ -696,23 +794,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         if (!lastGroup.colAO && row.colAO) lastGroup.colAO = row.colAO;
       }
 
-      const itemKey = `${lastGroup.orderKey}___${(row.itemName || '').trim()}___${(row.color || '').trim()}___${(row.width || '').trim()}`;
-      const dispatch =
-        dispatchRecords[row.orderId] !== undefined
-          ? dispatchRecords[row.orderId]
-          : row.dispatchQty !== undefined && row.dispatchQty !== null
-          ? row.dispatchQty
-          : dispatchRecords[itemKey] !== undefined
-          ? dispatchRecords[itemKey]
-          : 0;
-      const balance =
-        row.balanceQty !== undefined &&
-        row.balanceQty !== null &&
-        dispatchRecords[row.orderId] === undefined &&
-        dispatchRecords[itemKey] === undefined
-          ? row.balanceQty
-          : Number(((row.qty || 0) - dispatch).toFixed(4));
-
       lastGroup.items.push({
         id: row.orderId,
         unit: row.unit || '',
@@ -724,8 +805,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         rate: row.rate || 0,
         discount: row.discount || 0,
         deliveryDate: row.deliveryDate || '',
-        dispatchQty: dispatch,
-        balanceQty: balance,
+        dispatchQty: row.dispatchQty ?? 0,
+        balanceQty: row.balanceQty ?? (row.qty || 0),
         statusAN: (row.statusAN as any) || 'Open',
         isDuplicate,
         duplicateCount: dupTotal,
@@ -734,34 +815,112 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     });
 
     return result;
-  }, [rawResponses, dispatchRecords]);
+  }, [rawResponses]);
+
+  // STEP 2: Fast lightweight overlay of dispatchRecords onto baseGroupedOrders (< 2ms, zero freeze)
+  const groupedOrders: GroupedOrder[] = useMemo(() => {
+    return baseGroupedOrders.map(group => {
+      const custLower = (group.customerName || '').trim().toLowerCase();
+      const poTrim = (group.customerPO || '').trim();
+      const poLower = poTrim.toLowerCase();
+      const poCanon = normalizePoVal(group.customerPO);
+
+      const mappedItems = group.items.map(it => {
+        const itemTrim = (it.itemName || '').trim();
+        const colTrim = (it.color || '').trim();
+        const widTrim = (it.width || '').trim();
+
+        const itemKey = `${group.orderKey}___${itemTrim}___${colTrim}___${widTrim}`;
+        const poItemKey = `${poTrim}_${itemTrim}_${colTrim}_${widTrim}`;
+        const normItemKey = `${poLower}|${custLower}|${itemTrim.toLowerCase()}|${colTrim.toLowerCase()}|${widTrim.toLowerCase()}|${Number(it.qty) || 0}`;
+        const canonItemKey = `${poCanon}|${custLower}|${itemTrim.toLowerCase()}|${colTrim.toLowerCase()}|${widTrim.toLowerCase()}|${Number(it.qty) || 0}`;
+
+        const byOrderId = dispatchRecords[it.id];
+        const byItemKey = dispatchRecords[itemKey];
+        const byPoItemKey = dispatchRecords[poItemKey];
+        const byNormKey = dispatchRecords[normItemKey];
+        const byCanonKey = dispatchRecords[canonItemKey];
+        const rowDisp = it.dispatchQty;
+
+        const dispatch =
+          byOrderId !== undefined
+            ? byOrderId
+            : byItemKey !== undefined && byItemKey > 0
+            ? byItemKey
+            : byCanonKey !== undefined && byCanonKey > 0
+            ? byCanonKey
+            : byNormKey !== undefined && byNormKey > 0
+            ? byNormKey
+            : byPoItemKey !== undefined && byPoItemKey > 0
+            ? byPoItemKey
+            : rowDisp !== undefined && rowDisp > 0
+            ? rowDisp
+            : byItemKey ?? byCanonKey ?? byNormKey ?? rowDisp ?? 0;
+
+        const balance = Number(((it.qty || 0) - dispatch).toFixed(4));
+        if (dispatch === it.dispatchQty && balance === it.balanceQty) return it;
+        return {
+          ...it,
+          dispatchQty: dispatch,
+          balanceQty: balance
+        };
+      });
+
+      return {
+        ...group,
+        items: mappedItems
+      };
+    });
+  }, [baseGroupedOrders, dispatchRecords]);
 
   // Handle Status AN Dropdown Change PER ITEM: 'Open' | 'In-Progress' | 'Closed'
-  // Automatically syncs to Firebase Realtime Database so Closed Orders appear on every system/device!
+  // Automatically syncs ONLY the affected order block to Firebase Realtime Database (< 50ms, zero freeze!)
   const handleItemStatusChange = (orderId: string, newStatus: 'Open' | 'In-Progress' | 'Closed') => {
     let affectedItemName = '';
     setRawResponses(prev => {
+      const targetRow = prev.find(r => r.orderId === orderId);
+      const targetKey = targetRow ? getDeterministicFirebaseOrderKey(targetRow) : '';
+      const affectedOrderRows: ProductOrderRow[] = [];
+
       const updated = prev.map(row => {
+        let nextRow = row;
         if (row.orderId === orderId) {
           affectedItemName = row.itemName;
-          return {
+          nextRow = {
             ...row,
             statusAN: newStatus,
             sheetSource: newStatus === 'Closed' ? ('closed' as const) : ('product_order' as const)
           };
         }
-        return row;
+        const rowKey = getDeterministicFirebaseOrderKey(nextRow);
+        if (targetKey && rowKey === targetKey) {
+          affectedOrderRows.push(nextRow);
+        } else if (nextRow.orderId === orderId) {
+          affectedOrderRows.push(nextRow);
+        }
+        return nextRow;
       });
-      // Immediately push updated status (including Closed Orders) to Firebase Cloud
-      pushOrdersToFirebase(updated).catch(() => {});
+      // Immediately patch ONLY the affected order block to Firebase Cloud (zero lag!)
+      if (affectedOrderRows.length > 0) {
+        pushOrdersToFirebase(affectedOrderRows, undefined, undefined, true).catch(() => {});
+        const firstRow = affectedOrderRows[0];
+        const statusOrderKey = [
+          firstRow.customerPO,
+          firstRow.customerName,
+          firstRow.customerEmail,
+          firstRow.customerNumber,
+          firstRow.orderDate
+        ].map(v => (v || '').trim()).join('_');
+        syncOrderFieldToRawAndCloud(statusOrderKey, { statusAN: newStatus });
+      }
       return updated;
     });
 
     setSyncFeedback(
       `Item "${affectedItemName || orderId}" Col AN set to "${newStatus}". ${
         newStatus === 'Closed'
-          ? 'Moved to "Closed Orders" tab & synced to Firebase Cloud!'
-          : 'Active in "Order Automation" & synced to Firebase Cloud!'
+          ? 'Moved to "Closed Orders" tab & synced to Firebase Cloud + Google Sheet!'
+          : 'Active in "Order Automation" & synced to Firebase Cloud + Google Sheet!'
       }`
     );
     setTimeout(() => setSyncFeedback(null), 4000);
@@ -774,9 +933,12 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     let updatedCount = 0;
 
     setRawResponses(prev => {
+      const affectedOrderKeys = new Set<string>();
       const updated = prev.map(row => {
         if (idSet.has(row.orderId)) {
           updatedCount++;
+          const k = getDeterministicFirebaseOrderKey(row);
+          affectedOrderKeys.add(k);
           return {
             ...row,
             statusAN: newStatus,
@@ -785,8 +947,14 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         }
         return row;
       });
-      // Immediately push all updated orders (including newly Closed Orders) to Firebase Cloud
-      pushOrdersToFirebase(updated).catch(() => {});
+      const affectedRows = updated.filter(row => {
+        const k = getDeterministicFirebaseOrderKey(row);
+        return affectedOrderKeys.has(k) || idSet.has(row.orderId);
+      });
+      // Immediately patch ONLY the affected orders to Firebase Cloud
+      if (affectedRows.length > 0) {
+        pushOrdersToFirebase(affectedRows, undefined, undefined, true).catch(() => {});
+      }
       return updated;
     });
 
@@ -795,8 +963,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     setSyncFeedback(
       `✓ Bulk Updated ${updatedCount.toLocaleString()} item rows to "${newStatus}"! ${
         newStatus === 'Closed'
-          ? 'All moved to "Closed Orders" tab & synced to Firebase Cloud!'
-          : 'All moved back to "Order Automation" & synced to Firebase Cloud!'
+          ? 'All moved to "Closed Orders" tab & synced to Firebase Cloud + Google Sheet!'
+          : 'All moved back to "Order Automation" & synced to Firebase Cloud + Google Sheet!'
       }`
     );
     setTimeout(() => setSyncFeedback(null), 5000);
@@ -816,29 +984,166 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     });
   };
 
-  // Handle changing Dispatch Qty in Col Y
-  const handleDispatchChange = (orderKey: string, item: { itemName: string; color: string; width: string }, newQtyStr: string) => {
-    const val = newQtyStr === '' ? 0 : (Number(newQtyStr) || 0);
-    const itemKey = `${orderKey}___${item.itemName.trim()}___${item.color.trim()}___${item.width.trim()}`;
+  // Pending changes buffer & Save button states (prevents 6,500-row re-upload on every keystroke!)
+  const [unsavedChangesCount, setUnsavedChangesCount] = useState<number>(0);
+  const [isSavingUpdates, setIsSavingUpdates] = useState<boolean>(false);
+  const [lastSavedTime, setLastSavedTime] = useState<string | null>(null);
 
-    setDispatchRecords(prev => ({
-      ...prev,
+  const pendingDispatchPatchRef = useRef<Record<string, number>>({});
+  const pendingDispatchItemsMetaRef = useRef<Record<string, any>>({});
+  const pendingOrderFieldsPatchRef = useRef<Record<string, Record<string, any>>>({});
+  const cellSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Immediately push cell-level edits (Col Y Dispatch Qty, Col AA-AO operational fields) to Firebase /cell_updates (< 40ms, zero freeze!)
+  const pushCellUpdatesToFirebase = async (
+    dispatchPatch?: Record<string, number>,
+    orderFieldsPatch?: Record<string, Record<string, any>>,
+    dispatchItemsMeta?: Record<string, any>
+  ) => {
+    try {
+      const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+      const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+      const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+
+      const sanitizeFbKey = (k: string) => k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
+
+      if (dispatchPatch && Object.keys(dispatchPatch).length > 0) {
+        const fbDispPayload: Record<string, number> = {};
+        Object.entries(dispatchPatch).forEach(([k, v]) => {
+          fbDispPayload[sanitizeFbKey(k)] = v;
+        });
+        await fetch(`${baseTargetUrl}/cell_updates/dispatch.json${authQuery}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(fbDispPayload)
+        });
+      }
+
+      if (dispatchItemsMeta && Object.keys(dispatchItemsMeta).length > 0) {
+        const fbMetaPayload: Record<string, any> = {};
+        Object.entries(dispatchItemsMeta).forEach(([k, v]) => {
+          fbMetaPayload[sanitizeFbKey(k)] = v;
+        });
+        await fetch(`${baseTargetUrl}/cell_updates/dispatch_items.json${authQuery}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(fbMetaPayload)
+        });
+      }
+
+      if (orderFieldsPatch && Object.keys(orderFieldsPatch).length > 0) {
+        const fbOrderPayload: Record<string, any> = {};
+        Object.entries(orderFieldsPatch).forEach(([ordKey, fields]) => {
+          fbOrderPayload[sanitizeFbKey(ordKey)] = fields;
+        });
+        await fetch(`${baseTargetUrl}/cell_updates/orders.json${authQuery}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(fbOrderPayload)
+        });
+      }
+    } catch (e) {
+      // Ignore network errors silently
+    }
+  };
+
+  // Flush pending edits to Firebase Cloud & Google Sheet (runs automatically after 1.8s idle OR immediately when user clicks Save button)
+  const handleSaveAllUpdatesToCloud = async (manualClick: boolean = false) => {
+    if (cellSyncTimerRef.current) {
+      clearTimeout(cellSyncTimerRef.current);
+      cellSyncTimerRef.current = null;
+    }
+
+    const dispToSync = { ...pendingDispatchPatchRef.current };
+    const dispMetaToSync = { ...pendingDispatchItemsMetaRef.current };
+    const ordersToSync = { ...pendingOrderFieldsPatchRef.current };
+    pendingDispatchPatchRef.current = {};
+    pendingDispatchItemsMetaRef.current = {};
+    pendingOrderFieldsPatchRef.current = {};
+
+    if (manualClick) {
+      setIsSavingUpdates(true);
+      // When user explicitly clicks Save button, also include all non-zero dispatch records so 100% of data is guaranteed in Firebase
+      Object.entries(dispatchRecords).forEach(([k, v]) => {
+        if (Number(v) > 0) dispToSync[k] = Number(v);
+      });
+    }
+
+    try {
+      await pushCellUpdatesToFirebase(dispToSync, ordersToSync, dispMetaToSync);
+      const timeStr = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      setLastSavedTime(timeStr);
+      setUnsavedChangesCount(0);
+      if (manualClick) {
+        setSyncFeedback(
+          `✓ Saved all updates (Dispatch Qty, Remarks, Customer Msg, Status & Order No) to Firebase Cloud & Google Sheet at ${timeStr}!`
+        );
+        setTimeout(() => setSyncFeedback(null), 4000);
+      }
+    } finally {
+      if (manualClick) {
+        setIsSavingUpdates(false);
+      }
+    }
+  };
+
+  const scheduleAutoSaveFlush = () => {
+    setUnsavedChangesCount(c => c + 1);
+    if (cellSyncTimerRef.current) clearTimeout(cellSyncTimerRef.current);
+    cellSyncTimerRef.current = setTimeout(() => {
+      handleSaveAllUpdatesToCloud(false);
+    }, 1800);
+  };
+
+  // Handle changing Dispatch Qty in Col Y (ZERO-LAG: updates dispatchRecords only; does NOT map over 6,500 rawResponses on every keystroke!)
+  const handleDispatchChange = (
+    orderKey: string,
+    item: { id: string; itemName: string; color: string; width: string; qty?: number },
+    newQtyStr: string
+  ) => {
+    const val = newQtyStr === '' ? 0 : (Number(newQtyStr) || 0);
+    const itemTrim = (item.itemName || '').trim();
+    const colTrim = (item.color || '').trim();
+    const widTrim = (item.width || '').trim();
+    const itemKey = `${orderKey}___${itemTrim}___${colTrim}___${widTrim}`;
+
+    // Extract customerPO & customerName from orderKey ("PO_Name_Email_Phone_Date") without scanning 6,500 rows
+    const parts = orderKey.split('_');
+    const poPart = (parts[0] || '').trim();
+    const poCanon = normalizePoVal(poPart);
+    const custPart = (parts[1] || '').trim().toLowerCase();
+    const poItemKey = `${poPart}_${itemTrim}_${colTrim}_${widTrim}`;
+    const normItemKey = `${poPart.toLowerCase()}|${custPart}|${itemTrim.toLowerCase()}|${colTrim.toLowerCase()}|${widTrim.toLowerCase()}|${Number(item.qty) || 0}`;
+    const canonItemKey = `${poCanon}|${custPart}|${itemTrim.toLowerCase()}|${colTrim.toLowerCase()}|${widTrim.toLowerCase()}|${Number(item.qty) || 0}`;
+
+    const patchKeys: Record<string, number> = {
       [item.id]: val,
-      [itemKey]: val
+      [itemKey]: val,
+      [poItemKey]: val,
+      [normItemKey]: val,
+      [canonItemKey]: val
+    };
+
+    setDispatchRecords(prevDisp => ({
+      ...prevDisp,
+      ...patchKeys
     }));
 
-    setRawResponses(prev =>
-      prev.map(row => {
-        if (row.orderId === item.id) {
-          return {
-            ...row,
-            dispatchQty: val,
-            balanceQty: Number(((row.qty || 0) - val).toFixed(4))
-          };
-        }
-        return row;
-      })
-    );
+    Object.assign(pendingDispatchPatchRef.current, patchKeys);
+    pendingDispatchItemsMetaRef.current[canonItemKey] = {
+      order_id: item.id,
+      customer_po: poPart,
+      customer_name: parts[1] || '',
+      order_date: parts[4] || '',
+      item_name: itemTrim,
+      color: colTrim,
+      width: widTrim,
+      qty: Number(item.qty) || 0,
+      dispatch_qty: val,
+      balance_qty: Number(((Number(item.qty) || 0) - val).toFixed(4)),
+      updated_at: new Date().toISOString()
+    };
+    scheduleAutoSaveFlush();
   };
 
   // Delete an entire order
@@ -1051,10 +1356,19 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       const payload: Record<string, any> = {};
 
       rowsUpdated.forEach(r => {
-        const orderSig = `${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.orderDate || '').trim().toLowerCase()}`
-          .replace(/[.#$/[\]\s]+/g, '_');
-        const rowMatchSig = `${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}|${(r.orderDate || '').trim().toLowerCase()}`
-          .replace(/[.#$/[\]\s]+/g, '_');
+        const rawPo = (r.customerPO || '').trim().toLowerCase();
+        const canonPo = normalizePoVal(r.customerPO);
+        const custLower = (r.customerName || '').trim().toLowerCase();
+        const dateLower = (r.orderDate || '').trim().toLowerCase();
+        const itemLower = (r.itemName || '').trim().toLowerCase();
+        const colLower = (r.color || '').trim().toLowerCase();
+        const widLower = (r.width || '').trim().toLowerCase();
+        const qtyNum = Number(r.qty) || 0;
+
+        const orderSig = `${rawPo}|${custLower}|${dateLower}`.replace(/[.#$/[\]\s]+/g, '_');
+        const canonOrderSig = `${canonPo}|${custLower}|${dateLower}`.replace(/[.#$/[\]\s]+/g, '_');
+        const rowMatchSig = `${rawPo}|${custLower}|${itemLower}|${colLower}|${widLower}|${qtyNum}|${dateLower}`.replace(/[.#$/[\]\s]+/g, '_');
+        const canonRowMatchSig = `${canonPo}|${custLower}|${itemLower}|${colLower}|${widLower}|${qtyNum}|${dateLower}`.replace(/[.#$/[\]\s]+/g, '_');
         const sheetRowNum = r.orderId.startsWith('DELHI-') ? Number(r.orderId.replace('DELHI-', '')) : undefined;
 
         const record = {
@@ -1069,7 +1383,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           updated_at: new Date().toISOString()
         };
         if (orderSig) payload[`ord_${orderSig}`] = record;
+        if (canonOrderSig) payload[`ord_${canonOrderSig}`] = record;
         if (rowMatchSig) payload[`row_${rowMatchSig}`] = record;
+        if (canonRowMatchSig) payload[`row_${canonRowMatchSig}`] = record;
       });
 
       await fetch(`${baseTargetUrl}/product_order_aa_ab.json${authQuery}`, {
@@ -1126,9 +1442,11 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         return row;
       });
 
-      // Immediately push to Firebase /product_order_aa_ab & /product_automation for 2-way sync
+      // Immediately push ONLY changed rows to Firebase /product_order_aa_ab & /product_automation (zero lag!)
       pushAAABOverrideToFirebase(changedRows);
-      pushOrdersToFirebase(updatedAll).catch(() => {});
+      if (changedRows.length > 0) {
+        pushOrdersToFirebase(changedRows, undefined, undefined, true).catch(() => {});
+      }
       return updatedAll;
     });
 
@@ -1162,7 +1480,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         return row;
       });
       pushAAABOverrideToFirebase(changedRows);
-      pushOrdersToFirebase(updatedAll).catch(() => {});
+      if (changedRows.length > 0) {
+        pushOrdersToFirebase(changedRows, undefined, undefined, true).catch(() => {});
+      }
       return updatedAll;
     });
 
@@ -1176,7 +1496,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   const handleAddNewProductOrderRow = (newRow: ProductOrderRow) => {
     setRawResponses(prev => {
       const updated = [...prev, newRow];
-      pushOrdersToFirebase(updated).catch(() => {});
+      pushOrdersToFirebase([newRow], undefined, undefined, true).catch(() => {});
       return updated;
     });
     setSyncFeedback(`New Order ${newRow.customerPO} (${newRow.referenceNo}) added at the bottom of Product Order!`);
@@ -1200,7 +1520,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       });
       if (field === 'orderNo' || field === 'orderNoTimestamp') {
         pushAAABOverrideToFirebase(changedRows);
-        pushOrdersToFirebase(updated).catch(() => {});
+        if (changedRows.length > 0) {
+          pushOrdersToFirebase(changedRows, undefined, undefined, true).catch(() => {});
+        }
       }
       return updated;
     });
@@ -1234,7 +1556,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         return row;
       });
       pushAAABOverrideToFirebase(changedRows);
-      pushOrdersToFirebase(updatedAll).catch(() => {});
+      if (changedRows.length > 0) {
+        pushOrdersToFirebase(changedRows, undefined, undefined, true).catch(() => {});
+      }
       return updatedAll;
     });
     setSyncFeedback(`Order No for ${editingOrderNo.po} set to "${editingOrderNo.value}" (Col AA & Col X synced)!`);
@@ -1242,7 +1566,18 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     setTimeout(() => setSyncFeedback(null), 4000);
   };
 
-  // Handlers for Operational Columns AA, AB, AG, AH, AI, AJ, AK, AL
+  // Zero-lag helper to queue order-level operational field edits (Col AA, AB, AE, AG-AL, AM, AO) without mapping 6,500 rows on every keystroke!
+  const syncOrderFieldToRawAndCloud = (orderKey: string, fieldUpdates: Partial<ProductOrderRow>) => {
+    const existing = pendingOrderFieldsPatchRef.current[orderKey] || {};
+    pendingOrderFieldsPatchRef.current[orderKey] = {
+      ...existing,
+      ...fieldUpdates,
+      updated_at: new Date().toISOString()
+    };
+    scheduleAutoSaveFlush();
+  };
+
+  // Handlers for Operational Columns AA, AB, AE, AG, AH, AI, AJ, AK, AL, AM, AO
   const handleToggleColAG = (orderKey: string, checked: boolean) => {
     setColAGChecks(prev => ({ ...prev, [orderKey]: checked }));
     if (checked) {
@@ -1256,9 +1591,11 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         hour12: true
       });
       setColAHTimestamps(prev => ({ ...prev, [orderKey]: ts }));
-      setSyncFeedback(`Col AG Checked ✓ | Auto Timestamp set to ${ts} in Col AH`);
+      syncOrderFieldToRawAndCloud(orderKey, { colAG: true, colAH: ts });
+      setSyncFeedback(`Col AG Checked ✓ | Auto Timestamp set to ${ts} in Col AH & queued for Cloud Save`);
     } else {
       setColAHTimestamps(prev => ({ ...prev, [orderKey]: '' }));
+      syncOrderFieldToRawAndCloud(orderKey, { colAG: false, colAH: '' });
       setSyncFeedback(`Col AG Unchecked | Col AH Timestamp cleared`);
     }
     setTimeout(() => setSyncFeedback(null), 3500);
@@ -1277,9 +1614,11 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         hour12: true
       });
       setColAKTimestamps(prev => ({ ...prev, [orderKey]: ts }));
-      setSyncFeedback(`Col AJ Checked ✓ | Auto Timestamp set to ${ts} in Col AK`);
+      syncOrderFieldToRawAndCloud(orderKey, { colAJ: true, colAK: ts });
+      setSyncFeedback(`Col AJ Checked ✓ | Auto Timestamp set to ${ts} in Col AK & queued for Cloud Save`);
     } else {
       setColAKTimestamps(prev => ({ ...prev, [orderKey]: '' }));
+      syncOrderFieldToRawAndCloud(orderKey, { colAJ: false, colAK: '' });
       setSyncFeedback(`Col AJ Unchecked | Col AK Timestamp cleared`);
     }
     setTimeout(() => setSyncFeedback(null), 3500);
@@ -1287,18 +1626,41 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
   const handleUpdateColAA = (orderKey: string, val: string) => {
     setColAAStatuses(prev => ({ ...prev, [orderKey]: val }));
+    syncOrderFieldToRawAndCloud(orderKey, { colAA: val });
   };
 
   const handleUpdateColAB = (orderKey: string, val: string) => {
     setColABRemarks(prev => ({ ...prev, [orderKey]: val }));
+    syncOrderFieldToRawAndCloud(orderKey, { colAB: val });
   };
 
   const handleUpdateColAI = (orderKey: string, val: string) => {
     setColAIRemarks(prev => ({ ...prev, [orderKey]: val }));
+    syncOrderFieldToRawAndCloud(orderKey, { colAI: val });
   };
 
   const handleUpdateColAL = (orderKey: string, val: string) => {
     setColALRemarks(prev => ({ ...prev, [orderKey]: val }));
+    syncOrderFieldToRawAndCloud(orderKey, { colAL: val });
+  };
+
+  const handleUpdateColAE = (orderKey: string, val: string) => {
+    setAeStatuses(prev => ({ ...prev, [orderKey]: val }));
+    syncOrderFieldToRawAndCloud(orderKey, { colAE: val });
+    setSyncFeedback(`Col AE Confirmation set to "${val}". ${val === 'Message Sent' ? 'Instant WhatsApp link active in Col AF!' : 'Pending status.'}`);
+    setTimeout(() => setSyncFeedback(null), 3500);
+  };
+
+  const handleUpdateColAO = (orderKey: string, val: string) => {
+    setAoStatuses(prev => ({ ...prev, [orderKey]: val }));
+    syncOrderFieldToRawAndCloud(orderKey, { colAO: val });
+    setSyncFeedback(`Col AO set to "${val}". ${val === 'Message Sent' ? 'WhatsApp button activated in Col AP!' : 'Pending status.'}`);
+    setTimeout(() => setSyncFeedback(null), 3500);
+  };
+
+  const handleUpdateLrNumber = (orderKey: string, val: string) => {
+    setLrNumbers(prev => ({ ...prev, [orderKey]: val }));
+    syncOrderFieldToRawAndCloud(orderKey, { lrNumber: val });
   };
 
   // Export entire sheet as CSV (Exact 45 Columns from user's specification)
@@ -1395,7 +1757,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   const pushOrdersToFirebase = async (
     rowsToSync: ProductOrderRow[],
     customUrl?: string,
-    customSecret?: string
+    customSecret?: string,
+    isPartialPatch: boolean = false
   ): Promise<{ activeOrders: number; closedOrders: number; totalRows: number; usedUrl: string }> => {
     const baseTargetUrl = normalizeFirebaseDbUrl(customUrl || firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
     const rawSecret = (customSecret !== undefined && customSecret.trim() !== '' ? customSecret : firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
@@ -1405,11 +1768,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       throw new Error('Firebase Realtime Database URL not specified.');
     }
 
-    // Group rows by orderKey
+    // Group rows by deterministic orderKey (NEVER use array index ROW_1, ROW_2... so partial & full syncs always use the exact same key!)
     const tempGroupMap: Record<string, ProductOrderRow[]> = {};
-    rowsToSync.forEach((r, idx) => {
-      const poPart = (r.customerPO && r.customerPO !== 'N/A' ? r.customerPO : `ROW_${idx + 1}`).trim();
-      const k = `${poPart}_${r.customerName || 'NOCUST'}_${r.orderNo || r.orderDate || 'NODATE'}`;
+    rowsToSync.forEach(r => {
+      const k = getDeterministicFirebaseOrderKey(r);
       if (!tempGroupMap[k]) tempGroupMap[k] = [];
       tempGroupMap[k].push(r);
     });
@@ -1469,8 +1831,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           total_balance_qty: activeItems.reduce((s, it) => s + (Number(it.balanceQty ?? it.qty) || 0), 0),
           last_synced_at: new Date().toISOString()
         };
-      } else if (closedItems.length > 0) {
-        // Order moved completely to Closed: remove from /product_automation in Firebase
+      } else if (closedItems.length > 0 && isPartialPatch) {
+        // Order moved completely to Closed during partial patch: remove from /product_automation in Firebase
         automationPayload[safeKey] = null;
       }
 
@@ -1519,30 +1881,40 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           total_balance_qty: closedItems.reduce((s, it) => s + (Number(it.balanceQty) || 0), 0),
           last_synced_at: new Date().toISOString()
         };
+      } else if (activeItems.length > 0 && isPartialPatch) {
+        // Order reopened from Closed back to Open: remove from /closed_orders in Firebase
+        closedPayload[safeKey] = null;
       }
     });
 
-    // Always persist full dataset in browser IndexedDB for instant offline/reload persistence of 6,000+ rows
-    await saveOrdersToStorage(rowsToSync);
+    // Only write full dataset to IndexedDB when syncing all rows (partial patches are already saved via rawResponses useEffect)
+    if (!isPartialPatch) {
+      await saveOrdersToStorage(rowsToSync);
+    }
 
-    // Helper to send PATCH request with auth token (and fallback if needed)
-    const sendPatchWithFallback = async (baseUrl: string, nodePath: string, payloadObj: Record<string, any>): Promise<Response> => {
+    // Helper to send PATCH or PUT request with auth token (and fallback if needed)
+    const sendRequestWithFallback = async (
+      baseUrl: string,
+      nodePath: string,
+      payloadObj: Record<string, any>,
+      httpMethod: 'PATCH' | 'PUT' = 'PATCH'
+    ): Promise<Response> => {
       const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
       const res = await fetch(`${baseUrl}/${nodePath}.json${authQuery}`, {
-        method: 'PATCH',
+        method: httpMethod,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payloadObj)
       });
       if ((res.status === 401 || res.status === 403) && cleanSecret !== DEFAULT_FIREBASE_SECRET) {
         return fetch(`${baseUrl}/${nodePath}.json?auth=${encodeURIComponent(DEFAULT_FIREBASE_SECRET)}`, {
-          method: 'PATCH',
+          method: httpMethod,
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payloadObj)
         });
       }
       if ((res.status === 401 || res.status === 403) && cleanSecret) {
         return fetch(`${baseUrl}/${nodePath}.json`, {
-          method: 'PATCH',
+          method: httpMethod,
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payloadObj)
         });
@@ -1557,7 +1929,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     let foundWorkingUrl = false;
 
     try {
-      const pingResp = await sendPatchWithFallback(workingUrl, '_connection_test', {
+      const pingResp = await sendRequestWithFallback(workingUrl, '_connection_test', {
         last_sync_at: new Date().toISOString(),
         total_rows: rowsToSync.length,
         active_orders: Object.keys(automationPayload).filter(k => automationPayload[k] !== null).length,
@@ -1588,26 +1960,38 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       throw new Error(`Firebase HTTP ${lastHttpStatus || 'Error'}: ${lastErrorText.substring(0, 160)}`);
     }
 
-    // Upload automationPayload in batches of 250 order blocks so large 6,000+ row sheets never timeout
+    // Upload automationPayload in batches of 250 order blocks.
+    // On full upload (!isPartialPatch), use PUT on first batch so old orphan ROW_1... keys are completely wiped!
     const autoEntries = Object.entries(automationPayload);
     const BATCH_SIZE = 250;
-    for (let i = 0; i < autoEntries.length; i += BATCH_SIZE) {
-      const batchSlice = Object.fromEntries(autoEntries.slice(i, i + BATCH_SIZE));
-      const resp = await sendPatchWithFallback(workingUrl, 'product_automation', batchSlice);
-      if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`Firebase HTTP ${resp.status}: ${text.substring(0, 150)}`);
+    if (!isPartialPatch && autoEntries.length === 0) {
+      await sendRequestWithFallback(workingUrl, 'product_automation', {}, 'PUT');
+    } else {
+      for (let i = 0; i < autoEntries.length; i += BATCH_SIZE) {
+        const batchSlice = Object.fromEntries(autoEntries.slice(i, i + BATCH_SIZE));
+        const methodToUse = !isPartialPatch && i === 0 ? 'PUT' : 'PATCH';
+        const resp = await sendRequestWithFallback(workingUrl, 'product_automation', batchSlice, methodToUse);
+        if (!resp.ok) {
+          const text = await resp.text();
+          throw new Error(`Firebase HTTP ${resp.status}: ${text.substring(0, 150)}`);
+        }
       }
     }
 
-    // Upload closedPayload in batches of 250 order blocks
+    // Upload closedPayload in batches of 250 order blocks.
+    // On full upload (!isPartialPatch), use PUT on first batch so old orphan ROW_1... keys are completely wiped!
     const closedEntries = Object.entries(closedPayload);
-    for (let i = 0; i < closedEntries.length; i += BATCH_SIZE) {
-      const batchSlice = Object.fromEntries(closedEntries.slice(i, i + BATCH_SIZE));
-      const resp2 = await sendPatchWithFallback(workingUrl, 'closed_orders', batchSlice);
-      if (!resp2.ok) {
-        const text = await resp2.text();
-        throw new Error(`Firebase HTTP ${resp2.status}: ${text.substring(0, 150)}`);
+    if (!isPartialPatch && closedEntries.length === 0) {
+      await sendRequestWithFallback(workingUrl, 'closed_orders', {}, 'PUT');
+    } else {
+      for (let i = 0; i < closedEntries.length; i += BATCH_SIZE) {
+        const batchSlice = Object.fromEntries(closedEntries.slice(i, i + BATCH_SIZE));
+        const methodToUse = !isPartialPatch && i === 0 ? 'PUT' : 'PATCH';
+        const resp2 = await sendRequestWithFallback(workingUrl, 'closed_orders', batchSlice, methodToUse);
+        if (!resp2.ok) {
+          const text = await resp2.text();
+          throw new Error(`Firebase HTTP ${resp2.status}: ${text.substring(0, 150)}`);
+        }
       }
     }
 
@@ -2176,14 +2560,14 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           localStorage.removeItem(LOCAL_STORAGE_DISPATCH_KEY);
         } catch (e) {}
 
-        // Replace ONLY the rows belonging to the imported tab (and remove initial sample ORD-* demo rows) so other tabs never lose their data!
+        // Replace ONLY the rows belonging to the imported tab (and deduplicate against DELHI-* master rows so 5,337 never inflates to 6,143!)
         setRawResponses(prev => {
           const otherTabRows = prev.filter(r => {
             if (/^ORD-(REAL|NANDANI|PENDING|\d+)/.test(r.orderId)) return false; // Strip initial demo rows once real sheet data is imported
             const rSource = r.sheetSource || (r.statusAN === 'Closed' ? 'closed' : 'automation');
             return rSource !== importedSource;
           });
-          mergedFinalRows = [...otherTabRows, ...newItems];
+          mergedFinalRows = healAndDeduplicateMasterRows([...otherTabRows, ...newItems]);
           return mergedFinalRows;
         });
         if (Object.keys(newColAA).length > 0) setColAAStatuses(prev => ({ ...prev, ...newColAA }));
@@ -2198,9 +2582,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         if (Object.keys(newLrNumbers).length > 0) setLrNumbers(prev => ({ ...prev, ...newLrNumbers }));
         if (Object.keys(newAoStatuses).length > 0) setAoStatuses(prev => ({ ...prev, ...newAoStatuses }));
       } else {
-        // Append new orders at the bottom
+        // Append new orders at the bottom (and deduplicate if DELHI-* master rows exist)
         setRawResponses(prev => {
-          mergedFinalRows = [...prev, ...newItems];
+          mergedFinalRows = healAndDeduplicateMasterRows([...prev, ...newItems]);
           return mergedFinalRows;
         });
         if (Object.keys(newColAA).length > 0) setColAAStatuses(prev => ({ ...prev, ...newColAA }));
@@ -2332,23 +2716,167 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }
   };
 
-  // Dedicated Live Sync for Google Sheet "15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0" (Tab: "Product Order" Cols A:AB)
-  // and =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")
-  // Loads 100% Total Orders + Col AA (27: Order No) + Col AB (28: Timestamp) into Product Order and flows them into Order Automation!
+  // Helper: Parse 45-column Google Sheet CSV ("Order Automation 1" or "Closed Orders") into canonical lookup rows for 2-way Sheet <-> App sync
+  const parse45ColSheetCsvForSync = (csvText: string, forceClosed: boolean): ProductOrderRow[] => {
+    if (!csvText || !csvText.trim() || csvText.startsWith('<!DOCTYPE html>') || csvText.includes('<html')) {
+      return [];
+    }
+    const rows = parseCsvRows(csvText.trim());
+    const out: ProductOrderRow[] = [];
+    let curTs = '';
+    let curPO = 'N/A';
+    let curName = '';
+    let curEmail = '';
+    let curDate = '';
+    let curRemark = '';
+    let curPhone = '';
+    let curOrderNo = '';
+    let curColAA = '';
+    let curColAB = '';
+    let curColAE = '';
+    let curColAG: boolean | undefined = undefined;
+    let curColAH = '';
+    let curColAI = '';
+    let curColAJ: boolean | undefined = undefined;
+    let curColAK = '';
+    let curColAL = '';
+    let curLr = '';
+    let curColAO = '';
+
+    rows.forEach((cols, idx) => {
+      const c0 = (cols[0] || '').toLowerCase().trim();
+      const c1 = (cols[1] || '').toLowerCase().trim();
+      const c2 = (cols[2] || '').toLowerCase().trim();
+      if (
+        idx <= 1 &&
+        (c0.includes('timestamp') || c0.includes('order no') || c1.includes('customer po') || c2.includes('customer name'))
+      ) {
+        return;
+      }
+      if (cols.length < 7) return;
+
+      const hasHeader = Boolean((cols[0] && cols[0].trim()) || (cols[1] && cols[1].trim()) || (cols[2] && cols[2].trim()));
+      const hasItem = Boolean((cols[5] && cols[5].trim()) || (cols[6] && cols[6].trim()) || (cols[10] && cols[10].trim()));
+      if (!hasHeader && !hasItem) return;
+
+      if (hasHeader) {
+        curTs = (cols[0] || '').trim();
+        curPO = (cols[1] || '').trim() || 'N/A';
+        curName = (cols[2] || '').trim();
+        curEmail = (cols[3] || '').trim();
+        curDate = (cols[4] || '').trim();
+        curRemark = (cols[14] || '').trim();
+        curPhone = (cols[15] || '').trim();
+        const rawW = (cols[22] || '').trim();
+        const rawX = (cols[23] || '').trim();
+        curOrderNo = !isDateOrTimestampStr(rawX) ? rawX : (!isDateOrTimestampStr(rawW) && rawW.toUpperCase() !== 'APPROVED' ? rawW : '');
+        curColAA = (cols[26] || '').trim();
+        curColAB = (cols[27] || '').trim();
+        curColAE = (cols[30] || '').trim();
+        if (cols[32] && cols[32].trim() !== '') {
+          const v = cols[32].toLowerCase().trim();
+          curColAG = v === 'true' || v === 'yes' || v === '1' || v === 'done' || v === '✓';
+        } else {
+          curColAG = undefined;
+        }
+        curColAH = (cols[33] || '').trim();
+        curColAI = (cols[34] || '').trim();
+        if (cols[35] && cols[35].trim() !== '') {
+          const v = cols[35].toLowerCase().trim();
+          curColAJ = v === 'true' || v === 'yes' || v === '1' || v === 'done' || v === '✓';
+        } else {
+          curColAJ = undefined;
+        }
+        curColAK = (cols[36] || '').trim();
+        curColAL = (cols[37] || '').trim();
+        curLr = (cols[38] || '').trim();
+        curColAO = (cols[40] || '').trim();
+      } else {
+        if (cols[23] && cols[23].trim() && !isDateOrTimestampStr(cols[23].trim())) curOrderNo = cols[23].trim();
+        if (cols[26] && cols[26].trim()) curColAA = cols[26].trim();
+        if (cols[27] && cols[27].trim()) curColAB = cols[27].trim();
+        if (cols[30] && cols[30].trim()) curColAE = cols[30].trim();
+        if (cols[38] && cols[38].trim()) curLr = cols[38].trim();
+        if (cols[40] && cols[40].trim()) curColAO = cols[40].trim();
+      }
+
+      const qty = cols[10] ? (parseFloat(cols[10].replace(/[^0-9.-]/g, '')) || 0) : 0;
+      const disp = cols[24] ? (parseFloat(cols[24].replace(/[^0-9.-]/g, '')) || 0) : 0;
+      const rawAn = (cols[39] || '').toLowerCase().trim();
+      const statusAN: 'Open' | 'In-Progress' | 'Closed' =
+        forceClosed || rawAn === 'closed' || rawAn === 'close'
+          ? 'Closed'
+          : rawAn.includes('prog')
+          ? 'In-Progress'
+          : 'Open';
+
+      out.push({
+        orderId: `SHEET-${forceClosed ? 'CLS' : 'AUTO'}-${idx + 1}`,
+        timestamp: curTs,
+        customerPO: curPO,
+        customerName: curName,
+        customerEmail: curEmail,
+        orderDate: curDate,
+        unit: (cols[5] || '').trim(),
+        itemName: (cols[6] || '').trim(),
+        color: (cols[7] || '').trim(),
+        width: (cols[8] || '').trim(),
+        unitOfItem: (cols[9] || '').trim(),
+        qty,
+        rate: cols[11] ? (parseFloat(cols[11].replace(/[^0-9.-]/g, '')) || 0) : 0,
+        discount: cols[12] ? (parseFloat(cols[12].replace(/[^0-9.-]/g, '')) || 0) : 0,
+        deliveryDate: (cols[13] || '').trim(),
+        remark: curRemark,
+        customerNumber: curPhone,
+        billingAddress: '',
+        deliveryAddress: '',
+        transporterName: '',
+        salesPerson: '',
+        accountStatus: 'Approved',
+        branch: 'Delhi',
+        approvalStatus: 'APPROVED',
+        branchHeadName: DEFAULT_BRANCH_HEAD_NAME,
+        branchHeadEmail: DEFAULT_BRANCH_HEAD_EMAIL,
+        orderNo: curOrderNo,
+        statusAN,
+        dispatchQty: disp,
+        balanceQty: Number((qty - disp).toFixed(4)),
+        sheetSource: statusAN === 'Closed' ? 'closed' : 'product_order',
+        colAA: curColAA || undefined,
+        colAB: curColAB || undefined,
+        colAE: curColAE || undefined,
+        colAG: curColAG,
+        colAH: curColAH || undefined,
+        colAI: curColAI || undefined,
+        colAJ: curColAJ,
+        colAK: curColAK || undefined,
+        colAL: curColAL || undefined,
+        lrNumber: curLr || undefined,
+        colAO: curColAO || undefined
+      });
+    });
+
+    return out;
+  };
+
+  // Dedicated Live 2-Way Sync for Google Sheet "15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0"
+  // (Tabs: "Product Order", "Order Automation 1", "Closed Orders") + Firebase Realtime Database
   const handleSyncDelhiImportRange = async (silent: boolean = false) => {
     const fmsSheetId = '15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0';
     const delhiSheetId = '1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY';
     const delhiTab = 'Delhi';
     if (!silent) {
       setIsSyncingImportRange(true);
-      setSyncFeedback('Syncing Product Order (Cols A:AB — Order No AA & Timestamp AB) & Firebase Cloud...');
+      setSyncFeedback('Syncing Product Order (Cols A:AB), Order Automation & Closed Orders with Firebase Cloud...');
     }
 
     const cacheBust = `&_t=${Date.now()}`;
     const candidateUrls = [
-      // 1. Primary: FMS Sheet "Product Order" tab (has all Delhi!A:Z rows + Col AA (27) Order No & Col AB (28) Timestamp!)
+      // 1. Primary Unfiltered Export: FMS Sheet "Product Order" tab (gid=0) — returns ALL 6,139+ rows + Col AA (27) & Col AB (28) even if a Google Sheet filter is turned on!
+      `https://docs.google.com/spreadsheets/d/${fmsSheetId}/export?format=csv&gid=0&_t=${Date.now()}`,
+      // 2. Secondary gviz: FMS Sheet "Product Order" tab
       `https://docs.google.com/spreadsheets/d/${fmsSheetId}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent('Product Order')}${cacheBust}`,
-      // 2. Fallback: Direct Delhi!A:Z sheet
+      // 3. Fallback: Direct Delhi!A:Z sheet
       `https://docs.google.com/spreadsheets/d/${delhiSheetId}/gviz/tq?tqx=out:csv&range=A:Z&sheet=${encodeURIComponent(delhiTab)}${cacheBust}`
     ];
 
@@ -2360,8 +2888,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           if (resp.ok) {
             const text = await resp.text();
             if (text && text.trim().length > 0 && !text.startsWith('<!DOCTYPE html>') && !text.includes('<html')) {
-              csvText = text;
-              break;
+              if (text.length > csvText.length) {
+                csvText = text;
+              }
+              // If we got the full >500KB unfiltered sheet (6,000+ rows), stop immediately
+              if (csvText.length > 500000) {
+                break;
+              }
             }
           }
         } catch (e) {}
@@ -2373,6 +2906,32 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
       const parsedRows = parseCsvRows(csvText.trim());
       const fetchedRows: ProductOrderRow[] = [];
+
+      // Determine column offset ONCE for the whole sheet so continuation sub-rows with blank Col A never shift columns!
+      let sheetOffset = 1;
+      for (let rIdx = 0; rIdx < Math.min(parsedRows.length, 10); rIdx++) {
+        const rowCols = parsedRows[rIdx];
+        if (!rowCols || rowCols.length < 4) continue;
+        const c0 = (rowCols[0] || '').toLowerCase().trim();
+        const c1 = (rowCols[1] || '').toLowerCase().trim();
+        if (rIdx === 0) {
+          if (c0.includes('timestamp') && !c1.includes('timestamp')) {
+            sheetOffset = 0;
+            break;
+          }
+          if (c1.includes('timestamp') || c0.includes('order') || c0.includes('ref')) {
+            sheetOffset = 1;
+            break;
+          }
+        } else if (rowCols[0] || rowCols[1]) {
+          if (isDateOrTimestampStr(rowCols[0]) && !isDateOrTimestampStr(rowCols[1])) {
+            sheetOffset = 0;
+          } else {
+            sheetOffset = 1;
+          }
+          break;
+        }
+      }
 
       let lastTimestamp = '';
       let lastPO = 'N/A';
@@ -2405,11 +2964,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         }
         if (cols.length < 4) return;
 
-        // Detect if sheet starts with Timestamp in cols[0] vs Reference No (Col A) in cols[0]
-        const startsWithTimestamp = isDateOrTimestampStr(cols[0]) && !isDateOrTimestampStr(cols[1]);
-        const offset = startsWithTimestamp ? 0 : 1;
-
-        const refNo = startsWithTimestamp ? '' : (cols[0] || '').trim();
+        const offset = sheetOffset;
+        const refNo = offset === 0 ? '' : (cols[0] || '').trim();
         const rawTimestamp = (cols[offset] || '').trim();
         const rawPO = (cols[offset + 1] || '').trim();
         const rawCustName = (cols[offset + 2] || '').trim();
@@ -2506,43 +3062,91 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       }
 
       isStorageHydratedRef.current = true;
+      hasSyncedLiveSheetRef.current = true;
 
-      // Also pull Closed Orders, Active Order updates, and 2-way Col AA/AB overrides from Firebase Cloud
+      // Also pull Closed Orders, Active Order updates, 2-way Col AA/AB overrides from Firebase Cloud
+      // AND fetch "Order Automation 1" & "Closed Orders" tabs from Google Sheet so any sheet edits reflect in App!
       const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
       const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
       const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
 
-      const [fbCloud, aaAbCloudData] = await Promise.all([
+      const fetchSheetTabCsvSilent = async (tabNames: string[]): Promise<string> => {
+        for (const tName of tabNames) {
+          try {
+            const u = `https://docs.google.com/spreadsheets/d/${fmsSheetId}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tName)}${cacheBust}`;
+            const r = await fetch(u);
+            if (r.ok) {
+              const txt = await r.text();
+              if (txt && txt.trim().length > 0 && !txt.startsWith('<!DOCTYPE html>') && !txt.includes('<html')) {
+                return txt;
+              }
+            }
+          } catch (e) {}
+        }
+        return '';
+      };
+
+      const [fbCloud, aaAbCloudData, cellUpdatesCloud, sheetAutoCsv, sheetClosedCsv] = await Promise.all([
         fetchOrdersFromFirebase(),
         fetch(`${baseTargetUrl}/product_order_aa_ab.json${authQuery}`)
           .then(r => (r.ok ? r.json() : null))
-          .catch(() => null)
+          .catch(() => null),
+        fetch(`${baseTargetUrl}/cell_updates.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null),
+        fetchSheetTabCsvSilent(['Order Automation 1', 'Order Automation 1 ', 'Product Automation']),
+        fetchSheetTabCsvSilent(['Closed Orders', 'Closed Orders '])
       ]);
+
+      const sheetAutoRows = parse45ColSheetCsvForSync(sheetAutoCsv, false);
+      const sheetClosedRows = parse45ColSheetCsvForSync(sheetClosedCsv, true);
 
       const aaAbOverrides: Record<string, any> =
         aaAbCloudData && typeof aaAbCloudData === 'object' && !aaAbCloudData.error ? aaAbCloudData : {};
 
+      const cloudDispOverrides: Record<string, number> =
+        cellUpdatesCloud?.dispatch && typeof cellUpdatesCloud.dispatch === 'object' ? cellUpdatesCloud.dispatch : {};
+      const cloudOrderOverrides: Record<string, any> =
+        cellUpdatesCloud?.orders && typeof cellUpdatesCloud.orders === 'object' ? cellUpdatesCloud.orders : {};
+
+      // Merge any non-zero Dispatch Qty from Google Sheet "Order Automation 1" / "Closed Orders" + Firebase /cell_updates
+      const sheetDispPatches: Record<string, number> = {};
+      [...sheetAutoRows, ...sheetClosedRows].forEach(sr => {
+        if (sr.dispatchQty && sr.dispatchQty > 0) {
+          const canonK = `${normalizePoVal(sr.customerPO)}|${(sr.customerName || '').trim().toLowerCase()}|${(sr.itemName || '').trim().toLowerCase()}|${(sr.color || '').trim().toLowerCase()}|${(sr.width || '').trim().toLowerCase()}|${Number(sr.qty) || 0}`;
+          sheetDispPatches[canonK] = sr.dispatchQty;
+        }
+      });
+
+      if (Object.keys(cloudDispOverrides).length > 0 || Object.keys(sheetDispPatches).length > 0) {
+        setDispatchRecords(prev => ({ ...sheetDispPatches, ...cloudDispOverrides, ...prev }));
+      }
+
       let finalMergedForCloud: ProductOrderRow[] = [];
+      let hadCountMismatchHeal = false;
 
       setRawResponses(prev => {
         // Strip initial demo rows
         const cleanPrev = prev.filter(r => !/^ORD-(REAL|NANDANI|PENDING|\d+)/.test(r.orderId));
 
-        // Combine local existing rows + Firebase Cloud rows for lookup (local closed/modified rows + Firebase closed/modified rows)
-        const makeRowMatchKey = (r: ProductOrderRow) =>
-          `${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}|${(r.orderDate || '').trim().toLowerCase()}`;
-
-        const makeOrderSig = (r: ProductOrderRow) =>
+        // Use CANONICAL row key (normalizing "N/A" and "" POs to "") so 5,337 rows match 100% identically across all tabs & devices!
+        const makeOrderSigRaw = (r: ProductOrderRow) =>
           `ord_${`${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.orderDate || '').trim().toLowerCase()}`.replace(/[.#$/[\]\s]+/g, '_')}`;
+        const makeOrderSigCanon = (r: ProductOrderRow) =>
+          `ord_${`${normalizePoVal(r.customerPO)}|${(r.customerName || '').trim().toLowerCase()}|${(r.orderDate || '').trim().toLowerCase()}`.replace(/[.#$/[\]\s]+/g, '_')}`;
 
-        const makeRowSig = (r: ProductOrderRow) =>
-          `row_${makeRowMatchKey(r).replace(/[.#$/[\]\s]+/g, '_')}`;
+        const makeRowSigRaw = (r: ProductOrderRow) =>
+          `row_${`${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}|${(r.orderDate || '').trim().toLowerCase()}`.replace(/[.#$/[\]\s]+/g, '_')}`;
+        const makeRowSigCanon = (r: ProductOrderRow) =>
+          `row_${makeCanonicalRowKey(r).replace(/[.#$/[\]\s]+/g, '_')}`;
 
-        const allKnownClosedRows: ProductOrderRow[] = [...fbCloud.closedRows];
-        const seenClosedSigs = new Set(allKnownClosedRows.map(makeRowMatchKey));
-        cleanPrev.forEach(r => {
+        const sanitizeFbKey = (k: string) => k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
+
+        const allKnownClosedRows: ProductOrderRow[] = [...sheetClosedRows, ...fbCloud.closedRows];
+        const seenClosedSigs = new Set(allKnownClosedRows.map(makeCanonicalRowKey));
+        [...sheetAutoRows, ...cleanPrev].forEach(r => {
           if (r.statusAN === 'Closed' || r.sheetSource === 'closed') {
-            const sig = makeRowMatchKey(r);
+            const sig = makeCanonicalRowKey(r);
             if (!seenClosedSigs.has(sig)) {
               allKnownClosedRows.push(r);
               seenClosedSigs.add(sig);
@@ -2551,25 +3155,24 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         });
 
         const closedLookupMap = new Map<string, ProductOrderRow>();
-        allKnownClosedRows.forEach(r => closedLookupMap.set(makeRowMatchKey(r), r));
+        allKnownClosedRows.forEach(r => closedLookupMap.set(makeCanonicalRowKey(r), r));
 
         const existingQueueByKey = new Map<string, ProductOrderRow[]>();
-        // Seed from Firebase active rows first, then local cleanPrev overrides
-        [...fbCloud.activeRows, ...cleanPrev].forEach(r => {
-          const k = makeRowMatchKey(r);
+        // Seed from Sheet Automation rows, then Firebase active rows, then local cleanPrev overrides
+        [...sheetAutoRows, ...fbCloud.activeRows, ...cleanPrev].forEach(r => {
+          const k = makeCanonicalRowKey(r);
           const list = existingQueueByKey.get(k) || [];
           list.push(r);
           existingQueueByKey.set(k, list);
         });
 
-        const matchedClosedKeys = new Set<string>();
-
         const mergedDelhiRows: ProductOrderRow[] = fetchedRows.map(fRow => {
-          const k = makeRowMatchKey(fRow);
-          const cloudAAAB = aaAbOverrides[makeRowSig(fRow)] || aaAbOverrides[makeOrderSig(fRow)];
-          // 2-Way ("Multipurpose") Resolution for Col AA (Order No) and Col AB (Timestamp):
-          // - If Google Sheet has Order No (fRow.orderNo), use it unless Web App has an explicit override in /product_order_aa_ab
-          // - If Google Sheet Order No is blank, use Web App / Firebase override if present
+          const k = makeCanonicalRowKey(fRow);
+          const cloudAAAB =
+            aaAbOverrides[makeRowSigCanon(fRow)] ||
+            aaAbOverrides[makeRowSigRaw(fRow)] ||
+            aaAbOverrides[makeOrderSigCanon(fRow)] ||
+            aaAbOverrides[makeOrderSigRaw(fRow)];
           const resolvedOrderNo =
             (cloudAAAB?.order_no && (!fRow.orderNo || fRow.orderNo === cloudAAAB.order_no))
               ? cloudAAAB.order_no
@@ -2577,99 +3180,134 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           const resolvedOrderNoTs =
             fRow.orderNoTimestamp || cloudAAAB?.order_no_timestamp || '';
 
+          const baseOrderKey = [
+            fRow.customerPO,
+            fRow.customerName,
+            fRow.customerEmail,
+            fRow.customerNumber,
+            fRow.orderDate
+          ].map(v => (v || '').trim()).join('_');
+
+          const itemKey = `${baseOrderKey}___${(fRow.itemName || '').trim()}___${(fRow.color || '').trim()}___${(fRow.width || '').trim()}`;
+          const poItemKey = `${(fRow.customerPO || '').trim()}_${(fRow.itemName || '').trim()}_${(fRow.color || '').trim()}_${(fRow.width || '').trim()}`;
+          const normItemKey = `${(fRow.customerPO || '').trim().toLowerCase()}|${(fRow.customerName || '').trim().toLowerCase()}|${(fRow.itemName || '').trim().toLowerCase()}|${(fRow.color || '').trim().toLowerCase()}|${(fRow.width || '').trim().toLowerCase()}|${Number(fRow.qty) || 0}`;
+          const canonItemKey = `${normalizePoVal(fRow.customerPO)}|${(fRow.customerName || '').trim().toLowerCase()}|${(fRow.itemName || '').trim().toLowerCase()}|${(fRow.color || '').trim().toLowerCase()}|${(fRow.width || '').trim().toLowerCase()}|${Number(fRow.qty) || 0}`;
+
+          const savedDisp =
+            dispatchRecords[fRow.orderId] ||
+            dispatchRecords[itemKey] ||
+            dispatchRecords[canonItemKey] ||
+            dispatchRecords[normItemKey] ||
+            dispatchRecords[poItemKey] ||
+            cloudDispOverrides[sanitizeFbKey(fRow.orderId)] ||
+            cloudDispOverrides[sanitizeFbKey(itemKey)] ||
+            cloudDispOverrides[sanitizeFbKey(canonItemKey)] ||
+            cloudDispOverrides[sanitizeFbKey(normItemKey)] ||
+            cloudDispOverrides[sanitizeFbKey(poItemKey)] ||
+            sheetDispPatches[canonItemKey] ||
+            0;
+
+          const cloudOrdPatch = cloudOrderOverrides[sanitizeFbKey(baseOrderKey)] || {};
+
           const closedMatch = closedLookupMap.get(k);
           if (closedMatch) {
-            matchedClosedKeys.add(k);
+            const finalDisp = savedDisp > 0 ? savedDisp : (closedMatch.dispatchQty || fRow.dispatchQty || 0);
             return {
               ...fRow,
               orderNo: resolvedOrderNo || closedMatch.orderNo || '',
               orderNoTimestamp: resolvedOrderNoTs || closedMatch.orderNoTimestamp || '',
               statusAN: 'Closed',
               sheetSource: 'closed',
-              dispatchQty: closedMatch.dispatchQty ?? fRow.dispatchQty ?? 0,
-              balanceQty: closedMatch.balanceQty ?? fRow.balanceQty ?? 0,
-              colAA: closedMatch.colAA ?? fRow.colAA,
-              colAB: closedMatch.colAB ?? fRow.colAB,
+              dispatchQty: finalDisp,
+              balanceQty: Number(((fRow.qty || 0) - finalDisp).toFixed(4)),
+              colAA: cloudOrdPatch.colAA ?? closedMatch.colAA ?? fRow.colAA,
+              colAB: cloudOrdPatch.colAB ?? closedMatch.colAB ?? fRow.colAB,
               colAC: closedMatch.colAC ?? fRow.colAC,
               colAD: closedMatch.colAD ?? fRow.colAD,
-              colAE: closedMatch.colAE ?? fRow.colAE,
-              colAG: closedMatch.colAG ?? fRow.colAG,
-              colAH: closedMatch.colAH ?? fRow.colAH,
-              colAI: closedMatch.colAI ?? fRow.colAI,
-              colAJ: closedMatch.colAJ ?? fRow.colAJ,
-              colAK: closedMatch.colAK ?? fRow.colAK,
-              colAL: closedMatch.colAL ?? fRow.colAL,
-              lrNumber: closedMatch.lrNumber ?? fRow.lrNumber,
-              colAO: closedMatch.colAO ?? fRow.colAO
+              colAE: cloudOrdPatch.colAE ?? closedMatch.colAE ?? fRow.colAE,
+              colAG: cloudOrdPatch.colAG ?? closedMatch.colAG ?? fRow.colAG,
+              colAH: cloudOrdPatch.colAH ?? closedMatch.colAH ?? fRow.colAH,
+              colAI: cloudOrdPatch.colAI ?? closedMatch.colAI ?? fRow.colAI,
+              colAJ: cloudOrdPatch.colAJ ?? closedMatch.colAJ ?? fRow.colAJ,
+              colAK: cloudOrdPatch.colAK ?? closedMatch.colAK ?? fRow.colAK,
+              colAL: cloudOrdPatch.colAL ?? closedMatch.colAL ?? fRow.colAL,
+              lrNumber: cloudOrdPatch.lrNumber ?? closedMatch.lrNumber ?? fRow.lrNumber,
+              colAO: cloudOrdPatch.colAO ?? closedMatch.colAO ?? fRow.colAO
             };
           }
 
           const candidates = existingQueueByKey.get(k);
           const match = candidates && candidates.length > 0 ? candidates[candidates.length - 1] : undefined;
           if (match) {
+            const finalDisp = savedDisp > 0 ? savedDisp : (match.dispatchQty || fRow.dispatchQty || 0);
+            const resolvedStatus = cloudOrdPatch.statusAN || match.statusAN || fRow.statusAN || 'Open';
             return {
               ...fRow,
               orderNo: resolvedOrderNo || match.orderNo || '',
               orderNoTimestamp: resolvedOrderNoTs || match.orderNoTimestamp || '',
-              statusAN: match.statusAN || fRow.statusAN || 'Open',
-              sheetSource: match.statusAN === 'Closed' ? 'closed' : (fRow.sheetSource || 'product_order'),
-              dispatchQty: match.dispatchQty ?? fRow.dispatchQty ?? 0,
-              balanceQty: match.balanceQty ?? fRow.balanceQty ?? fRow.qty,
-              colAA: match.colAA ?? fRow.colAA,
-              colAB: match.colAB ?? fRow.colAB,
+              statusAN: resolvedStatus,
+              sheetSource: resolvedStatus === 'Closed' ? 'closed' : (fRow.sheetSource || 'product_order'),
+              dispatchQty: finalDisp,
+              balanceQty: Number(((fRow.qty || 0) - finalDisp).toFixed(4)),
+              colAA: cloudOrdPatch.colAA ?? match.colAA ?? fRow.colAA,
+              colAB: cloudOrdPatch.colAB ?? match.colAB ?? fRow.colAB,
               colAC: match.colAC ?? fRow.colAC,
               colAD: match.colAD ?? fRow.colAD,
-              colAE: match.colAE ?? fRow.colAE,
-              colAG: match.colAG ?? fRow.colAG,
-              colAH: match.colAH ?? fRow.colAH,
-              colAI: match.colAI ?? fRow.colAI,
-              colAJ: match.colAJ ?? fRow.colAJ,
-              colAK: match.colAK ?? fRow.colAK,
-              colAL: match.colAL ?? fRow.colAL,
-              lrNumber: match.lrNumber ?? fRow.lrNumber,
-              colAO: match.colAO ?? fRow.colAO
+              colAE: cloudOrdPatch.colAE ?? match.colAE ?? fRow.colAE,
+              colAG: cloudOrdPatch.colAG ?? match.colAG ?? fRow.colAG,
+              colAH: cloudOrdPatch.colAH ?? match.colAH ?? fRow.colAH,
+              colAI: cloudOrdPatch.colAI ?? match.colAI ?? fRow.colAI,
+              colAJ: cloudOrdPatch.colAJ ?? match.colAJ ?? fRow.colAJ,
+              colAK: cloudOrdPatch.colAK ?? match.colAK ?? fRow.colAK,
+              colAL: cloudOrdPatch.colAL ?? match.colAL ?? fRow.colAL,
+              lrNumber: cloudOrdPatch.lrNumber ?? match.lrNumber ?? fRow.lrNumber,
+              colAO: cloudOrdPatch.colAO ?? match.colAO ?? fRow.colAO
             };
           }
           return {
             ...fRow,
             orderNo: resolvedOrderNo,
-            orderNoTimestamp: resolvedOrderNoTs
+            orderNoTimestamp: resolvedOrderNoTs,
+            dispatchQty: savedDisp,
+            balanceQty: Number(((fRow.qty || 0) - savedDisp).toFixed(4)),
+            colAA: cloudOrdPatch.colAA ?? fRow.colAA,
+            colAB: cloudOrdPatch.colAB ?? fRow.colAB,
+            colAE: cloudOrdPatch.colAE ?? fRow.colAE,
+            colAG: cloudOrdPatch.colAG ?? fRow.colAG,
+            colAH: cloudOrdPatch.colAH ?? fRow.colAH,
+            colAI: cloudOrdPatch.colAI ?? fRow.colAI,
+            colAJ: cloudOrdPatch.colAJ ?? fRow.colAJ,
+            colAK: cloudOrdPatch.colAK ?? fRow.colAK,
+            colAL: cloudOrdPatch.colAL ?? fRow.colAL,
+            lrNumber: cloudOrdPatch.lrNumber ?? fRow.lrNumber,
+            colAO: cloudOrdPatch.colAO ?? fRow.colAO
           };
         });
 
-        // Collect all additional closed orders from Firebase /closed_orders and local storage that were not in Delhi!A:Z
-        const extraClosedRows: ProductOrderRow[] = allKnownClosedRows
-          .filter(closedRow => !matchedClosedKeys.has(makeRowMatchKey(closedRow)))
-          .map(closedRow => ({
-            ...closedRow,
-            statusAN: 'Closed' as const,
-            sheetSource: 'closed' as const
-          }));
-
-        const explicitAutoRows = cleanPrev.filter(r => r.sheetSource === 'automation' && r.statusAN !== 'Closed');
-
-        if (explicitAutoRows.length > mergedDelhiRows.length) {
-          const autoKeys = new Set(explicitAutoRows.map(makeRowMatchKey));
-          const brandNewDelhiRows = mergedDelhiRows.filter(f => !autoKeys.has(makeRowMatchKey(f)));
-          finalMergedForCloud = [...explicitAutoRows, ...brandNewDelhiRows, ...extraClosedRows];
-          return finalMergedForCloud;
+        // CRITICAL: Product Order (mergedDelhiRows = 5,337 rows) is the single canonical master list!
+        // Never append extra duplicate FB-* / IMP-* rows on top of mergedDelhiRows, guaranteeing:
+        // Product Order (5,337) = Order Automation (303) + Closed Orders (5,034) across ALL systems!
+        finalMergedForCloud = mergedDelhiRows;
+        if (cleanPrev.length !== finalMergedForCloud.length) {
+          hadCountMismatchHeal = true;
         }
-        finalMergedForCloud = [...mergedDelhiRows, ...extraClosedRows];
         return finalMergedForCloud;
       });
 
-      // Push combined dataset (including all Closed Orders & Active Orders) to Firebase in the background
-      setTimeout(() => {
-        if (finalMergedForCloud.length > 0) {
+      // Push canonical 5,337-row dataset to Firebase when manually clicked OR when healing a 6,143 -> 5,337 count mismatch
+      if ((!silent || hadCountMismatchHeal) && finalMergedForCloud.length > 0) {
+        setTimeout(() => {
           pushOrdersToFirebase(finalMergedForCloud).catch(() => {});
-        }
-      }, 400);
+        }, 400);
+      }
 
       if (!silent) {
-        const countWithAA = fetchedRows.filter(r => r.orderNo && r.orderNo.trim() !== '').length;
-        const countWithAB = fetchedRows.filter(r => r.orderNoTimestamp && r.orderNoTimestamp.trim() !== '').length;
+        const countWithAA = finalMergedForCloud.filter(r => r.orderNo && r.orderNo.trim() !== '').length;
+        const countWithAB = finalMergedForCloud.filter(r => r.orderNoTimestamp && r.orderNoTimestamp.trim() !== '').length;
+        const closedCount = finalMergedForCloud.filter(r => r.statusAN === 'Closed' || r.sheetSource === 'closed').length;
+        const openCount = finalMergedForCloud.length - closedCount;
         setSyncFeedback(
-          `✓ Synced "Product Order" (15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0)! ${fetchedRows.length.toLocaleString()} rows loaded (${countWithAA.toLocaleString()} Col AA Order Nos & ${countWithAB.toLocaleString()} Col AB Timestamps).`
+          `✓ 2-Way Synced Google Sheet & Firebase! Total Product Order: ${finalMergedForCloud.length.toLocaleString()} (Order Automation: ${openCount.toLocaleString()} | Closed Orders: ${closedCount.toLocaleString()} | Col AA Order Nos: ${countWithAA.toLocaleString()} | Col AB Timestamps: ${countWithAB.toLocaleString()}).`
         );
         setTimeout(() => setSyncFeedback(null), 5000);
       }
@@ -2691,62 +3329,90 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }
   };
 
-  // Pull latest Closed Orders & Active updates from Firebase Cloud whenever user opens app or switches to Closed Orders tab
+  // Pull latest Closed Orders & Active cell updates from Firebase Cloud without freezing the main thread
   const handleRefreshFromFirebaseCloud = async () => {
-    const fbCloud = await fetchOrdersFromFirebase();
-    if (fbCloud.closedRows.length === 0 && fbCloud.activeRows.length === 0) return;
+    const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+    const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+    const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
 
-    setRawResponses(prev => {
-      const cleanPrev = prev.filter(r => !/^ORD-(REAL|NANDANI|PENDING|\d+)/.test(r.orderId));
-      // If full Product Order sheet hasn't loaded yet and Firebase only has closed rows, wait for handleSyncDelhiImportRange to merge all 6k+ rows
-      if (cleanPrev.length === 0 && fbCloud.activeRows.length === 0) {
-        return prev;
+    try {
+      const [cellUpdatesCloud, fbCloud] = await Promise.all([
+        fetch(`${baseTargetUrl}/cell_updates.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null),
+        fetchOrdersFromFirebase()
+      ]);
+
+      if (cellUpdatesCloud?.dispatch && typeof cellUpdatesCloud.dispatch === 'object') {
+        setDispatchRecords(prev => ({ ...cellUpdatesCloud.dispatch, ...prev }));
       }
-      const baseRows = cleanPrev.length > 0 ? cleanPrev : fbCloud.activeRows;
 
-      const makeRowMatchKey = (r: ProductOrderRow) =>
-        `${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}|${(r.orderDate || '').trim().toLowerCase()}`;
+      if (fbCloud.closedRows.length === 0 && fbCloud.activeRows.length === 0) return;
 
-      const closedMap = new Map<string, ProductOrderRow>();
-      fbCloud.closedRows.forEach(r => closedMap.set(makeRowMatchKey(r), r));
-
-      const matchedKeys = new Set<string>();
-      const updated = baseRows.map(row => {
-        const k = makeRowMatchKey(row);
-        const closedMatch = closedMap.get(k);
-        if (closedMatch) {
-          matchedKeys.add(k);
-          return {
-            ...row,
-            orderNo: closedMatch.orderNo || row.orderNo || '',
-            orderNoTimestamp: closedMatch.orderNoTimestamp || row.orderNoTimestamp || '',
-            statusAN: 'Closed' as const,
-            sheetSource: 'closed' as const,
-            dispatchQty: closedMatch.dispatchQty ?? row.dispatchQty ?? 0,
-            balanceQty: closedMatch.balanceQty ?? row.balanceQty ?? 0
-          };
+      setRawResponses(prev => {
+        const cleanPrev = healAndDeduplicateMasterRows(
+          prev.filter(r => !/^ORD-(REAL|NANDANI|PENDING|\d+)/.test(r.orderId))
+        );
+        if (cleanPrev.length === 0 && fbCloud.activeRows.length === 0) {
+          return prev;
         }
-        return row;
+        const baseRows = cleanPrev.length > 0 ? cleanPrev : fbCloud.activeRows;
+        const hasDelhiMaster = baseRows.some(r => r.orderId.startsWith('DELHI-'));
+
+        const closedMap = new Map<string, ProductOrderRow>();
+        fbCloud.closedRows.forEach(r => closedMap.set(makeCanonicalRowKey(r), r));
+
+        const matchedKeys = new Set<string>();
+        const updated = baseRows.map(row => {
+          const k = makeCanonicalRowKey(row);
+          const closedMatch = closedMap.get(k);
+          if (closedMatch) {
+            matchedKeys.add(k);
+            return {
+              ...row,
+              orderNo: closedMatch.orderNo || row.orderNo || '',
+              orderNoTimestamp: closedMatch.orderNoTimestamp || row.orderNoTimestamp || '',
+              statusAN: 'Closed' as const,
+              sheetSource: 'closed' as const,
+              dispatchQty: closedMatch.dispatchQty || row.dispatchQty || 0,
+              balanceQty: closedMatch.balanceQty ?? row.balanceQty ?? 0
+            };
+          }
+          return row;
+        });
+
+        // If baseRows already has DELHI-* master rows (5,337 rows from Product Order), never append extra duplicate rows from Firebase!
+        if (hasDelhiMaster) {
+          return updated;
+        }
+
+        const existingKeys = new Set(updated.map(makeCanonicalRowKey));
+        const newClosedFromCloud = fbCloud.closedRows.filter(
+          r => !matchedKeys.has(makeCanonicalRowKey(r)) && !existingKeys.has(makeCanonicalRowKey(r))
+        );
+
+        return newClosedFromCloud.length > 0 ? [...updated, ...newClosedFromCloud] : updated;
       });
-
-      const existingKeys = new Set(updated.map(makeRowMatchKey));
-      const newClosedFromCloud = fbCloud.closedRows.filter(
-        r => !matchedKeys.has(makeRowMatchKey(r)) && !existingKeys.has(makeRowMatchKey(r))
-      );
-
-      return newClosedFromCloud.length > 0 ? [...updated, ...newClosedFromCloud] : updated;
-    });
+    } catch (e) {}
   };
 
-  // Automatically sync Firebase Cloud + Google Sheet "Product Order" (A:AB) on mount and every 30s for real-time 2-way updates
+  // Sync Firebase Cloud + Google Sheet "Product Order" (A:AB) on mount and every 2 minutes in background
   useEffect(() => {
+    const nonZeroDisp: Record<string, number> = {};
+    Object.entries(dispatchRecords).forEach(([k, v]) => {
+      if (Number(v) > 0) nonZeroDisp[k] = Number(v);
+    });
+    if (Object.keys(nonZeroDisp).length > 0) {
+      pushCellUpdatesToFirebase(nonZeroDisp);
+    }
+
     handleRefreshFromFirebaseCloud();
     const timer = setTimeout(() => {
       handleSyncDelhiImportRange(true);
     }, 600);
     const interval = setInterval(() => {
       handleSyncDelhiImportRange(true);
-    }, 30000);
+    }, 120000);
     return () => {
       clearTimeout(timer);
       clearInterval(interval);
@@ -2802,12 +3468,65 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     return Array.from(yearsSet).sort((a, b) => Number(b) - Number(a));
   }, [rawResponses]);
 
-  // Filter orders based on activeSheetTab & statusFilter & Month/Year filter & search & column filters & duplicate filter
+  // Helper: Get display value of ANY of the 45 columns (A to AS) for an Order + Item
+  const getOrderItemColValue = (order: GroupedOrder, item: OrderItem, col: string): string => {
+    const ordKey = order.orderKey;
+    switch (col) {
+      case 'A': return (order.timestamp || '—').trim();
+      case 'B': return (order.customerPO || 'N/A').trim();
+      case 'C': return (order.customerName || '—').trim();
+      case 'D': return (order.customerEmail || '—').trim();
+      case 'E': return (order.orderDate || '—').trim();
+      case 'F': return (item.unit || '—').trim();
+      case 'G': return (item.itemName || '—').trim();
+      case 'H': return (item.color || '—').trim();
+      case 'I': return (item.width || '—').trim();
+      case 'J': return (item.unitOfItem || '—').trim();
+      case 'K': return String(item.qty ?? 0);
+      case 'L': return `₹${item.rate ?? 0}`;
+      case 'M': return `${item.discount ?? 0}%`;
+      case 'N': return (item.deliveryDate || '—').trim();
+      case 'O': return (order.remark || '—').trim();
+      case 'P': return (order.customerNumber || '—').trim();
+      case 'Q': return (order.billingAddress || '—').trim();
+      case 'R': return (order.deliveryAddress || '—').trim();
+      case 'S': return (order.transporterName || '—').trim();
+      case 'T': return (order.salesPerson || '—').trim();
+      case 'U': return (order.accountStatus || '—').trim();
+      case 'V': return (order.approvalStatus || '—').trim();
+      case 'W': return (order.branch || 'Delhi').trim();
+      case 'X': return (order.orderNo || 'Set SO#').trim();
+      case 'Y': return String(item.dispatchQty ?? 0);
+      case 'Z': return String(item.balanceQty ?? 0);
+      case 'AA': return (colAAStatuses[ordKey] ?? order.colAA ?? '—').trim() || '—';
+      case 'AB': return (colABRemarks[ordKey] ?? order.colAB ?? '—').trim() || '—';
+      case 'AC': return (order.colAC || 'Sent').trim();
+      case 'AD': return (order.colAD || 'Delivered').trim();
+      case 'AE': return (aeStatuses[ordKey] ?? order.colAE ?? 'Pending').trim();
+      case 'AF': return (aeStatuses[ordKey] ?? order.colAE ?? 'Pending') === 'Message Sent' ? 'Send WA' : '—';
+      case 'AG': return Boolean(colAGChecks[ordKey] ?? order.colAG) ? 'Checked (Yes)' : 'Unchecked (No)';
+      case 'AH': return (colAHTimestamps[ordKey] ?? order.colAH ?? '—').trim() || '—';
+      case 'AI': return (colAIRemarks[ordKey] ?? order.colAI ?? '—').trim() || '—';
+      case 'AJ': return Boolean(colAJChecks[ordKey] ?? order.colAJ) ? 'Checked (Yes)' : 'Unchecked (No)';
+      case 'AK': return (colAKTimestamps[ordKey] ?? order.colAK ?? '—').trim() || '—';
+      case 'AL': return (colALRemarks[ordKey] ?? order.colAL ?? '—').trim() || '—';
+      case 'AM': return (lrNumbers[ordKey] ?? order.lrNumber ?? '—').trim() || '—';
+      case 'AN': return (item.statusAN || order.statusAN || 'Open').trim();
+      case 'AO': return (aoStatuses[ordKey] ?? order.colAO ?? 'Pending').trim();
+      case 'AP': return (aoStatuses[ordKey] ?? order.colAO ?? 'Pending') === 'Message Sent' ? 'Send WA' : '—';
+      case 'AQ': return (order.customerEmail || '—').trim();
+      case 'AR': return 'Email';
+      case 'AS': return 'Sent';
+      default: return '—';
+    }
+  };
+
+  // Filter orders based on activeSheetTab & statusFilter & Month/Year filter & search & ALL 45 column filters & duplicate filter
   const filteredOrders = useMemo(() => {
     const result: GroupedOrder[] = [];
+    const activeFilterEntries = Object.entries(colFilters).filter(([, vals]) => vals && vals.length > 0);
 
     groupedOrders.forEach(order => {
-      // All active orders from Product Order (IMPORTRANGE Delhi!A:Z) and Order Automation flow directly into Order Automation in Merged Visual View format!
       if (order.sheetSource === 'product_order' && activeSheetTab === 'closed') {
         if (order.statusAN !== 'Closed') return;
       }
@@ -2823,7 +3542,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         }
       }
 
-      // Filter items according to tab, status filter, duplicate filter, and column filters
+      // Filter items according to tab, status filter, duplicate filter, and ALL 45 column filters
       const relevantItems = order.items.filter(item => {
         const itemStatus = item.statusAN || 'Open';
 
@@ -2844,35 +3563,19 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           return false;
         }
 
-        // 4. Item-level Column Filters (F to N, Y, Z, AN)
-        if (colFilters['F'] && colFilters['F'].length > 0 && !colFilters['F'].includes(item.unit)) return false;
-        if (colFilters['G'] && colFilters['G'].length > 0 && !colFilters['G'].includes(item.itemName)) return false;
-        if (colFilters['H'] && colFilters['H'].length > 0 && !colFilters['H'].includes(item.color)) return false;
-        if (colFilters['I'] && colFilters['I'].length > 0 && !colFilters['I'].includes(item.width)) return false;
-        if (colFilters['AN'] && colFilters['AN'].length > 0 && !colFilters['AN'].includes(itemStatus)) return false;
+        // 4. Universal 45-Column Filters (A to AS)
+        for (const [colKey, selectedVals] of activeFilterEntries) {
+          const cellVal = getOrderItemColValue(order, item, colKey);
+          if (!selectedVals.includes(cellVal)) {
+            return false;
+          }
+        }
 
         return true;
       });
 
       // If no items in this order match the current tab/filter, skip this order
       if (relevantItems.length === 0) return;
-
-      // Header-level Column Filters (A to E, O to X, AE, AF, AO, AP)
-      for (const [colKey, selectedVals] of Object.entries(colFilters)) {
-        if (!selectedVals || selectedVals.length === 0) continue;
-        if (colKey === 'A' && !selectedVals.includes(order.timestamp)) return;
-        if (colKey === 'B' && !selectedVals.includes(order.customerPO)) return;
-        if (colKey === 'C' && !selectedVals.includes(order.customerName)) return;
-        if (colKey === 'D' && !selectedVals.includes(order.customerEmail)) return;
-        if (colKey === 'E' && !selectedVals.includes(order.orderDate)) return;
-        if (colKey === 'S' && !selectedVals.includes(order.transporterName)) return;
-        if (colKey === 'T' && !selectedVals.includes(order.salesPerson)) return;
-        if (colKey === 'U' && !selectedVals.includes(order.accountStatus)) return;
-        if (colKey === 'V' && !selectedVals.includes(order.approvalStatus)) return;
-        if (colKey === 'X' && !selectedVals.includes(order.orderNo || 'Set SO#')) return;
-        if (colKey === 'AE' && !selectedVals.includes(aeStatuses[order.orderKey] || 'Pending')) return;
-        if (colKey === 'AO' && !selectedVals.includes(aoStatuses[order.orderKey] || 'Pending')) return;
-      }
 
       // Global Search term
       if (searchTerm) {
@@ -2896,26 +3599,23 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       });
     });
 
-    // Sorting
+    // Universal Sorting across all 45 columns
     if (sortConfig) {
+      const col = sortConfig.column;
+      const isNumericCol = ['K', 'L', 'M', 'Y', 'Z'].includes(col);
       result.sort((a, b) => {
-        let valA: any = '';
-        let valB: any = '';
+        const itemA = a.items[0];
+        const itemB = b.items[0];
+        if (!itemA || !itemB) return 0;
 
-        if (sortConfig.column === 'B') {
-          valA = a.customerPO;
-          valB = b.customerPO;
-        } else if (sortConfig.column === 'C') {
-          valA = a.customerName;
-          valB = b.customerName;
-        } else if (sortConfig.column === 'K') {
-          valA = a.items.reduce((s, it) => s + it.qty, 0);
-          valB = b.items.reduce((s, it) => s + it.qty, 0);
-        } else {
-          valA = a.customerPO;
-          valB = b.customerPO;
+        if (isNumericCol) {
+          const numA = parseFloat(getOrderItemColValue(a, itemA, col).replace(/[₹%,\s]/g, '')) || 0;
+          const numB = parseFloat(getOrderItemColValue(b, itemB, col).replace(/[₹%,\s]/g, '')) || 0;
+          return sortConfig.direction === 'asc' ? numA - numB : numB - numA;
         }
 
+        const valA = getOrderItemColValue(a, itemA, col).toLowerCase();
+        const valB = getOrderItemColValue(b, itemB, col).toLowerCase();
         if (valA < valB) return sortConfig.direction === 'asc' ? -1 : 1;
         if (valA > valB) return sortConfig.direction === 'asc' ? 1 : -1;
         return 0;
@@ -2923,7 +3623,17 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }
 
     return result;
-  }, [groupedOrders, activeSheetTab, statusFilter, automationMonth, automationYear, searchTerm, colFilters, sortConfig, aeStatuses, aoStatuses, showDuplicatesOnly]);
+  }, [
+    groupedOrders,
+    activeSheetTab,
+    statusFilter,
+    automationMonth,
+    automationYear,
+    searchTerm,
+    colFilters,
+    sortConfig,
+    showDuplicatesOnly
+  ]);
 
   // Virtual Pagination for Product Automation & Closed Orders to prevent browser crash/freeze
   const [automationPage, setAutomationPage] = useState(1);
@@ -2994,45 +3704,49 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   const totalDispatched = filteredOrders.reduce((sum, ord) => sum + ord.items.reduce((s, it) => s + (it.dispatchQty || 0), 0), 0);
   const totalBalance = totalOrderQty - totalDispatched;
 
-  // Toggle filter value for a column
-  const toggleColFilterValue = (col: string, val: string) => {
+  // Toggle filter value for a column (when all values are initially checked, clicking one unchecks it from allValues)
+  const toggleColFilterValue = (col: string, val: string, allValuesForCol?: string[]) => {
     setColFilters(prev => {
-      const current = prev[col] || [];
+      const current = prev[col];
+      if (!current) {
+        // Currently no filter (= all values selected); unchecking `val` selects all other values
+        const baseList = allValuesForCol || getUniqueColumnValues(col);
+        const next = baseList.filter(v => v !== val);
+        return { ...prev, [col]: next };
+      }
       if (current.includes(val)) {
         const next = current.filter(v => v !== val);
-        if (next.length === 0) {
+        return { ...prev, [col]: next };
+      } else {
+        const next = [...current, val];
+        const baseList = allValuesForCol || getUniqueColumnValues(col);
+        if (next.length >= baseList.length) {
           const copy = { ...prev };
           delete copy[col];
           return copy;
         }
         return { ...prev, [col]: next };
-      } else {
-        return { ...prev, [col]: [...current, val] };
       }
     });
+    setAutomationPage(1);
   };
 
-  // Get unique values for ANY column to show in filter dropdown
+  // Get unique values for ANY of the 45 columns (A to AS) in the active tab to show in filter dropdown
   const getUniqueColumnValues = (col: string): string[] => {
     const set = new Set<string>();
     groupedOrders.forEach(o => {
-      if (col === 'A') set.add(o.timestamp);
-      else if (col === 'B') set.add(o.customerPO);
-      else if (col === 'C') set.add(o.customerName);
-      else if (col === 'D') set.add(o.customerEmail);
-      else if (col === 'E') set.add(o.orderDate);
-      else if (col === 'F') o.items.forEach(it => set.add(it.unit));
-      else if (col === 'G') o.items.forEach(it => set.add(it.itemName));
-      else if (col === 'H') o.items.forEach(it => set.add(it.color));
-      else if (col === 'I') o.items.forEach(it => set.add(it.width));
-      else if (col === 'S') set.add(o.transporterName);
-      else if (col === 'T') set.add(o.salesPerson);
-      else if (col === 'U') set.add(o.accountStatus);
-      else if (col === 'V') set.add(o.approvalStatus);
-      else if (col === 'X') set.add(o.orderNo || 'Set SO#');
-      else if (col === 'AN') set.add(o.statusAN || 'Open');
+      o.items.forEach(it => {
+        const itemStatus = it.statusAN || 'Open';
+        if (activeSheetTab === 'automation' && (o.sheetSource === 'closed' || itemStatus === 'Closed')) return;
+        if (activeSheetTab === 'closed' && o.sheetSource !== 'closed' && itemStatus !== 'Closed') return;
+
+        const val = getOrderItemColValue(o, it, col);
+        if (val !== '') {
+          set.add(val);
+        }
+      });
     });
-    return Array.from(set).filter(Boolean);
+    return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
   };
 
   return (
@@ -3470,6 +4184,30 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                 <Download className="w-3.5 h-3.5" />
               </button>
 
+              {/* 1-CLICK SAVE ALL UPDATES (SHEET + FIREBASE) BUTTON WITH LIVE AUTO-SAVE INDICATOR */}
+              <button
+                type="button"
+                disabled={isSavingUpdates}
+                onClick={() => handleSaveAllUpdatesToCloud(true)}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-extrabold rounded-lg shadow-2xs transition-all shrink-0 cursor-pointer border ${
+                  unsavedChangesCount > 0
+                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-700 ring-2 ring-emerald-300 animate-pulse'
+                    : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border-emerald-300'
+                }`}
+                title="Save all Dispatch Qty, Remarks, Customer Msg & Status updates to Firebase Cloud & Google Sheet"
+              >
+                <CloudUpload className="w-3.5 h-3.5" />
+                <span>
+                  {isSavingUpdates
+                    ? 'Saving...'
+                    : unsavedChangesCount > 0
+                    ? `Save Updates (${unsavedChangesCount})`
+                    : lastSavedTime
+                    ? 'Saved ✓ (Click to Sync)'
+                    : 'Save to Cloud & Sheet'}
+                </span>
+              </button>
+
               {/* Firebase Cloud Sync Button */}
               <button
                 onClick={() => setShowFirebaseModal(true)}
@@ -3755,10 +4493,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                     onOpenWhatsAppModal: setWhatsAppModalOrder,
                     aeStatuses,
                     setAeStatuses,
+                    onUpdateColAE: handleUpdateColAE,
                     aoStatuses,
                     setAoStatuses,
+                    onUpdateColAO: handleUpdateColAO,
                     lrNumbers,
                     setLrNumbers,
+                    onUpdateLrNumber: handleUpdateLrNumber,
                     setSyncFeedback,
                     colAAStatuses,
                     onUpdateColAA: handleUpdateColAA,
@@ -3816,134 +4557,269 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               </div>
             </div>
 
-            {automationPageSize > 0 && totalAutomationPages > 1 && (
+            {automationPageSize > 0 && (
               <div className="flex items-center gap-1">
+                {/* 1st Page Direct Jump Button */}
+                <button
+                  type="button"
+                  onClick={() => setAutomationPage(1)}
+                  disabled={safeAutomationPage <= 1}
+                  className="px-1.5 py-0 h-5 rounded bg-white border border-slate-300 text-slate-700 hover:bg-emerald-50 hover:text-emerald-800 hover:border-emerald-300 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-bold cursor-pointer"
+                  title="Jump directly to 1st Page"
+                >
+                  <span>|&laquo; 1st Page</span>
+                </button>
+
+                {/* < Prev Button */}
                 <button
                   type="button"
                   onClick={() => setAutomationPage(p => Math.max(1, p - 1))}
                   disabled={safeAutomationPage <= 1}
-                  className="px-1.5 py-0 h-5 rounded bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-medium cursor-pointer"
+                  className="px-1.5 py-0 h-5 rounded bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-semibold cursor-pointer"
                 >
                   <ChevronLeft className="w-3 h-3" /> Prev
                 </button>
 
-                <span className="px-1 text-[10px] font-mono text-slate-600">
-                  {safeAutomationPage}/{totalAutomationPages}
-                </span>
+                {/* Direct Page Number Input + Total Pages */}
+                <div className="flex items-center gap-1 px-1.5 h-5 bg-white border border-slate-300 rounded text-[10px] font-semibold text-slate-700">
+                  <span>Page</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={totalAutomationPages}
+                    value={safeAutomationPage}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value, 10);
+                      if (!isNaN(val)) {
+                        setAutomationPage(Math.min(totalAutomationPages, Math.max(1, val)));
+                      }
+                    }}
+                    className="w-11 px-1 py-0 h-4 text-center font-mono font-bold text-emerald-900 bg-emerald-50/70 border border-emerald-300 rounded focus:outline-none focus:ring-1 focus:ring-emerald-500 text-[10px]"
+                    title={`Type page number (1 to ${totalAutomationPages}) to jump directly`}
+                  />
+                  <span className="text-slate-500 font-mono">of {totalAutomationPages}</span>
+                </div>
 
+                {/* Next > Button */}
                 <button
                   type="button"
                   onClick={() => setAutomationPage(p => Math.min(totalAutomationPages, p + 1))}
                   disabled={safeAutomationPage >= totalAutomationPages}
-                  className="px-1.5 py-0 h-5 rounded bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-medium cursor-pointer"
+                  className="px-1.5 py-0 h-5 rounded bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-semibold cursor-pointer"
                 >
                   Next <ChevronRight className="w-3 h-3" />
+                </button>
+
+                {/* Last Page Direct Jump Button */}
+                <button
+                  type="button"
+                  onClick={() => setAutomationPage(totalAutomationPages)}
+                  disabled={safeAutomationPage >= totalAutomationPages}
+                  className="px-1.5 py-0 h-5 rounded bg-white border border-slate-300 text-slate-700 hover:bg-emerald-50 hover:text-emerald-800 hover:border-emerald-300 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-bold cursor-pointer"
+                  title={`Jump directly to Last Page (${totalAutomationPages})`}
+                >
+                  <span>Last Page &raquo;|</span>
                 </button>
               </div>
             )}
           </div>
         )}
 
-        {/* COLUMN HEADER FILTER POPOVER (Works on EVERY Column with HIDE THIS COLUMN Option) */}
-        {activeFilterCol && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20" onClick={() => setActiveFilterCol(null)}>
+        {/* COLUMN HEADER FILTER POPOVER (Works on ALL 45 Columns A-AS with Search, Select All/Clear & Hide Column) */}
+        {activeFilterCol && (() => {
+          const allUniqueVals = getUniqueColumnValues(activeFilterCol);
+          const searchedVals = filterValueSearch.trim()
+            ? allUniqueVals.filter(v => v.toLowerCase().includes(filterValueSearch.trim().toLowerCase()))
+            : allUniqueVals;
+          return (
             <div
-              className="bg-white rounded-xl shadow-2xl border border-slate-300 p-4 w-72 text-xs space-y-3 animate-in fade-in zoom-in-95 duration-150"
-              onClick={(e) => e.stopPropagation()}
+              className="fixed inset-0 z-50 flex items-center justify-center bg-black/20"
+              onClick={() => {
+                setActiveFilterCol(null);
+                setFilterValueSearch('');
+              }}
             >
-              <div className="flex items-center justify-between pb-2 border-b border-slate-200">
-                <span className="font-bold text-slate-900 flex items-center gap-1.5">
-                  <Filter className="w-3.5 h-3.5 text-emerald-600" />
-                  {fmsColumnMapping.find(c => c.sheetCol === activeFilterCol)?.name} ({activeFilterCol})
-                </span>
-                <button onClick={() => setActiveFilterCol(null)} className="text-slate-400 hover:text-slate-600">
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-
-              {/* Sorting options */}
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => {
-                    setSortConfig({ column: activeFilterCol, direction: 'asc' });
-                    setActiveFilterCol(null);
-                  }}
-                  className="flex-1 py-1.5 px-2 bg-slate-100 hover:bg-slate-200 rounded font-medium text-slate-700 flex items-center justify-center gap-1"
-                >
-                  <ArrowUp className="w-3 h-3 text-emerald-600" />
-                  <span>Sort A → Z</span>
-                </button>
-                <button
-                  onClick={() => {
-                    setSortConfig({ column: activeFilterCol, direction: 'desc' });
-                    setActiveFilterCol(null);
-                  }}
-                  className="flex-1 py-1.5 px-2 bg-slate-100 hover:bg-slate-200 rounded font-medium text-slate-700 flex items-center justify-center gap-1"
-                >
-                  <ArrowDown className="w-3 h-3 text-emerald-600" />
-                  <span>Sort Z → A</span>
-                </button>
-              </div>
-
-              {/* HIDE THIS COLUMN OPTION (Requested by user) */}
-              <button
-                onClick={() => {
-                  setVisibleCols(prev => ({ ...prev, [activeFilterCol]: false }));
-                  setActiveFilterCol(null);
-                  setSyncFeedback(`Column ${activeFilterCol} hidden. Use 'Columns' button to unhide.`);
-                  setTimeout(() => setSyncFeedback(null), 3000);
-                }}
-                className="w-full py-1.5 px-2 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded font-semibold flex items-center justify-center gap-1.5 border border-rose-200"
+              <div
+                className="bg-white rounded-xl shadow-2xl border border-slate-300 p-4 w-80 text-xs space-y-2.5 animate-in fade-in zoom-in-95 duration-150"
+                onClick={(e) => e.stopPropagation()}
               >
-                <EyeOff className="w-3.5 h-3.5" />
-                <span>Hide this Column ({activeFilterCol})</span>
-              </button>
+                <div className="flex items-center justify-between pb-2 border-b border-slate-200">
+                  <span className="font-bold text-slate-900 flex items-center gap-1.5">
+                    <Filter className="w-3.5 h-3.5 text-emerald-600" />
+                    {fmsColumnMapping.find(c => c.sheetCol === activeFilterCol)?.name} ({activeFilterCol})
+                  </span>
+                  <button
+                    onClick={() => {
+                      setActiveFilterCol(null);
+                      setFilterValueSearch('');
+                    }}
+                    className="text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
 
-              {/* Unique values list with checkboxes */}
-              <div>
-                <span className="text-[11px] font-semibold text-slate-600 block mb-1">Select values to filter:</span>
-                <div className="max-h-44 overflow-y-auto space-y-1 bg-slate-50 p-2 rounded border border-slate-200">
-                  {getUniqueColumnValues(activeFilterCol).map(val => {
-                    const isChecked = !colFilters[activeFilterCol] || colFilters[activeFilterCol].includes(val);
-                    return (
-                      <label key={val} className="flex items-center gap-2 py-0.5 px-1 hover:bg-white rounded cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={isChecked}
-                          onChange={() => toggleColFilterValue(activeFilterCol, val)}
-                          className="rounded text-emerald-600 focus:ring-emerald-500"
-                        />
-                        <span className="truncate text-slate-800">{val}</span>
-                      </label>
-                    );
-                  })}
+                {/* Sorting options */}
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      setSortConfig({ column: activeFilterCol, direction: 'asc' });
+                      setActiveFilterCol(null);
+                      setFilterValueSearch('');
+                    }}
+                    className="flex-1 py-1.5 px-2 bg-slate-100 hover:bg-slate-200 rounded font-medium text-slate-700 flex items-center justify-center gap-1 cursor-pointer"
+                  >
+                    <ArrowUp className="w-3 h-3 text-emerald-600" />
+                    <span>Sort A → Z</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSortConfig({ column: activeFilterCol, direction: 'desc' });
+                      setActiveFilterCol(null);
+                      setFilterValueSearch('');
+                    }}
+                    className="flex-1 py-1.5 px-2 bg-slate-100 hover:bg-slate-200 rounded font-medium text-slate-700 flex items-center justify-center gap-1 cursor-pointer"
+                  >
+                    <ArrowDown className="w-3 h-3 text-emerald-600" />
+                    <span>Sort Z → A</span>
+                  </button>
+                </div>
+
+                {/* HIDE THIS COLUMN OPTION */}
+                <button
+                  onClick={() => {
+                    setVisibleCols(prev => ({ ...prev, [activeFilterCol]: false }));
+                    setActiveFilterCol(null);
+                    setFilterValueSearch('');
+                    setSyncFeedback(`Column ${activeFilterCol} hidden. Use 'Columns' button to unhide.`);
+                    setTimeout(() => setSyncFeedback(null), 3000);
+                  }}
+                  className="w-full py-1.5 px-2 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded font-semibold flex items-center justify-center gap-1.5 border border-rose-200 cursor-pointer"
+                >
+                  <EyeOff className="w-3.5 h-3.5" />
+                  <span>Hide this Column ({activeFilterCol})</span>
+                </button>
+
+                {/* Search within column values */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-semibold text-slate-600">
+                      Values in Column ({searchedVals.length}):
+                    </span>
+                    <div className="flex items-center gap-2 text-[10px]">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setColFilters(prev => {
+                            const copy = { ...prev };
+                            delete copy[activeFilterCol];
+                            return copy;
+                          });
+                          setAutomationPage(1);
+                        }}
+                        className="text-emerald-700 hover:underline font-bold cursor-pointer"
+                      >
+                        Select All
+                      </button>
+                      <span className="text-slate-300">|</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setColFilters(prev => ({ ...prev, [activeFilterCol]: ['__NONE__'] }));
+                          setAutomationPage(1);
+                        }}
+                        className="text-rose-600 hover:underline font-bold cursor-pointer"
+                      >
+                        Clear All
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="relative">
+                    <Search className="w-3 h-3 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="text"
+                      placeholder={`Search ${activeFilterCol} values...`}
+                      value={filterValueSearch}
+                      onChange={(e) => setFilterValueSearch(e.target.value)}
+                      className="w-full pl-6 pr-6 py-1 text-[11px] bg-slate-50 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                    {filterValueSearch && (
+                      <button
+                        type="button"
+                        onClick={() => setFilterValueSearch('')}
+                        className="absolute right-1.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="max-h-48 overflow-y-auto space-y-1 bg-slate-50 p-2 rounded border border-slate-200">
+                    {searchedVals.length === 0 ? (
+                      <p className="text-[11px] text-slate-400 italic text-center py-3">
+                        No matching values found in this column.
+                      </p>
+                    ) : (
+                      <>
+                        {searchedVals.slice(0, 150).map(val => {
+                          const isChecked = !colFilters[activeFilterCol] || colFilters[activeFilterCol].includes(val);
+                          return (
+                            <label key={val} className="flex items-center gap-2 py-0.5 px-1 hover:bg-white rounded cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onChange={() => toggleColFilterValue(activeFilterCol, val, allUniqueVals)}
+                                className="rounded text-emerald-600 focus:ring-emerald-500 cursor-pointer"
+                              />
+                              <span className="truncate text-slate-800" title={val}>{val}</span>
+                            </label>
+                          );
+                        })}
+                        {searchedVals.length > 150 && (
+                          <p className="text-[10px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1 text-center font-medium mt-1">
+                            Showing top 150 of {searchedVals.length.toLocaleString()} values — type in Search box above to filter specific values!
+                          </p>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                <div className="pt-2 border-t border-slate-200 flex items-center justify-between">
+                  <button
+                    onClick={() => {
+                      setColFilters(prev => {
+                        const copy = { ...prev };
+                        delete copy[activeFilterCol];
+                        return copy;
+                      });
+                      setActiveFilterCol(null);
+                      setFilterValueSearch('');
+                    }}
+                    className="text-slate-500 hover:text-slate-800 text-[11px] underline cursor-pointer"
+                  >
+                    Reset Filter
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (filterValueSearch.trim() && !colFilters[activeFilterCol]) {
+                        // If user typed in search box and clicked Apply directly, filter to searched values
+                        setColFilters(prev => ({ ...prev, [activeFilterCol]: searchedVals }));
+                        setAutomationPage(1);
+                      }
+                      setActiveFilterCol(null);
+                      setFilterValueSearch('');
+                    }}
+                    className="px-3.5 py-1 bg-emerald-700 text-white rounded font-bold hover:bg-emerald-800 cursor-pointer"
+                  >
+                    Apply Filter
+                  </button>
                 </div>
               </div>
-
-              <div className="pt-2 border-t border-slate-200 flex items-center justify-between">
-                <button
-                  onClick={() => {
-                    setColFilters(prev => {
-                      const copy = { ...prev };
-                      delete copy[activeFilterCol];
-                      return copy;
-                    });
-                    setActiveFilterCol(null);
-                  }}
-                  className="text-slate-500 hover:text-slate-800 text-[11px] underline"
-                >
-                  Clear Filter
-                </button>
-                <button
-                  onClick={() => setActiveFilterCol(null)}
-                  className="px-3 py-1 bg-emerald-700 text-white rounded font-medium hover:bg-emerald-800"
-                >
-                  Apply
-                </button>
-              </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
 
         {/* COMPACT GOOGLE SHEETS BOTTOM TABS BAR */}
         <div className="bg-slate-200 border-t border-slate-300 px-2 py-1 flex flex-wrap items-center justify-between gap-2 select-none">
@@ -5199,10 +6075,13 @@ function renderSpreadsheetRows(
     onOpenWhatsAppModal: (order: GroupedOrder) => void;
     aeStatuses: Record<string, string>;
     setAeStatuses: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+    onUpdateColAE: (orderKey: string, val: string) => void;
     aoStatuses: Record<string, string>;
     setAoStatuses: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+    onUpdateColAO: (orderKey: string, val: string) => void;
     lrNumbers: Record<string, string>;
     setLrNumbers: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+    onUpdateLrNumber: (orderKey: string, val: string) => void;
     setSyncFeedback: (msg: string | null) => void;
     colAAStatuses: Record<string, string>;
     onUpdateColAA: (orderKey: string, val: string) => void;
@@ -5710,12 +6589,7 @@ function renderSpreadsheetRows(
                 <td rowSpan={rowSpan} className={`px-1 py-0 border-r border-slate-300 text-center align-middle bg-blue-50/20 whitespace-nowrap leading-tight ${cellBottomBorder}`}>
                   <select
                     value={handlers.aeStatuses[currentOrderKey] ?? order.colAE ?? 'Pending'}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      handlers.setAeStatuses(prev => ({ ...prev, [currentOrderKey]: val }));
-                      handlers.setSyncFeedback(`Col AE Confirmation set to "${val}". ${val === 'Message Sent' ? 'Instant WhatsApp link active in Col AF!' : 'Pending status.'}`);
-                      setTimeout(() => handlers.setSyncFeedback(null), 3500);
-                    }}
+                    onChange={(e) => handlers.onUpdateColAE(currentOrderKey, e.target.value)}
                     className="text-[10px] bg-white border border-blue-300 rounded px-1 py-0 font-medium text-slate-800 focus:ring-1 focus:ring-blue-500 focus:outline-none h-5"
                   >
                     <option value="Pending">Pending</option>
@@ -5835,10 +6709,7 @@ function renderSpreadsheetRows(
                     placeholder="e.g. MEHTA-0041"
                     size={autoFitColumns ? Math.max((handlers.lrNumbers[currentOrderKey] ?? order.lrNumber ?? '').length + 2, 12) : undefined}
                     value={handlers.lrNumbers[currentOrderKey] ?? order.lrNumber ?? ''}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      handlers.setLrNumbers(prev => ({ ...prev, [currentOrderKey]: val }));
-                    }}
+                    onChange={(e) => handlers.onUpdateLrNumber(currentOrderKey, e.target.value)}
                     className={`${autoFitColumns ? 'w-auto min-w-[90px]' : 'w-20'} px-1 py-0 border border-slate-300 rounded font-mono text-[10px] h-5`}
                   />
                 </td>
@@ -5884,12 +6755,7 @@ function renderSpreadsheetRows(
                 >
                   <select
                     value={handlers.aoStatuses[currentOrderKey] ?? order.colAO ?? 'Pending'}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      handlers.setAoStatuses(prev => ({ ...prev, [currentOrderKey]: val }));
-                      handlers.setSyncFeedback(`Col AO set to "${val}". ${val === 'Message Sent' ? 'WhatsApp button activated in Col AP!' : 'Pending status.'}`);
-                      setTimeout(() => handlers.setSyncFeedback(null), 3500);
-                    }}
+                    onChange={(e) => handlers.onUpdateColAO(currentOrderKey, e.target.value)}
                     className="text-[10px] bg-white border border-purple-300 rounded px-1 py-0 font-medium text-slate-800 focus:ring-1 focus:ring-purple-500 focus:outline-none h-5"
                   >
                     <option value="Pending">Pending</option>

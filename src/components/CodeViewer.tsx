@@ -41,6 +41,44 @@ export const CodeViewer: React.FC<CodeViewerProps> = ({ onCopyCode, copied }) =>
 
   return (
     <div className="space-y-6">
+      {/* 2-WAY SYNC (setupCompleteTwoWaySync) QUICK SETUP BANNER */}
+      <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-4 shadow-xs text-xs text-slate-800 space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="px-2 py-0.5 bg-amber-600 text-white font-extrabold rounded text-[11px] font-mono">
+              setupCompleteTwoWaySync()
+            </span>
+            <span className="font-bold text-sm text-amber-950">
+              Google Sheet ⇄ Application 2-Way Sync Kaise Chalu Karein (Sirf 1 Baar Setup):
+            </span>
+          </div>
+          <button
+            onClick={() => {
+              setConfig(prev => ({ ...prev, mode: 'firebase-sync' }));
+              onCopyCode();
+            }}
+            className="px-3.5 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white font-bold rounded-lg flex items-center gap-1.5 shadow-xs cursor-pointer"
+          >
+            {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+            <span>{copied ? '✓ Copied Full Script!' : '1-Click Copy setupCompleteTwoWaySync Script'}</span>
+          </button>
+        </div>
+        <ol className="list-decimal list-inside space-y-1 text-slate-700 font-medium pl-1">
+          <li>
+            Upar diye <strong>"1-Click Copy setupCompleteTwoWaySync Script"</strong> button par click karein (is script ke andar <code className="bg-white px-1.5 py-0.5 rounded border border-amber-300 font-mono font-bold text-amber-900">setupCompleteTwoWaySync()</code> function pehle se maujood hai).
+          </li>
+          <li>
+            Apni Google Sheet (<code className="font-mono text-[11px] bg-white px-1 rounded">15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0</code>) kholein aur upar menu me <strong>Extensions &gt; Apps Script</strong> par click karein.
+          </li>
+          <li>
+            Purana code hata kar yeh pura code paste karein aur <strong>Save (💾 Ctrl+S)</strong> dabayein.
+          </li>
+          <li>
+            Upar function dropdown (Run button ke paas) me <strong><code className="bg-amber-200/80 px-1.5 py-0.5 rounded font-mono font-bold text-amber-950">setupCompleteTwoWaySync</code></strong> select karein aur <strong>Run (▶)</strong> par click karein (ya Google Sheet refresh karke upar <strong>🔥 GINZA FMS Sync &gt; 5. ⏰ Setup Auto 5-Min Firebase Sync Trigger</strong> par click karein).
+          </li>
+        </ol>
+      </div>
+
       {/* Script Selector Header */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">

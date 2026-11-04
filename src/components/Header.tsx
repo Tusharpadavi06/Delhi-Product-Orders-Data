@@ -70,6 +70,8 @@ export function getProperInitial(name?: string, email?: string): string {
 }
 
 export const Header: React.FC<HeaderProps> = ({
+  activeTab,
+  setActiveTab,
   onCopyCode,
   copied,
   isFullWidth
@@ -252,198 +254,6 @@ export const Header: React.FC<HeaderProps> = ({
 
   return (
     <>
-      {/* 0. PRE-OPEN AUTHENTICATION LOGIN GATE MODAL (Shows before opening the sheet) */}
-      {!isAuthenticated && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-lg w-full overflow-hidden animate-in fade-in zoom-in-95 duration-200">
-            {/* Top Ginza Banner */}
-            <div className="bg-gradient-to-r from-slate-900 via-slate-800 to-emerald-950 px-6 py-5 text-white flex items-center justify-between border-b border-slate-700">
-              <div className="flex items-center gap-3.5">
-                <div className="h-12 px-2.5 py-1 rounded-xl bg-white border border-slate-200 flex items-center justify-center shadow-md shrink-0">
-                  <img
-                    src="https://www.ginzalimited.com/cdn/shop/files/Ginza_logo.jpg?v=1668509673&width=500"
-                    alt="Ginza Industries Limited"
-                    className="h-9 w-auto object-contain"
-                  />
-                </div>
-                <div>
-                  <span className="text-[10px] font-mono uppercase tracking-widest px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 font-bold">
-                    Google Sheet Authentication
-                  </span>
-                  <h2 className="text-lg font-extrabold tracking-tight text-white mt-0.5">
-                    Ginza FMS — New Delhi
-                  </h2>
-                  <p className="text-xs text-slate-300">
-                    Sign in with your Google / Ginza ID to open the live sheet
-                  </p>
-                </div>
-              </div>
-
-              {/* Live Alphabet Preview Badge */}
-              <div className="flex flex-col items-center">
-                <div
-                  className={`w-11 h-11 rounded-full ${loginColor} text-white flex items-center justify-center font-extrabold text-lg shadow-lg ring-2 ring-white`}
-                  title="Your Google Sheet Active Alphabet Avatar"
-                >
-                  {getProperInitial(loginName, loginEmail)}
-                </div>
-                <span className="text-[10px] text-emerald-300 font-mono mt-1 font-semibold">
-                  Active ID: {getProperInitial(loginName, loginEmail)}
-                </span>
-              </div>
-            </div>
-
-            <div className="p-6 space-y-5">
-              {/* Quick 1-Click Ginza Account Selector (Shows M, T, D, L, V alphabets) */}
-              <div>
-                <label className="block text-xs font-bold text-slate-700 mb-2">
-                  Quick Select Active Google Sheet ID (Click to Login Directly):
-                </label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {PRESET_GINZA_ACCOUNTS.map((acc) => {
-                    const letter = getProperInitial(acc.name, acc.email);
-                    const isSelected = loginEmail.toLowerCase() === acc.email.toLowerCase();
-                    return (
-                      <button
-                        key={acc.email}
-                        type="button"
-                        onClick={() => handleCompleteLogin(acc)}
-                        className={`flex items-center gap-2.5 p-2 rounded-xl border text-left transition-all cursor-pointer ${
-                          isSelected
-                            ? 'bg-emerald-50/90 border-emerald-500 ring-1 ring-emerald-500 shadow-xs'
-                            : 'bg-slate-50 hover:bg-slate-100 border-slate-200'
-                        }`}
-                      >
-                        <div
-                          className={`w-8 h-8 rounded-full ${acc.avatarColor} text-white flex items-center justify-center font-extrabold text-sm shrink-0 shadow-xs ring-2 ring-white`}
-                        >
-                          {letter}
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center justify-between gap-1">
-                            <span className="text-xs font-bold text-slate-900 truncate">{acc.name}</span>
-                            <span className="text-[10px] font-mono font-extrabold px-1.5 py-0.2 rounded bg-white text-slate-700 border border-slate-200">
-                              {letter}
-                            </span>
-                          </div>
-                          <div className="text-[10px] text-slate-500 font-mono truncate">{acc.email}</div>
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="relative flex py-0.5 items-center">
-                <div className="grow border-t border-slate-200"></div>
-                <span className="shrink mx-3 text-[11px] font-semibold text-slate-400 uppercase">
-                  Or Enter Your Custom Google ID
-                </span>
-                <div className="grow border-t border-slate-200"></div>
-              </div>
-
-              {/* Manual Login Form */}
-              <form onSubmit={handleLoginFormSubmit} className="space-y-3.5">
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      Your Name (Determines Alphabet Badge):
-                    </label>
-                    <div className="relative">
-                      <UserCheck className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                      <input
-                        type="text"
-                        required
-                        value={loginName}
-                        onChange={(e) => setLoginName(e.target.value)}
-                        placeholder="e.g. Tushar / MIS / Delhi"
-                        className="w-full pl-8 pr-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500 font-semibold text-slate-900"
-                      />
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      Google Email ID:
-                    </label>
-                    <div className="relative">
-                      <Mail className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                      <input
-                        type="email"
-                        required
-                        value={loginEmail}
-                        onChange={(e) => setLoginEmail(e.target.value)}
-                        placeholder="e.g. user@ginzalimited.com"
-                        className="w-full pl-8 pr-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500 font-mono text-slate-900"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      Branch / Department:
-                    </label>
-                    <div className="relative">
-                      <Building2 className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                      <input
-                        type="text"
-                        value={loginBranch}
-                        onChange={(e) => setLoginBranch(e.target.value)}
-                        placeholder="e.g. New Delhi / Mumbai"
-                        className="w-full pl-8 pr-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500 text-slate-800"
-                      />
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      Badge Color (Google Sheet Style):
-                    </label>
-                    <div className="flex items-center gap-2 pt-1">
-                      {[
-                        { cls: 'bg-teal-600', label: 'Teal' },
-                        { cls: 'bg-emerald-600', label: 'Green' },
-                        { cls: 'bg-blue-600', label: 'Blue' },
-                        { cls: 'bg-indigo-600', label: 'Indigo' },
-                        { cls: 'bg-purple-600', label: 'Purple' },
-                        { cls: 'bg-rose-600', label: 'Red' },
-                        { cls: 'bg-amber-600', label: 'Amber' }
-                      ].map((c) => (
-                        <button
-                          key={c.cls}
-                          type="button"
-                          onClick={() => setLoginColor(c.cls)}
-                          className={`w-6 h-6 rounded-full ${c.cls} text-white font-bold text-[11px] flex items-center justify-center cursor-pointer transition-transform ${
-                            loginColor === c.cls ? 'ring-2 ring-offset-2 ring-slate-900 scale-110' : 'opacity-75 hover:opacity-100'
-                          }`}
-                          title={c.label}
-                        >
-                          {getProperInitial(loginName, loginEmail)}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="pt-2">
-                  <button
-                    type="submit"
-                    className="w-full py-2.5 px-4 bg-emerald-700 hover:bg-emerald-800 text-white font-bold rounded-xl shadow-md flex items-center justify-center gap-2 text-xs transition-all cursor-pointer"
-                  >
-                    <LogIn className="w-4 h-4" />
-                    <span>
-                      Login &amp; Open Sheet as "{getProperInitial(loginName, loginEmail)}" ({loginName || loginEmail})
-                    </span>
-                  </button>
-                </div>
-              </form>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* 1. MAIN HEADER NAVIGATION BAR */}
       <header className="sticky top-0 z-40 bg-white border-b border-slate-200 shadow-2xs">
         <div className={`mx-auto transition-all ${isFullWidth ? 'px-3 sm:px-6' : 'max-w-7xl px-4 sm:px-6 lg:px-8'}`}>
@@ -470,6 +280,49 @@ export const Header: React.FC<HeaderProps> = ({
                   Product Order → Product Automation 1
                 </span>
               </div>
+            </div>
+
+            {/* Zone 2: Navigation & 2-Way Sync Apps Script Buttons */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setActiveTab('simulator')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  activeTab === 'simulator'
+                    ? 'bg-emerald-700 text-white shadow-xs'
+                    : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200'
+                }`}
+              >
+                <span>📊 Live Sheet (All Orders)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveTab('code')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  activeTab === 'code'
+                    ? 'bg-amber-600 text-white shadow-xs ring-2 ring-amber-400'
+                    : 'bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300'
+                }`}
+                title="View & Copy Google Sheet Apps Script containing setupCompleteTwoWaySync()"
+              >
+                <Terminal className="w-3.5 h-3.5 text-amber-700" />
+                <span>📜 2-Way Sync Script (setupCompleteTwoWaySync)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={onCopyCode}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  copied
+                    ? 'bg-emerald-600 text-white'
+                    : 'bg-slate-900 hover:bg-slate-800 text-white'
+                }`}
+                title="1-Click Copy full Google Apps Script with setupCompleteTwoWaySync()"
+              >
+                {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copied ? 'Copied setupCompleteTwoWaySync!' : 'Copy GAS Code'}</span>
+              </button>
             </div>
 
             {/* Zone 3: User Profile */}

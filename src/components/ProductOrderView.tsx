@@ -21,7 +21,11 @@ import {
   FileSpreadsheet,
   Flame,
   Columns,
-  Edit3
+  Edit3,
+  Search,
+  ArrowUp,
+  ArrowDown,
+  EyeOff
 } from 'lucide-react';
 
 export const DELHI_IMPORTRANGE_FORMULA = '=IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z")';
@@ -176,6 +180,12 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [highlightedOrderId, setHighlightedOrderId] = useState<string | null>(null);
 
+  // Column Filter & Sort State for all 28 columns in Product Order Tab
+  const [poColFilters, setPoColFilters] = useState<Record<string, string[]>>({});
+  const [poSortConfig, setPoSortConfig] = useState<{ colId: string; direction: 'asc' | 'desc' } | null>(null);
+  const [activePoFilterCol, setActivePoFilterCol] = useState<string | null>(null);
+  const [poFilterSearch, setPoFilterSearch] = useState<string>('');
+
   // Column Visibility State for Product Order Tab (28 Columns: A to AB)
   const [visiblePoCols, setVisiblePoCols] = useState<Record<string, boolean>>(() => {
     try {
@@ -251,9 +261,122 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
     return orders.filter(isYesterdayTodayBlankOrder).length;
   }, [orders, currentYesterdayTodayIsoSet]);
 
-  // Filtered rows based on Month, Year, Yesterday/Today (Blank O.N only), Pending O.N, and Search
+  // Helper: Get display value for any of the 28 columns in Product Order
+  const getPoColCellValue = (row: ProductOrderRow, colId: string): string => {
+    switch (colId) {
+      case 'referenceNo':
+        return row.referenceNo && !isDateOrTimestampStr(row.referenceNo) ? row.referenceNo.trim() : '—';
+      case 'timestamp':
+        return (row.timestamp || '—').trim();
+      case 'customerPO':
+        return (row.customerPO || 'N/A').trim();
+      case 'customerName':
+        return (row.customerName || '—').trim();
+      case 'customerEmail':
+        return (row.customerEmail || '—').trim();
+      case 'orderDate':
+        return (row.orderDate || '—').trim();
+      case 'unit':
+        return (row.unit || '—').trim();
+      case 'itemName':
+        return (row.itemName || '—').trim();
+      case 'color':
+        return (row.color || '—').trim();
+      case 'width':
+        return (row.width || '—').trim();
+      case 'unitOfItem':
+        return (row.unitOfItem || '—').trim();
+      case 'qty':
+        return String(row.qty ?? 0);
+      case 'rate':
+        return `₹${row.rate ?? 0}`;
+      case 'discount':
+        return `${row.discount ?? 0}%`;
+      case 'deliveryDate':
+        return (row.deliveryDate || '—').trim();
+      case 'remark':
+        return (row.remark || '—').trim();
+      case 'customerNumber':
+        return (row.customerNumber || '—').trim();
+      case 'billingAddress':
+        return (row.billingAddress || '—').trim();
+      case 'deliveryAddress':
+        return (row.deliveryAddress || '—').trim();
+      case 'transporterName':
+        return (row.transporterName || '—').trim();
+      case 'salesPerson':
+        return (row.salesPerson || '—').trim();
+      case 'accountStatus':
+        return (row.accountStatus || '—').trim();
+      case 'branch':
+        return row.branch && !isDateOrTimestampStr(row.branch) ? row.branch.trim() : 'Delhi';
+      case 'approvalStatus':
+        return (row.approvalStatus || '—').trim();
+      case 'branchHeadName':
+        return row.branchHeadName &&
+          row.branchHeadName.trim() !== '' &&
+          row.branchHeadName.trim() !== '—' &&
+          !isDateOrTimestampStr(row.branchHeadName)
+          ? row.branchHeadName.trim()
+          : DEFAULT_BRANCH_HEAD_NAME;
+      case 'branchHeadEmail':
+        return row.branchHeadEmail &&
+          row.branchHeadEmail.trim() !== '' &&
+          row.branchHeadEmail.trim() !== '—' &&
+          !isDateOrTimestampStr(row.branchHeadEmail)
+          ? row.branchHeadEmail.trim()
+          : DEFAULT_BRANCH_HEAD_EMAIL;
+      case 'orderNo':
+        return row.orderNo && !isDateOrTimestampStr(row.orderNo) && row.orderNo.trim() !== ''
+          ? row.orderNo.trim()
+          : '(Blank O.N)';
+      case 'orderNoTimestamp':
+        return row.orderNoTimestamp && row.orderNoTimestamp.trim() !== ''
+          ? row.orderNoTimestamp.trim()
+          : '—';
+      default:
+        return '—';
+    }
+  };
+
+  // Get unique values for any of the 28 columns
+  const getUniquePoColumnValues = (colId: string): string[] => {
+    const set = new Set<string>();
+    orders.forEach(r => {
+      const val = getPoColCellValue(r, colId);
+      if (val !== '') set.add(val);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+  };
+
+  const togglePoColFilterValue = (colId: string, val: string, allValuesForCol?: string[]) => {
+    setPoColFilters(prev => {
+      const current = prev[colId];
+      if (!current) {
+        const baseList = allValuesForCol || getUniquePoColumnValues(colId);
+        return { ...prev, [colId]: baseList.filter(v => v !== val) };
+      }
+      if (current.includes(val)) {
+        return { ...prev, [colId]: current.filter(v => v !== val) };
+      } else {
+        const next = [...current, val];
+        const baseList = allValuesForCol || getUniquePoColumnValues(colId);
+        if (next.length >= baseList.length) {
+          const copy = { ...prev };
+          delete copy[colId];
+          return copy;
+        }
+        return { ...prev, [colId]: next };
+      }
+    });
+    setCurrentPage(1);
+  };
+
+  // Filtered rows based on Month, Year, Yesterday/Today (Blank O.N only), Pending O.N, 28-Col Filters, and Search
   const filteredRows = useMemo(() => {
-    return orders.filter(row => {
+    const activeColFilterEntries = Object.entries(poColFilters).filter(([, vals]) => vals && vals.length > 0);
+
+    const list = orders.filter(row => {
       const cleanOrdNo = row.orderNo && !isDateOrTimestampStr(row.orderNo) ? row.orderNo.trim() : '';
 
       if (filterPendingOnly && cleanOrdNo !== '') {
@@ -277,6 +400,14 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
         }
       }
 
+      // 28-Column Filters
+      for (const [colId, selectedVals] of activeColFilterEntries) {
+        const cellVal = getPoColCellValue(row, colId);
+        if (!selectedVals.includes(cellVal)) {
+          return false;
+        }
+      }
+
       if (searchTerm) {
         const q = searchTerm.toLowerCase();
         const cleanRef = row.referenceNo && !isDateOrTimestampStr(row.referenceNo) ? row.referenceNo : '';
@@ -293,7 +424,26 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
       }
       return true;
     });
-  }, [orders, filterPendingOnly, selectedMonth, selectedYear, filterYesterdayTodayOnly, currentYesterdayTodayIsoSet, searchTerm]);
+
+    if (poSortConfig) {
+      const { colId, direction } = poSortConfig;
+      const isNum = ['qty', 'rate', 'discount'].includes(colId);
+      list.sort((a, b) => {
+        if (isNum) {
+          const numA = parseFloat(getPoColCellValue(a, colId).replace(/[₹%,\s]/g, '')) || 0;
+          const numB = parseFloat(getPoColCellValue(b, colId).replace(/[₹%,\s]/g, '')) || 0;
+          return direction === 'asc' ? numA - numB : numB - numA;
+        }
+        const valA = getPoColCellValue(a, colId).toLowerCase();
+        const valB = getPoColCellValue(b, colId).toLowerCase();
+        if (valA < valB) return direction === 'asc' ? -1 : 1;
+        if (valA > valB) return direction === 'asc' ? 1 : -1;
+        return 0;
+      });
+    }
+
+    return list;
+  }, [orders, filterPendingOnly, selectedMonth, selectedYear, filterYesterdayTodayOnly, currentYesterdayTodayIsoSet, searchTerm, poColFilters, poSortConfig]);
 
   // Safe pagination calculation
   const totalPages = Math.max(1, Math.ceil(filteredRows.length / (pageSize || 30)));
@@ -394,21 +544,22 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
             </select>
           </div>
 
-          {/* Reset Month/Year Filter if active */}
-          {(selectedMonth !== 'ALL' || selectedYear !== 'ALL' || filterYesterdayTodayOnly) && (
+          {/* Reset Month/Year or Column Filter if active */}
+          {(selectedMonth !== 'ALL' || selectedYear !== 'ALL' || filterYesterdayTodayOnly || Object.keys(poColFilters).length > 0) && (
             <button
               type="button"
               onClick={() => {
                 setSelectedMonth('ALL');
                 setSelectedYear('ALL');
                 setFilterYesterdayTodayOnly(false);
+                setPoColFilters({});
                 setHighlightedOrderId(null);
                 setCurrentPage(1);
               }}
               className="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg font-bold text-[11px] flex items-center gap-1 cursor-pointer"
             >
               <X className="w-3 h-3" />
-              <span>Clear Date Filter</span>
+              <span>Reset Filters {Object.keys(poColFilters).length > 0 ? `(${Object.keys(poColFilters).length})` : ''}</span>
             </button>
           )}
 
@@ -569,6 +720,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                   stickyHead = 'sticky left-[150px] z-40 shadow-[2px_0_4px_-1px_rgba(0,0,0,0.3)]';
                 }
 
+                const isColFiltered = Boolean(poColFilters[col.id] && poColFilters[col.id].length > 0);
                 return (
                   <th
                     key={col.id}
@@ -577,16 +729,31 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                   >
                     <div className="flex items-center justify-between gap-1">
                       <span className="font-semibold">{col.label}</span>
-                      {col.id === 'orderNo' && (
-                        <span className="text-[9px] px-1 bg-amber-400 text-slate-950 rounded font-extrabold">
-                          AA (27)
-                        </span>
-                      )}
-                      {col.id === 'orderNoTimestamp' && (
-                        <span className="text-[9px] px-1 bg-emerald-300 text-slate-950 rounded font-extrabold">
-                          AB (28)
-                        </span>
-                      )}
+                      <div className="flex items-center gap-1">
+                        {col.id === 'orderNo' && (
+                          <span className="text-[9px] px-1 bg-amber-400 text-slate-950 rounded font-extrabold">
+                            AA (27)
+                          </span>
+                        )}
+                        {col.id === 'orderNoTimestamp' && (
+                          <span className="text-[9px] px-1 bg-emerald-300 text-slate-950 rounded font-extrabold">
+                            AB (28)
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActivePoFilterCol(activePoFilterCol === col.id ? null : col.id);
+                            setPoFilterSearch('');
+                          }}
+                          className={`p-0.5 rounded hover:bg-black/25 transition-colors cursor-pointer ${
+                            isColFiltered ? 'text-rose-300 bg-rose-950 font-extrabold' : 'text-white/70 hover:text-white'
+                          }`}
+                          title={`Filter, Sort or Hide ${col.label}`}
+                        >
+                          <Filter className="w-2.5 h-2.5" />
+                        </button>
+                      </div>
                     </div>
                   </th>
                 );
@@ -1023,9 +1190,21 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
             </select>
           </div>
 
-          {/* Previous / Next Buttons */}
-          {pageSize > 0 && totalPages > 1 && (
+          {/* 1st Page / < Prev / Page Number Input / Next > / Last Page Controls */}
+          {pageSize > 0 && (
             <div className="flex items-center gap-1">
+              {/* 1st Page Direct Jump Button */}
+              <button
+                type="button"
+                disabled={safeCurrentPage <= 1}
+                onClick={() => setCurrentPage(1)}
+                className="px-1.5 py-0 h-5 rounded border border-slate-300 bg-white hover:bg-blue-50 hover:text-blue-800 hover:border-blue-300 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-bold text-slate-700 cursor-pointer"
+                title="Jump directly to 1st Page"
+              >
+                <span>|&laquo; 1st Page</span>
+              </button>
+
+              {/* < Prev Button */}
               <button
                 type="button"
                 disabled={safeCurrentPage <= 1}
@@ -1035,9 +1214,28 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                 <ChevronLeft className="w-3 h-3" />
                 <span>Prev</span>
               </button>
-              <span className="text-[10px] font-mono text-slate-600">
-                {safeCurrentPage}/{totalPages}
-              </span>
+
+              {/* Direct Page Number Input + Total Pages */}
+              <div className="flex items-center gap-1 px-1.5 h-5 bg-white border border-slate-300 rounded text-[10px] font-semibold text-slate-700">
+                <span>Page</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={totalPages}
+                  value={safeCurrentPage}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value, 10);
+                    if (!isNaN(val)) {
+                      setCurrentPage(Math.min(totalPages, Math.max(1, val)));
+                    }
+                  }}
+                  className="w-11 px-1 py-0 h-4 text-center font-mono font-bold text-blue-900 bg-blue-50/70 border border-blue-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 text-[10px]"
+                  title={`Type page number (1 to ${totalPages}) to jump directly`}
+                />
+                <span className="text-slate-500 font-mono">of {totalPages}</span>
+              </div>
+
+              {/* Next > Button */}
               <button
                 type="button"
                 disabled={safeCurrentPage >= totalPages}
@@ -1047,10 +1245,218 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                 <span>Next</span>
                 <ChevronRight className="w-3 h-3" />
               </button>
+
+              {/* Last Page Direct Jump Button */}
+              <button
+                type="button"
+                disabled={safeCurrentPage >= totalPages}
+                onClick={() => setCurrentPage(totalPages)}
+                className="px-1.5 py-0 h-5 rounded border border-slate-300 bg-white hover:bg-blue-50 hover:text-blue-800 hover:border-blue-300 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-0.5 text-[10px] font-bold text-slate-700 cursor-pointer"
+                title={`Jump directly to Last Page (${totalPages})`}
+              >
+                <span>Last Page &raquo;|</span>
+              </button>
             </div>
           )}
         </div>
       </div>
+
+      {/* COLUMN HEADER FILTER POPOVER FOR PRODUCT ORDER TAB (All 28 Columns) */}
+      {activePoFilterCol && (() => {
+        const colObj = productOrderColumns.find(c => c.id === activePoFilterCol);
+        const colIdx = productOrderColumns.findIndex(c => c.id === activePoFilterCol);
+        const colLetter = colIdx >= 0 ? getPoSheetColLetter(colIdx) : '';
+        const allUniqueVals = getUniquePoColumnValues(activePoFilterCol);
+        const searchedVals = poFilterSearch.trim()
+          ? allUniqueVals.filter(v => v.toLowerCase().includes(poFilterSearch.trim().toLowerCase()))
+          : allUniqueVals;
+
+        return (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/25"
+            onClick={() => {
+              setActivePoFilterCol(null);
+              setPoFilterSearch('');
+            }}
+          >
+            <div
+              className="bg-white rounded-xl shadow-2xl border border-slate-300 p-4 w-80 text-xs space-y-2.5 animate-in fade-in zoom-in-95 duration-150"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between pb-2 border-b border-slate-200">
+                <span className="font-bold text-slate-900 flex items-center gap-1.5">
+                  <Filter className="w-3.5 h-3.5 text-blue-600" />
+                  {colObj?.label} ({colLetter} / {colIdx + 1})
+                </span>
+                <button
+                  onClick={() => {
+                    setActivePoFilterCol(null);
+                    setPoFilterSearch('');
+                  }}
+                  className="text-slate-400 hover:text-slate-600 cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Sorting options */}
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    setPoSortConfig({ colId: activePoFilterCol, direction: 'asc' });
+                    setActivePoFilterCol(null);
+                    setPoFilterSearch('');
+                  }}
+                  className="flex-1 py-1.5 px-2 bg-slate-100 hover:bg-slate-200 rounded font-medium text-slate-700 flex items-center justify-center gap-1 cursor-pointer"
+                >
+                  <ArrowUp className="w-3 h-3 text-blue-600" />
+                  <span>Sort A → Z</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setPoSortConfig({ colId: activePoFilterCol, direction: 'desc' });
+                    setActivePoFilterCol(null);
+                    setPoFilterSearch('');
+                  }}
+                  className="flex-1 py-1.5 px-2 bg-slate-100 hover:bg-slate-200 rounded font-medium text-slate-700 flex items-center justify-center gap-1 cursor-pointer"
+                >
+                  <ArrowDown className="w-3 h-3 text-blue-600" />
+                  <span>Sort Z → A</span>
+                </button>
+              </div>
+
+              {/* Hide this Column */}
+              <button
+                onClick={() => {
+                  setVisiblePoCols(prev => ({ ...prev, [activePoFilterCol]: false }));
+                  setActivePoFilterCol(null);
+                  setPoFilterSearch('');
+                }}
+                className="w-full py-1.5 px-2 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded font-semibold flex items-center justify-center gap-1.5 border border-rose-200 cursor-pointer"
+              >
+                <EyeOff className="w-3.5 h-3.5" />
+                <span>Hide this Column ({colLetter})</span>
+              </button>
+
+              {/* Search & Values List */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-semibold text-slate-600">
+                    Values in Column ({searchedVals.length}):
+                  </span>
+                  <div className="flex items-center gap-2 text-[10px]">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPoColFilters(prev => {
+                          const copy = { ...prev };
+                          delete copy[activePoFilterCol];
+                          return copy;
+                        });
+                        setCurrentPage(1);
+                      }}
+                      className="text-blue-700 hover:underline font-bold cursor-pointer"
+                    >
+                      Select All
+                    </button>
+                    <span className="text-slate-300">|</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPoColFilters(prev => ({ ...prev, [activePoFilterCol]: ['__NONE__'] }));
+                        setCurrentPage(1);
+                      }}
+                      className="text-rose-600 hover:underline font-bold cursor-pointer"
+                    >
+                      Clear All
+                    </button>
+                  </div>
+                </div>
+
+                <div className="relative">
+                  <Search className="w-3 h-3 absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
+                  <input
+                    type="text"
+                    placeholder={`Search ${colObj?.label} values...`}
+                    value={poFilterSearch}
+                    onChange={(e) => setPoFilterSearch(e.target.value)}
+                    className="w-full pl-6 pr-6 py-1 text-[11px] bg-slate-50 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                  {poFilterSearch && (
+                    <button
+                      type="button"
+                      onClick={() => setPoFilterSearch('')}
+                      className="absolute right-1.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+
+                <div className="max-h-48 overflow-y-auto space-y-1 bg-slate-50 p-2 rounded border border-slate-200">
+                  {searchedVals.length === 0 ? (
+                    <p className="text-[11px] text-slate-400 italic text-center py-3">
+                      No matching values found in this column.
+                    </p>
+                  ) : (
+                    <>
+                      {searchedVals.slice(0, 150).map(val => {
+                        const isChecked = !poColFilters[activePoFilterCol] || poColFilters[activePoFilterCol].includes(val);
+                        return (
+                          <label key={val} className="flex items-center gap-2 py-0.5 px-1 hover:bg-white rounded cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={() => togglePoColFilterValue(activePoFilterCol, val, allUniqueVals)}
+                              className="rounded text-blue-600 focus:ring-blue-500 cursor-pointer"
+                            />
+                            <span className="truncate text-slate-800" title={val}>{val}</span>
+                          </label>
+                        );
+                      })}
+                      {searchedVals.length > 150 && (
+                        <p className="text-[10px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1 text-center font-medium mt-1">
+                          Showing top 150 of {searchedVals.length.toLocaleString()} values — type in Search box above to filter specific values!
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-slate-200 flex items-center justify-between">
+                <button
+                  onClick={() => {
+                    setPoColFilters(prev => {
+                      const copy = { ...prev };
+                      delete copy[activePoFilterCol];
+                      return copy;
+                    });
+                    setActivePoFilterCol(null);
+                    setPoFilterSearch('');
+                  }}
+                  className="text-slate-500 hover:text-slate-800 text-[11px] underline cursor-pointer"
+                >
+                  Reset Filter
+                </button>
+                <button
+                  onClick={() => {
+                    if (poFilterSearch.trim() && !poColFilters[activePoFilterCol]) {
+                      setPoColFilters(prev => ({ ...prev, [activePoFilterCol]: searchedVals }));
+                      setCurrentPage(1);
+                    }
+                    setActivePoFilterCol(null);
+                    setPoFilterSearch('');
+                  }}
+                  className="px-3.5 py-1 bg-blue-700 text-white rounded font-bold hover:bg-blue-800 cursor-pointer"
+                >
+                  Apply Filter
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* MODAL: PRODUCT ORDER COLUMN VISIBILITY MANAGER (HIDE / SHOW 28 COLUMNS) */}
       {showPoColManager && (
