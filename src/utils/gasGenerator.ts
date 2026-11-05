@@ -2596,6 +2596,7 @@ function syncWebAppUpdatesToAutomationSheet() {
   const dispItemsMap = cellUpdates.dispatch_items || {};
   const ordersMap = cellUpdates.orders || {};
   const statusAnMap = cellUpdates.status_an || {};
+  const statusMap = cellUpdates.status_map || {};
 
   const rowCount = lastRow - FIREBASE_CONFIG.FIRST_DATA_ROW + 1;
   const maxCols = Math.max(sheet.getLastColumn(), 45);
@@ -2656,12 +2657,16 @@ function syncWebAppUpdatesToAutomationSheet() {
       }
     }
 
-    // 2. Check Open / Close Status (Col AN = 40)
+    // 2. Check Open / Close Status (Col AN = 40) from both status_an and status_map
     const cloudStatusObj = statusAnMap[normItemSig] || statusAnMap[naItemSig];
-    if (cloudStatusObj && cloudStatusObj.status_an) {
+    const resolvedCloudStatus =
+      (cloudStatusObj && cloudStatusObj.status_an) ||
+      statusMap[normItemSig] ||
+      statusMap[naItemSig];
+    if (resolvedCloudStatus) {
       const currentSheetStatus = String(row[39] || "Open").trim();
-      if (currentSheetStatus !== cloudStatusObj.status_an) {
-        sheet.getRange(sheetRowNum, 40).setValue(cloudStatusObj.status_an);
+      if (currentSheetStatus !== resolvedCloudStatus) {
+        sheet.getRange(sheetRowNum, 40).setValue(resolvedCloudStatus);
         updatedCellsCount++;
       }
     }

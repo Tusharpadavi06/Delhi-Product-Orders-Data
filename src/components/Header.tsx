@@ -282,48 +282,8 @@ export const Header: React.FC<HeaderProps> = ({
               </div>
             </div>
 
-            {/* Zone 2: Navigation & 2-Way Sync Apps Script Buttons */}
-            <div className="flex items-center gap-2 flex-wrap">
-              <button
-                type="button"
-                onClick={() => setActiveTab('simulator')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer flex items-center gap-1.5 ${
-                  activeTab === 'simulator'
-                    ? 'bg-emerald-700 text-white shadow-xs'
-                    : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200'
-                }`}
-              >
-                <span>📊 Live Sheet (All Orders)</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setActiveTab('code')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer flex items-center gap-1.5 ${
-                  activeTab === 'code'
-                    ? 'bg-amber-600 text-white shadow-xs ring-2 ring-amber-400'
-                    : 'bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300'
-                }`}
-                title="View & Copy Google Sheet Apps Script containing setupCompleteTwoWaySync()"
-              >
-                <Terminal className="w-3.5 h-3.5 text-amber-700" />
-                <span>📜 2-Way Sync Script (setupCompleteTwoWaySync)</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={onCopyCode}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer flex items-center gap-1.5 ${
-                  copied
-                    ? 'bg-emerald-600 text-white'
-                    : 'bg-slate-900 hover:bg-slate-800 text-white'
-                }`}
-                title="1-Click Copy full Google Apps Script with setupCompleteTwoWaySync()"
-              >
-                {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{copied ? 'Copied setupCompleteTwoWaySync!' : 'Copy GAS Code'}</span>
-              </button>
-            </div>
+            {/* Zone 2: Clean Dashboard Center */}
+            <div className="flex items-center gap-2"></div>
 
             {/* Zone 3: User Profile */}
             <div className="flex items-center gap-3 shrink-0">

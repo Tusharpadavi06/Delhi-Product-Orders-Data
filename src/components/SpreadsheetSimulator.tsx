@@ -907,7 +907,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     });
   }, [baseGroupedOrders, dispatchRecords]);
 
-  // Helper to immediately patch centralized status_map in Firebase (< 50ms, never hits 256MB limit)
+  // Helper to immediately patch centralized status_map & status_an in Firebase (< 50ms, never hits 256MB limit)
+  // Also syncs with Google Sheet's syncWebAppUpdatesToAutomationSheet() which reads /cell_updates/status_an & /cell_updates/status_map
   const patchCentralizedStatusMap = async (rows: ProductOrderRow[], forceStatus?: 'Open' | 'In-Progress' | 'Closed') => {
     if (!rows || rows.length === 0) return;
     try {
@@ -915,23 +916,39 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
       const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
       const sanitizeFbKey = (k: string) => k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
+      const nowIso = new Date().toISOString();
 
       const statusMapPatch: Record<string, string> = {};
+      const statusAnPatch: Record<string, { status_an: string; updated_at: string }> = {};
       rows.forEach(r => {
         const st = forceStatus || (r.statusAN === 'Closed' || r.sheetSource === 'closed' ? 'Closed' : (r.statusAN || 'Open'));
         const kWithDate = sanitizeFbKey(makeCanonicalRowKey(r));
         const kNoDate = sanitizeFbKey(
           `${normalizePoVal(r.customerPO)}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`
         );
+        const poWithNa = normalizePoVal(r.customerPO) || 'n/a';
+        const kNaNoDate = sanitizeFbKey(
+          `${poWithNa}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`
+        );
         statusMapPatch[kWithDate] = st;
         statusMapPatch[kNoDate] = st;
+        statusMapPatch[kNaNoDate] = st;
+        statusAnPatch[kNoDate] = { status_an: st, updated_at: nowIso };
+        statusAnPatch[kNaNoDate] = { status_an: st, updated_at: nowIso };
       });
 
-      await fetch(`${baseTargetUrl}/cell_updates/status_map.json${authQuery}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(statusMapPatch)
-      });
+      await Promise.all([
+        fetch(`${baseTargetUrl}/cell_updates/status_map.json${authQuery}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(statusMapPatch)
+        }),
+        fetch(`${baseTargetUrl}/cell_updates/status_an.json${authQuery}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(statusAnPatch)
+        })
+      ]);
     } catch (e) {
       // Ignore network errors silently
     }
