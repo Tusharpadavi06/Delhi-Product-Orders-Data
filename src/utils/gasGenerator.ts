@@ -2774,7 +2774,7 @@ function syncClosedOrdersToFirebase() {
   }
 
   ss.toast("Reading archived orders from '" + sheet.getName() + "'...", "Syncing Firebase", 3);
-  const result = pushSheetDataToFirebaseCollection_(sheet, "closed_orders");
+  const result = pushSheetDataToFirebaseCollection_(sheet, "closed_orders_v2");
   
   if (result.success) {
     ss.toast("Successfully synced " + result.orderCount + " closed orders to Firebase!", "Firebase Synced", 6);

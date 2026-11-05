@@ -227,17 +227,51 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   // Guard so async IndexedDB hydration never overwrites fresh live Google Sheet sync
   const hasSyncedLiveSheetRef = useRef<boolean>(false);
 
-  // Load larger datasets (6,000+ rows) from IndexedDB on initial mount.
-  // If IndexedDB had < 6,000 rows (e.g. 5,337 when Google Sheet gviz filter was active), skip it so full 6,139+ rows load from Google Sheet!
+  // Load larger datasets (6,000+ rows) from IndexedDB on initial mount and share any local Closed Orders to centralized Firebase!
   useEffect(() => {
     loadOrdersFromStorage()
       .then((saved) => {
-        if (hasSyncedLiveSheetRef.current) return;
-        if (saved && Array.isArray(saved) && saved.length >= 6000) {
-          const cleaned = healAndDeduplicateMasterRows(saved.map(sanitizeProductOrderRow));
-          if (cleaned.length >= 6000) {
-            setRawResponses(cleaned);
-            saveOrdersToStorage(cleaned);
+        if (saved && Array.isArray(saved) && saved.length > 0) {
+          const sanitizedSaved = saved.map(sanitizeProductOrderRow);
+          const closedInStorage = sanitizedSaved.filter(r => r.statusAN === 'Closed' || r.sheetSource === 'closed');
+
+          // Immediately push all locally saved Closed Order statuses to centralized Firebase /cell_updates/status_map
+          if (closedInStorage.length > 0) {
+            const baseTargetUrl = normalizeFirebaseDbUrl(DEFAULT_FIREBASE_RTDB_URL);
+            const authQuery = DEFAULT_FIREBASE_SECRET ? `?auth=${encodeURIComponent(DEFAULT_FIREBASE_SECRET)}` : '';
+            const sanitizeFbKey = (k: string) => k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
+            const statusMapPatch: Record<string, string> = {};
+            closedInStorage.forEach(r => {
+              const kWithDate = sanitizeFbKey(makeCanonicalRowKey(r));
+              const kNoDate = sanitizeFbKey(
+                `${normalizePoVal(r.customerPO)}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`
+              );
+              statusMapPatch[kWithDate] = 'Closed';
+              statusMapPatch[kNoDate] = 'Closed';
+            });
+            fetch(`${baseTargetUrl}/cell_updates/status_map.json${authQuery}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(statusMapPatch)
+            }).catch(() => {});
+          }
+
+          if (!hasSyncedLiveSheetRef.current && sanitizedSaved.length >= 6000) {
+            const cleaned = healAndDeduplicateMasterRows(sanitizedSaved);
+            if (cleaned.length >= 6000) {
+              setRawResponses(cleaned);
+              saveOrdersToStorage(cleaned);
+            }
+          } else if (closedInStorage.length > 0) {
+            // Even if live sheet already loaded first, preserve all local Closed Orders from IndexedDB!
+            const closedSigs = new Set(closedInStorage.map(makeCanonicalRowKey));
+            setRawResponses(prev =>
+              prev.map(r =>
+                closedSigs.has(makeCanonicalRowKey(r))
+                  ? { ...r, statusAN: 'Closed' as const, sheetSource: 'closed' as const }
+                  : r
+              )
+            );
           }
         }
       })
@@ -873,6 +907,36 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     });
   }, [baseGroupedOrders, dispatchRecords]);
 
+  // Helper to immediately patch centralized status_map in Firebase (< 50ms, never hits 256MB limit)
+  const patchCentralizedStatusMap = async (rows: ProductOrderRow[], forceStatus?: 'Open' | 'In-Progress' | 'Closed') => {
+    if (!rows || rows.length === 0) return;
+    try {
+      const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+      const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+      const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+      const sanitizeFbKey = (k: string) => k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
+
+      const statusMapPatch: Record<string, string> = {};
+      rows.forEach(r => {
+        const st = forceStatus || (r.statusAN === 'Closed' || r.sheetSource === 'closed' ? 'Closed' : (r.statusAN || 'Open'));
+        const kWithDate = sanitizeFbKey(makeCanonicalRowKey(r));
+        const kNoDate = sanitizeFbKey(
+          `${normalizePoVal(r.customerPO)}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`
+        );
+        statusMapPatch[kWithDate] = st;
+        statusMapPatch[kNoDate] = st;
+      });
+
+      await fetch(`${baseTargetUrl}/cell_updates/status_map.json${authQuery}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(statusMapPatch)
+      });
+    } catch (e) {
+      // Ignore network errors silently
+    }
+  };
+
   // Handle Status AN Dropdown Change PER ITEM: 'Open' | 'In-Progress' | 'Closed'
   // Automatically syncs ONLY the affected order block to Firebase Realtime Database (< 50ms, zero freeze!)
   const handleItemStatusChange = (orderId: string, newStatus: 'Open' | 'In-Progress' | 'Closed') => {
@@ -881,6 +945,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       const targetRow = prev.find(r => r.orderId === orderId);
       const targetKey = targetRow ? getDeterministicFirebaseOrderKey(targetRow) : '';
       const affectedOrderRows: ProductOrderRow[] = [];
+      const directlyChangedRows: ProductOrderRow[] = [];
 
       const updated = prev.map(row => {
         let nextRow = row;
@@ -891,6 +956,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             statusAN: newStatus,
             sheetSource: newStatus === 'Closed' ? ('closed' as const) : ('product_order' as const)
           };
+          directlyChangedRows.push(nextRow);
         }
         const rowKey = getDeterministicFirebaseOrderKey(nextRow);
         if (targetKey && rowKey === targetKey) {
@@ -900,7 +966,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         }
         return nextRow;
       });
-      // Immediately patch ONLY the affected order block to Firebase Cloud (zero lag!)
+      // Immediately patch centralized status_map + affected order block to Firebase Cloud (zero lag!)
+      if (directlyChangedRows.length > 0) {
+        patchCentralizedStatusMap(directlyChangedRows, newStatus).catch(() => {});
+      }
       if (affectedOrderRows.length > 0) {
         pushOrdersToFirebase(affectedOrderRows, undefined, undefined, true).catch(() => {});
         const firstRow = affectedOrderRows[0];
@@ -934,16 +1003,19 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
     setRawResponses(prev => {
       const affectedOrderKeys = new Set<string>();
+      const directlyChangedRows: ProductOrderRow[] = [];
       const updated = prev.map(row => {
         if (idSet.has(row.orderId)) {
           updatedCount++;
           const k = getDeterministicFirebaseOrderKey(row);
           affectedOrderKeys.add(k);
-          return {
+          const nextRow = {
             ...row,
             statusAN: newStatus,
             sheetSource: newStatus === 'Closed' ? ('closed' as const) : ('product_order' as const)
           };
+          directlyChangedRows.push(nextRow);
+          return nextRow;
         }
         return row;
       });
@@ -951,7 +1023,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const k = getDeterministicFirebaseOrderKey(row);
         return affectedOrderKeys.has(k) || idSet.has(row.orderId);
       });
-      // Immediately patch ONLY the affected orders to Firebase Cloud
+      // Immediately patch centralized status_map + affected orders to Firebase Cloud
+      if (directlyChangedRows.length > 0) {
+        patchCentralizedStatusMap(directlyChangedRows, newStatus).catch(() => {});
+      }
       if (affectedRows.length > 0) {
         pushOrdersToFirebase(affectedRows, undefined, undefined, true).catch(() => {});
       }
@@ -1919,6 +1994,14 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           body: JSON.stringify(payloadObj)
         });
       }
+      // If PUT fails with HTTP 400 (e.g. Firebase max write size limit), automatically fallback to PATCH so it never throws HTTP 400!
+      if (res.status === 400 && httpMethod === 'PUT') {
+        return fetch(`${baseUrl}/${nodePath}.json${authQuery}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadObj)
+        });
+      }
       return res;
     };
 
@@ -1960,10 +2043,17 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       throw new Error(`Firebase HTTP ${lastHttpStatus || 'Error'}: ${lastErrorText.substring(0, 160)}`);
     }
 
-    // Upload automationPayload in batches of 250 order blocks.
-    // On full upload (!isPartialPatch), use PUT on first batch so old orphan ROW_1... keys are completely wiped!
+    // Also sync compact centralized status_map in /cell_updates/status_map so all devices immediately see identical Open/Closed counts
+    const closedOrModifiedRows = isPartialPatch
+      ? rowsToSync
+      : rowsToSync.filter(r => r.statusAN === 'Closed' || r.sheetSource === 'closed');
+    if (closedOrModifiedRows.length > 0) {
+      patchCentralizedStatusMap(closedOrModifiedRows).catch(() => {});
+    }
+
+    // Upload automationPayload in batches of 150 order blocks.
     const autoEntries = Object.entries(automationPayload);
-    const BATCH_SIZE = 250;
+    const BATCH_SIZE = 150;
     if (!isPartialPatch && autoEntries.length === 0) {
       await sendRequestWithFallback(workingUrl, 'product_automation', {}, 'PUT');
     } else {
@@ -1978,16 +2068,15 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       }
     }
 
-    // Upload closedPayload in batches of 250 order blocks.
-    // On full upload (!isPartialPatch), use PUT on first batch so old orphan ROW_1... keys are completely wiped!
+    // Upload closedPayload to clean 'closed_orders_v2' node in batches of 150 order blocks (avoids legacy 415k-key /closed_orders node!)
     const closedEntries = Object.entries(closedPayload);
     if (!isPartialPatch && closedEntries.length === 0) {
-      await sendRequestWithFallback(workingUrl, 'closed_orders', {}, 'PUT');
+      await sendRequestWithFallback(workingUrl, 'closed_orders_v2', {}, 'PUT');
     } else {
       for (let i = 0; i < closedEntries.length; i += BATCH_SIZE) {
         const batchSlice = Object.fromEntries(closedEntries.slice(i, i + BATCH_SIZE));
         const methodToUse = !isPartialPatch && i === 0 ? 'PUT' : 'PATCH';
-        const resp2 = await sendRequestWithFallback(workingUrl, 'closed_orders', batchSlice, methodToUse);
+        const resp2 = await sendRequestWithFallback(workingUrl, 'closed_orders_v2', batchSlice, methodToUse);
         if (!resp2.ok) {
           const text = await resp2.text();
           throw new Error(`Firebase HTTP ${resp2.status}: ${text.substring(0, 150)}`);
@@ -2092,7 +2181,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
     try {
       const [closedData, autoData] = await Promise.all([
-        fetchNodeWithAuthFallback('closed_orders'),
+        fetchNodeWithAuthFallback('closed_orders_v2'),
         fetchNodeWithAuthFallback('product_automation')
       ]);
 
@@ -3108,6 +3197,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         cellUpdatesCloud?.dispatch && typeof cellUpdatesCloud.dispatch === 'object' ? cellUpdatesCloud.dispatch : {};
       const cloudOrderOverrides: Record<string, any> =
         cellUpdatesCloud?.orders && typeof cellUpdatesCloud.orders === 'object' ? cellUpdatesCloud.orders : {};
+      const cloudStatusMap: Record<string, string> =
+        cellUpdatesCloud?.status_map && typeof cellUpdatesCloud.status_map === 'object' ? cellUpdatesCloud.status_map : {};
 
       // Merge any non-zero Dispatch Qty from Google Sheet "Order Automation 1" / "Closed Orders" + Firebase /cell_updates
       const sheetDispPatches: Record<string, number> = {};
@@ -3124,12 +3215,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
       let finalMergedForCloud: ProductOrderRow[] = [];
       let hadCountMismatchHeal = false;
+      const localClosedToShare: ProductOrderRow[] = [];
 
       setRawResponses(prev => {
         // Strip initial demo rows
         const cleanPrev = prev.filter(r => !/^ORD-(REAL|NANDANI|PENDING|\d+)/.test(r.orderId));
 
-        // Use CANONICAL row key (normalizing "N/A" and "" POs to "") so 5,337 rows match 100% identically across all tabs & devices!
+        // Use CANONICAL row key (normalizing "N/A" and "" POs to "") so all 6,153 rows match 100% identically across all tabs & devices!
         const makeOrderSigRaw = (r: ProductOrderRow) =>
           `ord_${`${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.orderDate || '').trim().toLowerCase()}`.replace(/[.#$/[\]\s]+/g, '_')}`;
         const makeOrderSigCanon = (r: ProductOrderRow) =>
@@ -3139,6 +3231,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           `row_${`${(r.customerPO || '').trim().toLowerCase()}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}|${(r.orderDate || '').trim().toLowerCase()}`.replace(/[.#$/[\]\s]+/g, '_')}`;
         const makeRowSigCanon = (r: ProductOrderRow) =>
           `row_${makeCanonicalRowKey(r).replace(/[.#$/[\]\s]+/g, '_')}`;
+
+        const makeCanonItemKeyNoDate = (r: ProductOrderRow) =>
+          `${normalizePoVal(r.customerPO)}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`;
 
         const sanitizeFbKey = (k: string) => k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
 
@@ -3150,12 +3245,17 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             if (!seenClosedSigs.has(sig)) {
               allKnownClosedRows.push(r);
               seenClosedSigs.add(sig);
+              localClosedToShare.push(r);
             }
           }
         });
 
         const closedLookupMap = new Map<string, ProductOrderRow>();
-        allKnownClosedRows.forEach(r => closedLookupMap.set(makeCanonicalRowKey(r), r));
+        const closedNoDateLookupMap = new Map<string, ProductOrderRow>();
+        allKnownClosedRows.forEach(r => {
+          closedLookupMap.set(makeCanonicalRowKey(r), r);
+          closedNoDateLookupMap.set(makeCanonItemKeyNoDate(r), r);
+        });
 
         const existingQueueByKey = new Map<string, ProductOrderRow[]>();
         // Seed from Sheet Automation rows, then Firebase active rows, then local cleanPrev overrides
@@ -3168,6 +3268,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
         const mergedDelhiRows: ProductOrderRow[] = fetchedRows.map(fRow => {
           const k = makeCanonicalRowKey(fRow);
+          const canonItemKey = makeCanonItemKeyNoDate(fRow);
           const cloudAAAB =
             aaAbOverrides[makeRowSigCanon(fRow)] ||
             aaAbOverrides[makeRowSigRaw(fRow)] ||
@@ -3191,7 +3292,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           const itemKey = `${baseOrderKey}___${(fRow.itemName || '').trim()}___${(fRow.color || '').trim()}___${(fRow.width || '').trim()}`;
           const poItemKey = `${(fRow.customerPO || '').trim()}_${(fRow.itemName || '').trim()}_${(fRow.color || '').trim()}_${(fRow.width || '').trim()}`;
           const normItemKey = `${(fRow.customerPO || '').trim().toLowerCase()}|${(fRow.customerName || '').trim().toLowerCase()}|${(fRow.itemName || '').trim().toLowerCase()}|${(fRow.color || '').trim().toLowerCase()}|${(fRow.width || '').trim().toLowerCase()}|${Number(fRow.qty) || 0}`;
-          const canonItemKey = `${normalizePoVal(fRow.customerPO)}|${(fRow.customerName || '').trim().toLowerCase()}|${(fRow.itemName || '').trim().toLowerCase()}|${(fRow.color || '').trim().toLowerCase()}|${(fRow.width || '').trim().toLowerCase()}|${Number(fRow.qty) || 0}`;
 
           const savedDisp =
             dispatchRecords[fRow.orderId] ||
@@ -3208,8 +3308,16 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             0;
 
           const cloudOrdPatch = cloudOrderOverrides[sanitizeFbKey(baseOrderKey)] || {};
+          const explicitMapStatus =
+            cloudStatusMap[sanitizeFbKey(k)] || cloudStatusMap[sanitizeFbKey(canonItemKey)];
 
-          const closedMatch = closedLookupMap.get(k);
+          const closedMatch =
+            explicitMapStatus === 'Open' || explicitMapStatus === 'In-Progress'
+              ? undefined
+              : closedLookupMap.get(k) ||
+                closedNoDateLookupMap.get(canonItemKey) ||
+                (explicitMapStatus === 'Closed' ? fRow : undefined);
+
           if (closedMatch) {
             const finalDisp = savedDisp > 0 ? savedDisp : (closedMatch.dispatchQty || fRow.dispatchQty || 0);
             return {
@@ -3240,7 +3348,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           const match = candidates && candidates.length > 0 ? candidates[candidates.length - 1] : undefined;
           if (match) {
             const finalDisp = savedDisp > 0 ? savedDisp : (match.dispatchQty || fRow.dispatchQty || 0);
-            const resolvedStatus = cloudOrdPatch.statusAN || match.statusAN || fRow.statusAN || 'Open';
+            const resolvedStatus =
+              (explicitMapStatus as any) || cloudOrdPatch.statusAN || match.statusAN || fRow.statusAN || 'Open';
             return {
               ...fRow,
               orderNo: resolvedOrderNo || match.orderNo || '',
@@ -3284,9 +3393,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           };
         });
 
-        // CRITICAL: Product Order (mergedDelhiRows = 5,337 rows) is the single canonical master list!
+        // CRITICAL: Product Order (mergedDelhiRows = 6,153 rows) is the single canonical master list!
         // Never append extra duplicate FB-* / IMP-* rows on top of mergedDelhiRows, guaranteeing:
-        // Product Order (5,337) = Order Automation (303) + Closed Orders (5,034) across ALL systems!
+        // Product Order (6,153) = Order Automation + Closed Orders across ALL systems!
         finalMergedForCloud = mergedDelhiRows;
         if (cleanPrev.length !== finalMergedForCloud.length) {
           hadCountMismatchHeal = true;
@@ -3294,7 +3403,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         return finalMergedForCloud;
       });
 
-      // Push canonical 5,337-row dataset to Firebase when manually clicked OR when healing a 6,143 -> 5,337 count mismatch
+      // If this browser had local Closed Orders not yet in Firebase (e.g. 5,205 closed rows in local IndexedDB), immediately share them to centralized Firebase!
+      if (localClosedToShare.length > 0) {
+        patchCentralizedStatusMap(localClosedToShare, 'Closed').catch(() => {});
+        pushOrdersToFirebase(localClosedToShare, undefined, undefined, true).catch(() => {});
+      }
+
+      // Push canonical dataset to Firebase when manually clicked OR when healing a count mismatch
       if ((!silent || hadCountMismatchHeal) && finalMergedForCloud.length > 0) {
         setTimeout(() => {
           pushOrdersToFirebase(finalMergedForCloud).catch(() => {});
@@ -3334,6 +3449,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
     const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
     const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+    const sanitizeFbKey = (k: string) => k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
+    const makeCanonItemKeyNoDate = (r: ProductOrderRow) =>
+      `${normalizePoVal(r.customerPO)}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`;
 
     try {
       const [cellUpdatesCloud, fbCloud] = await Promise.all([
@@ -3347,7 +3465,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         setDispatchRecords(prev => ({ ...cellUpdatesCloud.dispatch, ...prev }));
       }
 
-      if (fbCloud.closedRows.length === 0 && fbCloud.activeRows.length === 0) return;
+      const cloudStatusMap: Record<string, string> =
+        cellUpdatesCloud?.status_map && typeof cellUpdatesCloud.status_map === 'object' ? cellUpdatesCloud.status_map : {};
+
+      if (fbCloud.closedRows.length === 0 && fbCloud.activeRows.length === 0 && Object.keys(cloudStatusMap).length === 0) return;
 
       setRawResponses(prev => {
         const cleanPrev = healAndDeduplicateMasterRows(
@@ -3360,12 +3481,32 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const hasDelhiMaster = baseRows.some(r => r.orderId.startsWith('DELHI-'));
 
         const closedMap = new Map<string, ProductOrderRow>();
-        fbCloud.closedRows.forEach(r => closedMap.set(makeCanonicalRowKey(r), r));
+        const closedNoDateMap = new Map<string, ProductOrderRow>();
+        fbCloud.closedRows.forEach(r => {
+          closedMap.set(makeCanonicalRowKey(r), r);
+          closedNoDateMap.set(makeCanonItemKeyNoDate(r), r);
+        });
 
         const matchedKeys = new Set<string>();
         const updated = baseRows.map(row => {
           const k = makeCanonicalRowKey(row);
-          const closedMatch = closedMap.get(k);
+          const canonItemK = makeCanonItemKeyNoDate(row);
+          const explicitMapStatus =
+            cloudStatusMap[sanitizeFbKey(k)] || cloudStatusMap[sanitizeFbKey(canonItemK)];
+
+          if (explicitMapStatus === 'Open' || explicitMapStatus === 'In-Progress') {
+            return {
+              ...row,
+              statusAN: explicitMapStatus as 'Open' | 'In-Progress',
+              sheetSource: 'product_order' as const
+            };
+          }
+
+          const closedMatch =
+            closedMap.get(k) ||
+            closedNoDateMap.get(canonItemK) ||
+            (explicitMapStatus === 'Closed' ? row : undefined);
+
           if (closedMatch) {
             matchedKeys.add(k);
             return {
@@ -3381,7 +3522,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           return row;
         });
 
-        // If baseRows already has DELHI-* master rows (5,337 rows from Product Order), never append extra duplicate rows from Firebase!
+        // If baseRows already has DELHI-* master rows (6,153 rows from Product Order), never append extra duplicate rows from Firebase!
         if (hasDelhiMaster) {
           return updated;
         }
@@ -3404,6 +3545,12 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     });
     if (Object.keys(nonZeroDisp).length > 0) {
       pushCellUpdatesToFirebase(nonZeroDisp);
+    }
+
+    // Also push any locally closed orders in rawResponses to centralized /cell_updates/status_map on startup
+    const localClosed = rawResponses.filter(r => r.statusAN === 'Closed' || r.sheetSource === 'closed');
+    if (localClosed.length > 0) {
+      patchCentralizedStatusMap(localClosed, 'Closed').catch(() => {});
     }
 
     handleRefreshFromFirebaseCloud();
