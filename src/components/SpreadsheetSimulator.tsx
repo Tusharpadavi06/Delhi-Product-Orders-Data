@@ -58,7 +58,7 @@ import {
   Calendar
 } from 'lucide-react';
 
-const LOCAL_STORAGE_KEY = 'ginza_fms_sheet_orders_v12';
+const LOCAL_STORAGE_KEY = 'ginza_fms_sheet_orders_v13';
 const LOCAL_STORAGE_DISPATCH_KEY = 'ginza_fms_sheet_dispatch_v9';
 const LOCAL_STORAGE_COL_VISIBILITY = 'ginza_fms_col_visibility_v10';
 const LOCAL_STORAGE_FIREBASE_CONFIG = 'ginza_fms_firebase_cfg_v9';
@@ -106,6 +106,20 @@ function makeCanonicalRowKey(r: ProductOrderRow): string {
 }
 
 /**
+ * Date-independent Canonical Item Key so rows whose date was blanked by Google Sheet gviz export still match 100%.
+ */
+function makeCanonItemKeyWithoutDate(r: ProductOrderRow): string {
+  return [
+    normalizePoVal(r.customerPO),
+    (r.customerName || '').trim().toLowerCase(),
+    (r.itemName || '').trim().toLowerCase(),
+    (r.color || '').trim().toLowerCase(),
+    (r.width || '').trim().toLowerCase(),
+    String(Number(r.qty) || 0)
+  ].join('|');
+}
+
+/**
  * Deterministic Firebase Order Key (never uses array index ROW_1, ROW_2... so partial & full syncs always use the exact same key!).
  */
 function getDeterministicFirebaseOrderKey(r: ProductOrderRow): string {
@@ -127,15 +141,18 @@ function healAndDeduplicateMasterRows(rows: ProductOrderRow[]): ProductOrderRow[
   if (extraRows.length === 0) return delhiMasterRows;
 
   const closedByCanonKey = new Map<string, ProductOrderRow>();
+  const closedByNoDateKey = new Map<string, ProductOrderRow>();
   extraRows.forEach(r => {
     if (r.statusAN === 'Closed' || r.sheetSource === 'closed') {
       closedByCanonKey.set(makeCanonicalRowKey(r), r);
+      closedByNoDateKey.set(makeCanonItemKeyWithoutDate(r), r);
     }
   });
 
   return delhiMasterRows.map(r => {
     const k = makeCanonicalRowKey(r);
-    const closedMatch = closedByCanonKey.get(k);
+    const kNoDate = makeCanonItemKeyWithoutDate(r);
+    const closedMatch = closedByCanonKey.get(k) || closedByNoDateKey.get(kNoDate);
     if (closedMatch && r.statusAN !== 'Closed') {
       return {
         ...r,
@@ -155,12 +172,14 @@ function healAndDeduplicateMasterRows(rows: ProductOrderRow[]): ProductOrderRow[
  * Cleans any ProductOrderRow so that:
  * 1) Date/time strings never appear in referenceNo (Col 1 Order No) or orderNo (Col 27 / Col X Order No).
  * 2) Blank Branch Head Name defaults to "Vinay Chhajer" and blank Branch Head Email defaults to "vinay.chhajer@ginzalimited.com".
+ * 3) Blank orderDate is recovered from timestamp, and US M/D/YYYY timestamps (e.g. "9/1/2026 10:34:53") are formatted to Indian DD/MM/YYYY ("01/09/2026 10:34:53") so September/October never look like January/February!
  */
 function sanitizeProductOrderRow(row: ProductOrderRow): ProductOrderRow {
   const rawRef = (row.referenceNo || '').trim();
   const rawOrdNo = (row.orderNo || '').trim();
   let cleanRef = rawRef;
   let cleanTimestamp = (row.timestamp || '').trim();
+  let cleanOrderDate = (row.orderDate || '').trim();
   let cleanOrderNo = rawOrdNo;
   let cleanOrderNoTs = (row.orderNoTimestamp || '').trim();
 
@@ -172,6 +191,21 @@ function sanitizeProductOrderRow(row: ProductOrderRow): ProductOrderRow {
   if (isDateOrTimestampStr(rawOrdNo)) {
     if (!cleanOrderNoTs) cleanOrderNoTs = rawOrdNo;
     cleanOrderNo = '';
+  }
+
+  const parsedDate = parseOrderDateParts(cleanOrderDate, cleanTimestamp);
+  if (parsedDate) {
+    const ddMmYyyy = `${String(parsedDate.day).padStart(2, '0')}/${String(parsedDate.month).padStart(2, '0')}/${parsedDate.year}`;
+    if (!cleanOrderDate) {
+      cleanOrderDate = ddMmYyyy;
+    }
+    // If cleanTimestamp starts with a numeric date (like US M/D/YYYY "9/1/2026 10:34:53"), normalize its date prefix to DD/MM/YYYY ("01/09/2026 10:34:53")
+    if (cleanTimestamp) {
+      const tsParts = cleanTimestamp.match(/^(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})(.*)$/);
+      if (tsParts) {
+        cleanTimestamp = `${ddMmYyyy}${tsParts[2] || ''}`;
+      }
+    }
   }
 
   const rawHeadName = (row.branchHeadName || '').trim();
@@ -190,6 +224,7 @@ function sanitizeProductOrderRow(row: ProductOrderRow): ProductOrderRow {
     ...row,
     referenceNo: cleanRef,
     timestamp: cleanTimestamp,
+    orderDate: cleanOrderDate,
     orderNo: cleanOrderNo,
     orderNoTimestamp: cleanOrderNoTs,
     branchHeadName: cleanHeadName,
@@ -3328,12 +3363,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           const explicitMapStatus =
             cloudStatusMap[sanitizeFbKey(k)] || cloudStatusMap[sanitizeFbKey(canonItemKey)];
 
+          const directClosedMatch =
+            closedLookupMap.get(k) ||
+            closedNoDateLookupMap.get(canonItemKey);
+
           const closedMatch =
-            explicitMapStatus === 'Open' || explicitMapStatus === 'In-Progress'
-              ? undefined
-              : closedLookupMap.get(k) ||
-                closedNoDateLookupMap.get(canonItemKey) ||
-                (explicitMapStatus === 'Closed' ? fRow : undefined);
+            directClosedMatch ||
+            (explicitMapStatus === 'Closed' ? fRow : undefined);
 
           if (closedMatch) {
             const finalDisp = savedDisp > 0 ? savedDisp : (closedMatch.dispatchQty || fRow.dispatchQty || 0);
@@ -3511,17 +3547,12 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           const explicitMapStatus =
             cloudStatusMap[sanitizeFbKey(k)] || cloudStatusMap[sanitizeFbKey(canonItemK)];
 
-          if (explicitMapStatus === 'Open' || explicitMapStatus === 'In-Progress') {
-            return {
-              ...row,
-              statusAN: explicitMapStatus as 'Open' | 'In-Progress',
-              sheetSource: 'product_order' as const
-            };
-          }
+          const directClosedMatch =
+            closedMap.get(k) ||
+            closedNoDateMap.get(canonItemK);
 
           const closedMatch =
-            closedMap.get(k) ||
-            closedNoDateMap.get(canonItemK) ||
+            directClosedMatch ||
             (explicitMapStatus === 'Closed' ? row : undefined);
 
           if (closedMatch) {
@@ -3536,6 +3567,15 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               balanceQty: closedMatch.balanceQty ?? row.balanceQty ?? 0
             };
           }
+
+          if (explicitMapStatus === 'Open' || explicitMapStatus === 'In-Progress') {
+            return {
+              ...row,
+              statusAN: explicitMapStatus as 'Open' | 'In-Progress',
+              sheetSource: 'product_order' as const
+            };
+          }
+
           return row;
         });
 
@@ -3631,6 +3671,30 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     });
     return Array.from(yearsSet).sort((a, b) => Number(b) - Number(a));
   }, [rawResponses]);
+
+  // Per-month item counts for the active tab (Order Automation vs Closed Orders) so Month Filter dropdown matches All Months 100%
+  const automationMonthCounts = useMemo(() => {
+    const counts: Record<string, number> = { ALL: 0 };
+    for (let m = 1; m <= 12; m++) counts[String(m)] = 0;
+
+    rawResponses.forEach(r => {
+      const isClosed = r.statusAN === 'Closed' || r.sheetSource === 'closed';
+      if (activeSheetTab === 'automation' && isClosed) return;
+      if (activeSheetTab === 'closed' && !isClosed) return;
+
+      const parsed = parseOrderDateParts(r.orderDate, r.timestamp);
+      if (automationYear !== 'ALL') {
+        if (!parsed || String(parsed.year) !== automationYear) return;
+      }
+
+      counts.ALL = (counts.ALL || 0) + 1;
+      if (parsed && parsed.month >= 1 && parsed.month <= 12) {
+        const mKey = String(parsed.month);
+        counts[mKey] = (counts[mKey] || 0) + 1;
+      }
+    });
+    return counts;
+  }, [rawResponses, activeSheetTab, automationYear]);
 
   // Helper: Get display value of ANY of the 45 columns (A to AS) for an Order + Item
   const getOrderItemColValue = (order: GroupedOrder, item: OrderItem, col: string): string => {
@@ -3917,9 +3981,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     <div className="space-y-4">
       {/* SPREADSHEET TOOLBAR & CONTROLS */}
       <div className="bg-white rounded-xl border border-slate-300 shadow-xs overflow-hidden">
-        {/* Top Control Bar - Shown on Order Automation & Closed Orders tabs (avoids duplicate Month/Year filter on Product Order tab) */}
+        {/* Top Control Bar - Shown on Order Automation & Closed Orders tabs (with visible horizontal scrollbar) */}
         {activeSheetTab !== 'product_order' && (
-          <div className="px-2.5 py-1.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 overflow-x-auto select-none scrollbar-none whitespace-nowrap">
+          <div className="px-2.5 pt-1.5 pb-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 overflow-x-auto select-none fms-toolbar-scroll whitespace-nowrap">
             {/* Left Controls Group in Single Line */}
             <div className="flex items-center gap-2 shrink-0">
               {/* Search Box */}
@@ -3955,9 +4019,22 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   }}
                   className="text-xs font-bold text-slate-800 bg-transparent focus:outline-none cursor-pointer pr-1"
                 >
-                  {MONTH_OPTIONS.map(m => (
-                    <option key={m.value} value={m.value}>{m.label}</option>
-                  ))}
+                  {MONTH_OPTIONS.map(m => {
+                    const cnt = automationMonthCounts[m.value] || 0;
+                    const suffix =
+                      m.value === 'ALL'
+                        ? ` (${cnt.toLocaleString()} ${activeSheetTab === 'closed' ? 'Closed' : 'Open'})`
+                        : cnt > 0
+                        ? ` (${cnt.toLocaleString()})`
+                        : activeSheetTab === 'automation'
+                        ? ' (0 — Closed ✓)'
+                        : ' (0)';
+                    return (
+                      <option key={m.value} value={m.value}>
+                        {m.label}{suffix}
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
 
@@ -4329,16 +4406,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                 <span>Columns ({Object.values(visibleCols).filter(Boolean).length}/45)</span>
               </button>
 
-              {/* Clear Product Automation Tab Button */}
-              <button
-                onClick={() => setShowClearAutomationModal(true)}
-                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-300 rounded-lg shadow-2xs transition-colors shrink-0 cursor-pointer"
-                title="Clear all rows in Product Automation & upload fresh new data"
-              >
-                <Trash2 className="w-3 h-3 text-rose-600" />
-                <span>Clear Tab</span>
-              </button>
-
               {/* Export CSV */}
               <button
                 onClick={handleExportCSV}
@@ -4348,7 +4415,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                 <Download className="w-3.5 h-3.5" />
               </button>
 
-              {/* 1-CLICK SAVE ALL UPDATES (SHEET + FIREBASE) BUTTON WITH LIVE AUTO-SAVE INDICATOR */}
+              {/* LIVE AUTO-SAVE INDICATOR (Auto-saves every edit in real-time; click only if you want to force-sync manually) */}
               <button
                 type="button"
                 disabled={isSavingUpdates}
@@ -4358,37 +4425,16 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                     ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-700 ring-2 ring-emerald-300 animate-pulse'
                     : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border-emerald-300'
                 }`}
-                title="Save all Dispatch Qty, Remarks, Customer Msg & Status updates to Firebase Cloud & Google Sheet"
+                title="Auto-Save is ALWAYS ON! Every change (Dispatch Qty, Remark, Status, Msg) saves automatically to Firebase & Google Sheet. Click only if you want to force a manual sync."
               >
-                <CloudUpload className="w-3.5 h-3.5" />
+                <CloudUpload className="w-3.5 h-3.5 text-emerald-700" />
                 <span>
                   {isSavingUpdates
-                    ? 'Saving...'
+                    ? 'Auto-Saving...'
                     : unsavedChangesCount > 0
-                    ? `Save Updates (${unsavedChangesCount})`
-                    : lastSavedTime
-                    ? 'Saved ✓ (Click to Sync)'
-                    : 'Save to Cloud & Sheet'}
+                    ? `Auto-Saving (${unsavedChangesCount})...`
+                    : '⚡ Auto-Save ON (Synced ✓)'}
                 </span>
-              </button>
-
-              {/* Firebase Cloud Sync Button */}
-              <button
-                onClick={() => setShowFirebaseModal(true)}
-                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold bg-amber-500 hover:bg-amber-600 text-white rounded-lg shadow-2xs transition-colors shrink-0 cursor-pointer"
-                title="Upload historical data to Firebase"
-              >
-                <Flame className="w-3 h-3 fill-white" />
-                <span>Firebase</span>
-              </button>
-
-              {/* Reset data */}
-              <button
-                onClick={handleReset}
-                className="p-1 text-slate-500 hover:text-slate-700 hover:bg-slate-200 rounded shrink-0 cursor-pointer"
-                title="Reset to default sample data"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
               </button>
 
               {/* FULL SIZE ON BUTTON IN THE FAR RIGHT CORNER */}

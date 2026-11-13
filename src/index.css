@@ -42,3 +42,28 @@
 .fms-sheet-scroll::-webkit-scrollbar-corner {
   background: #e2e8f0;
 }
+
+/* VISIBLE HORIZONTAL SCROLLBAR FOR TOP MENU / TOOLBAR */
+.fms-toolbar-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #64748b #e2e8f0;
+}
+
+.fms-toolbar-scroll::-webkit-scrollbar {
+  height: 8px;
+}
+
+.fms-toolbar-scroll::-webkit-scrollbar-track {
+  background: #e2e8f0;
+  border-radius: 9999px;
+}
+
+.fms-toolbar-scroll::-webkit-scrollbar-thumb {
+  background: #64748b;
+  border-radius: 9999px;
+}
+
+.fms-toolbar-scroll::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}
+

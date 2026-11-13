@@ -2479,6 +2479,11 @@ function syncProductOrderAAABWithFirebase() {
   const outgoingPatch = {};
   let updatedInSheetCount = 0;
 
+  // Build in-memory 2-column array for Col AA (27) & Col AB (28) -> Single batch write (ZERO Google Sheet hang!)
+  const aaAbBatch = displayValues.map(function(r) {
+    return [r[26] || "", r[27] || ""];
+  });
+
   let lastPo = "";
   let lastCust = "";
   let lastOrdDate = "";
@@ -2512,17 +2517,18 @@ function syncProductOrderAAABWithFirebase() {
 
     const cloudEntry = cloudAAAB[ordSig] || cloudAAAB[normOrdSig];
     if (cloudEntry && cloudEntry.order_no && String(cloudEntry.order_no).trim() !== "" && sheetAA !== String(cloudEntry.order_no).trim()) {
-      // Order No was entered or updated in Web App -> Write into Google Sheet Col AA (27) & Col AB (28)!
+      // Order No was entered or updated in Web App -> Update in-memory batch for Col AA (27) & Col AB (28)
       sheetAA = String(cloudEntry.order_no).trim();
       sheetAB = String(cloudEntry.order_no_timestamp || nowFormatted).trim();
-      sheet.getRange(sheetRowNum, 27).setValue(sheetAA);
-      sheet.getRange(sheetRowNum, 28).setValue(sheetAB);
+      aaAbBatch[i][0] = sheetAA;
+      aaAbBatch[i][1] = sheetAB;
       updatedInSheetCount++;
     } else if (sheetAA !== "") {
-      // Order No exists in Google Sheet Col AA -> Ensure Col AB has timestamp and sync to Firebase
+      // Order No exists in Google Sheet Col AA -> Ensure Col AB has timestamp in memory and sync to Firebase
       if (!sheetAB) {
         sheetAB = nowFormatted;
-        sheet.getRange(sheetRowNum, 28).setValue(sheetAB);
+        aaAbBatch[i][1] = sheetAB;
+        updatedInSheetCount++;
       }
       const rec = {
         order_no: sheetAA,
@@ -2540,6 +2546,11 @@ function syncProductOrderAAABWithFirebase() {
     }
   }
 
+  // Write Col AA & AB in ONE single batch operation (100x faster, zero freeze!)
+  if (updatedInSheetCount > 0) {
+    sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 27, rowCount, 2).setValues(aaAbBatch);
+  }
+
   if (Object.keys(outgoingPatch).length > 0) {
     try {
       UrlFetchApp.fetch(url, {
@@ -2552,13 +2563,13 @@ function syncProductOrderAAABWithFirebase() {
   }
 
   if (updatedInSheetCount > 0) {
-    ss.toast("Updated " + updatedInSheetCount + " Order Numbers in 'Product Order' (Col AA & AB) from Web Application!", "2-Way Sync", 4);
+    ss.toast("Updated " + updatedInSheetCount + " Order Numbers in 'Product Order' (Col AA & AB) in 1 batch!", "2-Way Sync", 4);
   }
 }
 
 /* =========================================================
    0B. PULL WEB APP UPDATES (DISPATCH QNT, REMARKS, STATUS, LR, WHATSAPP, OPEN/CLOSE) INTO GOOGLE SHEET
-   Reads /cell_updates and /product_order_aa_ab from Firebase and writes into Order Automation 1 / Product Automation
+   Uses 1-Batch Memory Update on Cols X..AO (Cols 24..41) — ZERO cell-by-cell setValue hang!
    ========================================================= */
 
 function syncWebAppUpdatesToAutomationSheet() {
@@ -2603,6 +2614,11 @@ function syncWebAppUpdatesToAutomationSheet() {
   const displayValues = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols).getDisplayValues();
   const rawValues = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols).getValues();
 
+  // Extract Cols X..AO (indices 23..40, 18 columns) into an in-memory block for 1 single batch write
+  const blockColsXtoAO = rawValues.map(function(r) {
+    return r.slice(23, 41);
+  });
+
   let currentPo = "";
   let currentCust = "";
   let currentEmail = "";
@@ -2612,7 +2628,6 @@ function syncWebAppUpdatesToAutomationSheet() {
 
   for (let i = 0; i < displayValues.length; i++) {
     const row = displayValues[i];
-    const sheetRowNum = FIREBASE_CONFIG.FIRST_DATA_ROW + i;
     const isBlockStart = Boolean(String(row[0] || "").trim() || String(row[1] || "").trim() || String(row[2] || "").trim());
 
     if (isBlockStart) {
@@ -2632,7 +2647,7 @@ function syncWebAppUpdatesToAutomationSheet() {
     const width = String(row[8] || "").trim();
     const qtyNum = parseFloat(rawValues[i][10]) || 0;
 
-    // 1. Check Dispatch Qty (Col Y = 25, Balance Col Z = 26)
+    // 1. Check Dispatch Qty (Col Y = index 1 in blockColsXtoAO, Balance Col Z = index 2)
     const normItemSig = (normPo + "|" + currentCust.toLowerCase() + "|" + itemName.toLowerCase() + "|" + color.toLowerCase() + "|" + width.toLowerCase() + "|" + qtyNum).replace(/[.#$/\[\]\s]+/g, "_");
     const naItemSig = (poWithNa.toLowerCase() + "|" + currentCust.toLowerCase() + "|" + itemName.toLowerCase() + "|" + color.toLowerCase() + "|" + width.toLowerCase() + "|" + qtyNum).replace(/[.#$/\[\]\s]+/g, "_");
 
@@ -2651,13 +2666,13 @@ function syncWebAppUpdatesToAutomationSheet() {
       const currentSheetDisp = parseFloat(rawValues[i][24]) || 0;
       if (currentSheetDisp !== cloudDisp) {
         const newBal = Number((qtyNum - cloudDisp).toFixed(4));
-        sheet.getRange(sheetRowNum, 25).setValue(cloudDisp); // Col Y
-        sheet.getRange(sheetRowNum, 26).setValue(newBal);    // Col Z
+        blockColsXtoAO[i][1] = cloudDisp; // Col Y (25)
+        blockColsXtoAO[i][2] = newBal;    // Col Z (26)
         updatedCellsCount++;
       }
     }
 
-    // 2. Check Open / Close Status (Col AN = 40) from both status_an and status_map
+    // 2. Check Open / Close Status (Col AN = 40 -> index 16 in blockColsXtoAO)
     const cloudStatusObj = statusAnMap[normItemSig] || statusAnMap[naItemSig];
     const resolvedCloudStatus =
       (cloudStatusObj && cloudStatusObj.status_an) ||
@@ -2666,7 +2681,7 @@ function syncWebAppUpdatesToAutomationSheet() {
     if (resolvedCloudStatus) {
       const currentSheetStatus = String(row[39] || "Open").trim();
       if (currentSheetStatus !== resolvedCloudStatus) {
-        sheet.getRange(sheetRowNum, 40).setValue(resolvedCloudStatus);
+        blockColsXtoAO[i][16] = resolvedCloudStatus; // Col AN (40)
         updatedCellsCount++;
       }
     }
@@ -2677,7 +2692,7 @@ function syncWebAppUpdatesToAutomationSheet() {
       const ordSig2 = "ord_" + (normPo + "|" + currentCust.toLowerCase() + "|" + currentDate.toLowerCase()).replace(/[.#$/\[\]\s]+/g, "_");
       const aaAbMatch = cloudAAAB[ordSig1] || cloudAAAB[ordSig2];
       if (aaAbMatch && aaAbMatch.order_no && String(row[23] || "").trim() !== String(aaAbMatch.order_no).trim()) {
-        sheet.getRange(sheetRowNum, 24).setValue(String(aaAbMatch.order_no).trim()); // Col X
+        blockColsXtoAO[i][0] = String(aaAbMatch.order_no).trim(); // Col X (24)
         updatedCellsCount++;
       }
 
@@ -2688,55 +2703,123 @@ function syncWebAppUpdatesToAutomationSheet() {
       const ordPatch = ordersMap[ordKeyNa] || ordersMap[ordKeyBlank] || ordersMap[ordKeySimple];
       if (ordPatch) {
         if (ordPatch.colAA !== undefined && String(row[26] || "") !== String(ordPatch.colAA)) {
-          sheet.getRange(sheetRowNum, 27).setValue(ordPatch.colAA); // Col AA Status
+          blockColsXtoAO[i][3] = ordPatch.colAA; // Col AA (27)
           updatedCellsCount++;
         }
         if (ordPatch.colAB !== undefined && String(row[27] || "") !== String(ordPatch.colAB)) {
-          sheet.getRange(sheetRowNum, 28).setValue(ordPatch.colAB); // Col AB Remark
+          blockColsXtoAO[i][4] = ordPatch.colAB; // Col AB (28)
           updatedCellsCount++;
         }
         if (ordPatch.colAE !== undefined && String(row[30] || "") !== String(ordPatch.colAE)) {
-          sheet.getRange(sheetRowNum, 31).setValue(ordPatch.colAE); // Col AE Confirmation Msg
+          blockColsXtoAO[i][7] = ordPatch.colAE; // Col AE (31)
           updatedCellsCount++;
         }
         if (ordPatch.colAG !== undefined && Boolean(rawValues[i][32]) !== Boolean(ordPatch.colAG)) {
-          sheet.getRange(sheetRowNum, 33).setValue(Boolean(ordPatch.colAG)); // Col AG Follow-up 1
+          blockColsXtoAO[i][9] = Boolean(ordPatch.colAG); // Col AG (33)
           updatedCellsCount++;
         }
         if (ordPatch.colAH !== undefined && String(row[33] || "") !== String(ordPatch.colAH)) {
-          sheet.getRange(sheetRowNum, 34).setValue(ordPatch.colAH); // Col AH Timestamp
+          blockColsXtoAO[i][10] = ordPatch.colAH; // Col AH (34)
           updatedCellsCount++;
         }
         if (ordPatch.colAI !== undefined && String(row[34] || "") !== String(ordPatch.colAI)) {
-          sheet.getRange(sheetRowNum, 35).setValue(ordPatch.colAI); // Col AI Follow-up 1 Remark
+          blockColsXtoAO[i][11] = ordPatch.colAI; // Col AI (35)
           updatedCellsCount++;
         }
         if (ordPatch.colAJ !== undefined && Boolean(rawValues[i][35]) !== Boolean(ordPatch.colAJ)) {
-          sheet.getRange(sheetRowNum, 36).setValue(Boolean(ordPatch.colAJ)); // Col AJ Follow-up 2
+          blockColsXtoAO[i][12] = Boolean(ordPatch.colAJ); // Col AJ (36)
           updatedCellsCount++;
         }
         if (ordPatch.colAK !== undefined && String(row[36] || "") !== String(ordPatch.colAK)) {
-          sheet.getRange(sheetRowNum, 37).setValue(ordPatch.colAK); // Col AK Timestamp
+          blockColsXtoAO[i][13] = ordPatch.colAK; // Col AK (37)
           updatedCellsCount++;
         }
         if (ordPatch.colAL !== undefined && String(row[37] || "") !== String(ordPatch.colAL)) {
-          sheet.getRange(sheetRowNum, 38).setValue(ordPatch.colAL); // Col AL Follow-up 2 Remark
+          blockColsXtoAO[i][14] = ordPatch.colAL; // Col AL (38)
           updatedCellsCount++;
         }
         if (ordPatch.lrNumber !== undefined && String(row[38] || "") !== String(ordPatch.lrNumber)) {
-          sheet.getRange(sheetRowNum, 39).setValue(ordPatch.lrNumber); // Col AM LR Number
+          blockColsXtoAO[i][15] = ordPatch.lrNumber; // Col AM (39)
           updatedCellsCount++;
         }
         if (ordPatch.colAO !== undefined && String(row[40] || "") !== String(ordPatch.colAO)) {
-          sheet.getRange(sheetRowNum, 41).setValue(ordPatch.colAO); // Col AO Delivered Msg
+          blockColsXtoAO[i][17] = ordPatch.colAO; // Col AO (41)
           updatedCellsCount++;
         }
       }
     }
+
+    // Apply in-memory updates from blockColsXtoAO back into rawValues[i] (cols 23..40)
+    for (let c = 0; c < 18; c++) {
+      rawValues[i][23 + c] = blockColsXtoAO[i][c];
+    }
+    // Ensure sub-rows of merged order blocks carry order header info (A..E) when moved to Closed Orders
+    if (!String(rawValues[i][2] || "").trim() && currentCust) {
+      rawValues[i][1] = currentPo;
+      rawValues[i][2] = currentCust;
+      rawValues[i][3] = currentEmail;
+      rawValues[i][4] = currentDate;
+      rawValues[i][15] = currentPhone;
+    }
   }
 
-  if (updatedCellsCount > 0) {
-    ss.toast("Updated " + updatedCellsCount + " cells in Google Sheet from Web Application!", "2-Way Sync Complete", 4);
+  // Separate Open/In-Progress rows from Closed rows so Closed orders move from "Order Automation 1" to "Closed Orders" in 1 fast batch!
+  const closedSheet =
+    ss.getSheetByName(FIREBASE_CONFIG.CLOSED_TAB) ||
+    ss.getSheetByName("Closed Orders") ||
+    ss.getSheetByName("Closed Orders ");
+
+  const stillOpenRows = [];
+  const newlyClosedRows = [];
+
+  for (let i = 0; i < rawValues.length; i++) {
+    const r = rawValues[i];
+    const st = String(r[39] || "Open").trim().toLowerCase();
+    if (st === "closed" || st === "close") {
+      r[39] = "Closed";
+      newlyClosedRows.push(r);
+    } else {
+      stillOpenRows.push(r);
+    }
+  }
+
+  if (newlyClosedRows.length > 0 && closedSheet) {
+    // Append newly closed rows to "Closed Orders" tab in 1 batch write
+    const closedStartRow = Math.max(FIREBASE_CONFIG.FIRST_DATA_ROW, closedSheet.getLastRow() + 1);
+    const neededRows = closedStartRow + newlyClosedRows.length - 1;
+    if (neededRows > closedSheet.getMaxRows()) {
+      closedSheet.insertRowsAfter(closedSheet.getMaxRows(), neededRows - closedSheet.getMaxRows());
+    }
+    if (closedSheet.getMaxColumns() < maxCols) {
+      closedSheet.insertColumnsAfter(closedSheet.getMaxColumns(), maxCols - closedSheet.getMaxColumns());
+    }
+    closedSheet.getRange(closedStartRow, 1, newlyClosedRows.length, maxCols).setValues(newlyClosedRows);
+
+    // Rewrite only stillOpenRows to "Order Automation 1" in 1 batch write & clear leftover bottom rows (ZERO slow deleteRows loop!)
+    const fullAutoRange = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols);
+    fullAutoRange.breakApart();
+    if (stillOpenRows.length > 0) {
+      sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, stillOpenRows.length, maxCols).setValues(stillOpenRows);
+    }
+    if (stillOpenRows.length < rowCount) {
+      sheet
+        .getRange(
+          FIREBASE_CONFIG.FIRST_DATA_ROW + stillOpenRows.length,
+          1,
+          rowCount - stillOpenRows.length,
+          maxCols
+        )
+        .clearContent();
+    }
+    ss.toast(
+      "Moved " + newlyClosedRows.length + " Closed rows to 'Closed Orders' & kept " + stillOpenRows.length + " Open rows in '" + sheet.getName() + "'!",
+      "2-Way Sync Complete",
+      5
+    );
+  } else if (updatedCellsCount > 0) {
+    // Write all updated cells in ONE single batch operation (prevents Google Sheet from recalculating 5,000 times!)
+    sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 24, rowCount, 18).setValues(blockColsXtoAO);
+    ss.toast("Updated " + updatedCellsCount + " cells in Google Sheet in 1 fast batch!", "2-Way Sync Complete", 4);
   }
 }
 
@@ -2795,12 +2878,10 @@ function syncClosedOrdersToFirebase() {
 function syncAllTabsToFirebase() {
   syncProductOrderAAABWithFirebase();
   syncWebAppUpdatesToAutomationSheet();
-  syncProductAutomationToFirebase();
-  syncClosedOrdersToFirebase();
 }
 
 /* =========================================================
-   3B. INSTANT WEBHOOK (doPost) & REAL-TIME SHEET EDIT (onEdit)
+   3B. INSTANT WEBHOOK (doPost) & LIGHTWEIGHT SINGLE-ROW SHEET EDIT (onEdit)
    ========================================================= */
 
 function doPost(e) {
@@ -2823,7 +2904,7 @@ function onEdit(e) {
   const row = e.range.getRow();
   if (row < FIREBASE_CONFIG.FIRST_DATA_ROW) return;
 
-  // 1. If Order No (Col AA = 27) edited in "Product Order" -> Auto-fill Timestamp in Col AB (28) & sync to Firebase
+  // 1. If Order No (Col AA = 27) edited in "Product Order" -> Auto-fill Timestamp in Col AB (28) ONLY on that single row (0.05s, zero sheet scan!)
   if (sheetName === FIREBASE_CONFIG.SOURCE_TAB && col === 27) {
     const val = String(e.range.getValue() || "").trim();
     if (val !== "") {
@@ -2833,13 +2914,10 @@ function onEdit(e) {
         sheet.getRange(row, 28).setValue(ts);
       }
     }
-    try {
-      syncProductOrderAAABWithFirebase();
-    } catch (err) {}
     return;
   }
 
-  // 2. If Dispatch Qnt (Col Y = 25) edited in Order Automation -> Auto-calculate Balance (Col Z = K - Y) & sync to Firebase
+  // 2. If Dispatch Qnt (Col Y = 25) edited in Order Automation -> Auto-calculate Balance (Col Z = K - Y) on that single row
   if (col === 25 && (sheetName === FIREBASE_CONFIG.AUTOMATION_TAB || sheetName.indexOf("Automation") !== -1)) {
     const qty = parseFloat(sheet.getRange(row, 11).getValue()) || 0;
     const dispRaw = sheet.getRange(row, 25).getValue();

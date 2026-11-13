@@ -80,7 +80,8 @@ export const MONTH_OPTIONS = [
  * Supports DD/MM/YYYY, D/M/YYYY, YYYY-MM-DD, MM/DD/YYYY
  */
 export function parseOrderDateParts(dateStr?: string, fallbackTimestamp?: string): { day: number; month: number; year: number; isoDate: string } | null {
-  const raw = (dateStr && dateStr.trim() !== '' ? dateStr : fallbackTimestamp || '').trim();
+  const hasExplicitOrderDate = Boolean(dateStr && dateStr.trim() !== '');
+  const raw = (hasExplicitOrderDate ? dateStr! : fallbackTimestamp || '').trim();
   if (!raw) return null;
 
   // Take date part before comma or space
@@ -102,6 +103,28 @@ export function parseOrderDateParts(dateStr?: string, fallbackTimestamp?: string
     }
   }
 
+  // Check DD-MMM-YYYY (e.g. 30-Jan-2026, 05-Feb-2026)
+  const monthNamesMatch = datePart.match(/^(\d{1,2})[-/.]([a-zA-Z]{3,9})[-/.](\d{2,4})$/);
+  if (monthNamesMatch) {
+    const day = parseInt(monthNamesMatch[1], 10);
+    const mStr = monthNamesMatch[2].toLowerCase().substring(0, 3);
+    const mMap: Record<string, number> = {
+      jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+      jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12
+    };
+    const month = mMap[mStr] || 0;
+    let year = parseInt(monthNamesMatch[3], 10);
+    if (year < 100) year += 2000;
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return {
+        day,
+        month,
+        year,
+        isoDate: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+      };
+    }
+  }
+
   // Check DD/MM/YYYY or MM/DD/YYYY
   const slashMatch = datePart.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})$/);
   if (slashMatch) {
@@ -110,10 +133,24 @@ export function parseOrderDateParts(dateStr?: string, fallbackTimestamp?: string
     let year = parseInt(slashMatch[3], 10);
     if (year < 100) year += 2000;
 
+    // Google Forms / Sheets 24-hour timestamps without comma (e.g. "9/1/2026 10:34:53" or "8/5/2026 14:05:29")
+    // are exported in US M/D/YYYY HH:mm:ss format, whereas Order Date (Col E) is Indian DD/MM/YYYY.
+    const isUs24HrTimestamp =
+      !hasExplicitOrderDate &&
+      !raw.includes(',') &&
+      !/[ap]\.?m\.?/i.test(raw) &&
+      /\s+\d{1,2}:\d{2}/.test(raw);
+
     let day = p1;
     let month = p2;
-    // If p2 > 12 and p1 <= 12, it's MM/DD/YYYY
+
     if (p2 > 12 && p1 <= 12) {
+      month = p1;
+      day = p2;
+    } else if (p1 > 12 && p2 <= 12) {
+      day = p1;
+      month = p2;
+    } else if (isUs24HrTimestamp && p1 <= 12 && p2 <= 31) {
       month = p1;
       day = p2;
     }
@@ -505,9 +542,9 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
   return (
     <div className="space-y-1.5">
       {/* PRODUCT ORDER FILTER & ACTION TOOLBAR: Month/Year Filter + New Orders + Columns (Hide/Show) + Actions */}
-      <div className="flex flex-wrap items-center justify-between gap-2 px-2 py-1.5 bg-slate-100/90 border border-slate-200 rounded-lg text-xs">
+      <div className="flex items-center justify-between gap-2 px-2.5 pt-1.5 pb-2 bg-slate-100/90 border border-slate-200 rounded-lg text-xs overflow-x-auto whitespace-nowrap fms-toolbar-scroll">
         {/* Left Side: Month & Year Filter + Yesterday/Today Quick Jump */}
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           {/* Month Filter */}
           <div className="flex items-center gap-1 bg-white px-2 py-1 rounded-lg border border-slate-300 shadow-2xs">
             <Calendar className="w-3.5 h-3.5 text-blue-600 shrink-0" />
@@ -587,7 +624,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
         </div>
 
         {/* Right Side: Action Controls */}
-        <div className="flex flex-wrap items-center gap-2 ml-auto">
+        <div className="flex items-center gap-2 ml-auto shrink-0">
           {/* Columns (Hide / Show) Button for Product Order Tab */}
           <button
             type="button"
@@ -610,30 +647,6 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
             >
               <RefreshCw className={`w-3.5 h-3.5 text-blue-600 ${isSyncingImportRange ? 'animate-spin' : ''}`} />
               <span>{isSyncingImportRange ? 'Syncing Sheet...' : 'Sync Sheet (AA/AB)'}</span>
-            </button>
-          )}
-
-          {/* 0. Clear All Rows */}
-          {onClearAllRows && (
-            <button
-              onClick={() => setShowClearConfirmModal(true)}
-              className="px-2.5 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 hover:text-rose-900 border border-rose-300 font-bold rounded-lg shadow-2xs flex items-center gap-1.5 transition-colors cursor-pointer text-xs"
-              title="Delete all data from Product Order sheet to re-upload freshly"
-            >
-              <Trash2 className="w-3.5 h-3.5 text-rose-600" />
-              <span>Clear All ({orders.length})</span>
-            </button>
-          )}
-
-          {/* 0.2 Firebase Cloud Sync */}
-          {onOpenFirebaseModal && (
-            <button
-              onClick={onOpenFirebaseModal}
-              className="px-2.5 py-1 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-lg shadow-2xs flex items-center gap-1.5 transition-colors cursor-pointer text-xs"
-              title="Sync & Upload Data to Firebase Realtime Database"
-            >
-              <Flame className="w-3.5 h-3.5 fill-white" />
-              <span>Firebase</span>
             </button>
           )}
 
