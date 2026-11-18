@@ -1714,11 +1714,13 @@ const NewProductOrderRowModal: React.FC<NewProductOrderRowModalProps> = ({ onClo
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const nowStr = new Date().toLocaleString('en-IN');
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const nowStr = `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
     const finalOrderNo = generateNow ? `DLFSO2526-0${Math.floor(1750 + Math.random() * 50)}` : orderNo;
 
     const newRow: ProductOrderRow = {
-      orderId: `ORD-${Date.now()}`,
+      orderId: `APP-${Date.now()}`,
       referenceNo,
       timestamp: nowStr,
       customerPO,

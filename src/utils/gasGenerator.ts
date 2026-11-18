@@ -2451,11 +2451,11 @@ function fmsFormatDateDDMMYYYY_(val, tz) {
   const s = String(val).trim();
   if (!s) return "";
   // ISO YYYY-MM-DD
-  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  let m = s.match(/^(\\d{4})-(\\d{1,2})-(\\d{1,2})/);
   if (m) return ("0" + m[3]).slice(-2) + "/" + ("0" + m[2]).slice(-2) + "/" + m[1];
   // DD-MMM-YYYY or D-MMM-YY (e.g. 17-Nov-2026)
   const monNames = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
-  m = s.match(/^(\d{1,2})[\s\-\/]([A-Za-z]{3})[A-Za-z]*[\s\-\/](\d{2,4})/);
+  m = s.match(/^(\\d{1,2})[\\s\\-\\/]([A-Za-z]{3})[A-Za-z]*[\\s\\-\\/](\\d{2,4})/);
   if (m) {
     const monIdx = monNames.indexOf(m[2].toLowerCase()) + 1;
     if (monIdx > 0) {
@@ -2464,7 +2464,7 @@ function fmsFormatDateDDMMYYYY_(val, tz) {
     }
   }
   // DD/MM/YYYY or D/M/YYYY
-  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  m = s.match(/^(\\d{1,2})[\\/\\-](\\d{1,2})[\\/\\-](\\d{2,4})/);
   if (m) {
     const yr = m[3].length === 2 ? "20" + m[3] : m[3];
     return ("0" + m[1]).slice(-2) + "/" + ("0" + m[2]).slice(-2) + "/" + yr;
@@ -2473,7 +2473,7 @@ function fmsFormatDateDDMMYYYY_(val, tz) {
 }
 
 function fmsFbKey_(raw) {
-  return String(raw || "").replace(/[.#$/\[\]\s]+/g, "_").substring(0, 180);
+  return String(raw || "").replace(/[.#$/\\[\\]\\s]+/g, "_").substring(0, 180);
 }
 
 /* =========================================================
@@ -3490,8 +3490,8 @@ function pushSheetDataToFirebaseCollection_(sheet, collectionName) {
 function fmsSanitizeFirebaseKey_(key) {
   if (!key) return "KEY_" + Utilities.getUuid().substring(0, 8);
   return String(key)
-    .replace(/[.#$/\[\]]/g, "_")
-    .replace(/\s+/g, "_")
+    .replace(/[.#$/\\[\\]]/g, "_")
+    .replace(/\\s+/g, "_")
     .replace(/[^a-zA-Z0-9_-]/g, "")
     .substring(0, 120);
 }

@@ -92,6 +92,16 @@ const LOCAL_STORAGE_COL_AK_KEY = 'ginza_fms_col_ak_v10';
 const LOCAL_STORAGE_COL_AL_KEY = 'ginza_fms_col_al_v10';
 const LOCAL_STORAGE_TNA_RECORDS = 'ginza_fms_tna_records_v2';
 const LOCAL_STORAGE_FMS_WEBAPP_URL = 'ginza_fms_sheet_webapp_url_v1';
+const LOCAL_STORAGE_STATUS_OVERRIDES = 'ginza_fms_status_overrides_v1';
+
+interface LocalStatusOverrideEntry {
+  status_an: 'Open' | 'In-Progress' | 'Closed';
+  updated_at: string;
+}
+
+function sanitizeStatusFbKey(k: string): string {
+  return k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
+}
 
 /**
  * Normalizes Customer PO so blank, "N/A", "NA", "-", "nil" all match 100% identically across tabs & devices.
@@ -137,6 +147,120 @@ function makeCanonItemKeyWithoutDate(r: ProductOrderRow): string {
     (r.width || '').trim().toLowerCase(),
     String(Number(r.qty) || 0)
   ].join('|');
+}
+
+function buildStatusOverrideKeys(r: ProductOrderRow): { fullKey: string; noDateKey: string; poNaNoDateKey: string } {
+  const cust = (r.customerName || '').trim().toLowerCase();
+  const item = (r.itemName || '').trim().toLowerCase();
+  const col = (r.color || '').trim().toLowerCase();
+  const wid = (r.width || '').trim().toLowerCase();
+  const qty = Number(r.qty) || 0;
+  const poWithNa = normalizePoVal(r.customerPO) || 'n/a';
+  return {
+    fullKey: sanitizeStatusFbKey(makeCanonicalRowKey(r)),
+    noDateKey: sanitizeStatusFbKey(makeCanonItemKeyWithoutDate(r)),
+    poNaNoDateKey: sanitizeStatusFbKey(`${poWithNa}|${cust}|${item}|${col}|${wid}|${qty}`)
+  };
+}
+
+function readLocalStatusOverrides(): Record<string, LocalStatusOverrideEntry> {
+  try {
+    const raw = localStorage.getItem(LOCAL_STORAGE_STATUS_OVERRIDES);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return {};
+    const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    const cleaned: Record<string, LocalStatusOverrideEntry> = {};
+    Object.entries(parsed).forEach(([k, v]: [string, any]) => {
+      if (v && typeof v === 'object' && v.status_an && v.updated_at) {
+        const ts = Date.parse(v.updated_at);
+        if (!isNaN(ts) && ts >= cutoff) {
+          cleaned[k] = { status_an: v.status_an, updated_at: v.updated_at };
+        }
+      }
+    });
+    return cleaned;
+  } catch {
+    return {};
+  }
+}
+
+function writeLocalStatusOverrides(
+  rows: ProductOrderRow[],
+  forceStatus?: 'Open' | 'In-Progress' | 'Closed'
+): void {
+  if (!rows || rows.length === 0) return;
+  try {
+    const current = readLocalStatusOverrides();
+    const nowIso = new Date().toISOString();
+    rows.forEach(r => {
+      const st: 'Open' | 'In-Progress' | 'Closed' =
+        forceStatus || (r.statusAN === 'Closed' || r.sheetSource === 'closed' ? 'Closed' : (r.statusAN || 'Open'));
+      const { fullKey, noDateKey, poNaNoDateKey } = buildStatusOverrideKeys(r);
+      const entry: LocalStatusOverrideEntry = { status_an: st, updated_at: nowIso };
+      current[fullKey] = entry;
+      current[noDateKey] = entry;
+      current[poNaNoDateKey] = entry;
+    });
+    localStorage.setItem(LOCAL_STORAGE_STATUS_OVERRIDES, JSON.stringify(current));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+function resolveExplicitStatusWithOverrides(
+  r: ProductOrderRow,
+  cloudStatusAnMap: Record<string, any>,
+  cloudStatusMap: Record<string, string>,
+  localOverrides: Record<string, LocalStatusOverrideEntry>
+): { status?: 'Open' | 'In-Progress' | 'Closed'; localIsNewer: boolean } {
+  const { fullKey, noDateKey, poNaNoDateKey } = buildStatusOverrideKeys(r);
+
+  const pickBestAn = (src: Record<string, any>): LocalStatusOverrideEntry | undefined => {
+    const candidates = [src[fullKey], src[noDateKey], src[poNaNoDateKey]].filter(
+      (x): x is LocalStatusOverrideEntry => Boolean(x && typeof x === 'object' && x.status_an)
+    );
+    if (candidates.length === 0) return undefined;
+    return candidates.reduce((best, cur) =>
+      String(cur.updated_at || '') > String(best.updated_at || '') ? cur : best
+    );
+  };
+
+  const localBest = pickBestAn(localOverrides);
+  const fbAnBest = pickBestAn(cloudStatusAnMap);
+
+  if (localBest && (!fbAnBest || String(localBest.updated_at || '') >= String(fbAnBest.updated_at || ''))) {
+    const fbMatchesLocal = fbAnBest && fbAnBest.status_an === localBest.status_an;
+    return { status: localBest.status_an, localIsNewer: !fbMatchesLocal };
+  }
+
+  if (fbAnBest?.status_an) {
+    return { status: fbAnBest.status_an, localIsNewer: false };
+  }
+
+  const legacyStatus = (cloudStatusMap[fullKey] || cloudStatusMap[noDateKey] || cloudStatusMap[poNaNoDateKey]) as
+    | 'Open'
+    | 'In-Progress'
+    | 'Closed'
+    | undefined;
+  return { status: legacyStatus, localIsNewer: false };
+}
+
+function applyLocalStatusOverrides(rows: ProductOrderRow[]): ProductOrderRow[] {
+  const overrides = readLocalStatusOverrides();
+  if (Object.keys(overrides).length === 0) return rows;
+  return rows.map(r => {
+    const { fullKey, noDateKey, poNaNoDateKey } = buildStatusOverrideKeys(r);
+    const hit = overrides[fullKey] || overrides[noDateKey] || overrides[poNaNoDateKey];
+    if (!hit?.status_an) return r;
+    const targetSheetSource: 'closed' | 'product_order' = hit.status_an === 'Closed' ? 'closed' : 'product_order';
+    if (r.statusAN === hit.status_an && r.sheetSource === targetSheetSource) return r;
+    return {
+      ...r,
+      statusAN: hit.status_an,
+      sheetSource: targetSheetSource
+    };
+  });
 }
 
 /**
@@ -282,51 +406,18 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   // Guard so async IndexedDB hydration never overwrites fresh live Google Sheet sync
   const hasSyncedLiveSheetRef = useRef<boolean>(false);
 
-  // Load larger datasets (6,000+ rows) from IndexedDB on initial mount and share any local Closed Orders to centralized Firebase!
+  // Load larger datasets (6,000+ rows) from IndexedDB on initial mount for fast instant render
+  // NEVER blindly overwrite Firebase status_map or live synced state with stale cached Closed statuses!
   useEffect(() => {
     loadOrdersFromStorage()
       .then((saved) => {
-        if (saved && Array.isArray(saved) && saved.length > 0) {
-          const sanitizedSaved = saved.map(sanitizeProductOrderRow);
-          const closedInStorage = sanitizedSaved.filter(r => r.statusAN === 'Closed' || r.sheetSource === 'closed');
-
-          // Immediately push all locally saved Closed Order statuses to centralized Firebase /cell_updates/status_map
-          if (closedInStorage.length > 0) {
-            const baseTargetUrl = normalizeFirebaseDbUrl(DEFAULT_FIREBASE_RTDB_URL);
-            const authQuery = DEFAULT_FIREBASE_SECRET ? `?auth=${encodeURIComponent(DEFAULT_FIREBASE_SECRET)}` : '';
-            const sanitizeFbKey = (k: string) => k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
-            const statusMapPatch: Record<string, string> = {};
-            closedInStorage.forEach(r => {
-              const kWithDate = sanitizeFbKey(makeCanonicalRowKey(r));
-              const kNoDate = sanitizeFbKey(
-                `${normalizePoVal(r.customerPO)}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`
-              );
-              statusMapPatch[kWithDate] = 'Closed';
-              statusMapPatch[kNoDate] = 'Closed';
-            });
-            fetch(`${baseTargetUrl}/cell_updates/status_map.json${authQuery}`, {
-              method: 'PATCH',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(statusMapPatch)
-            }).catch(() => {});
-          }
-
-          if (!hasSyncedLiveSheetRef.current && sanitizedSaved.length >= 6000) {
-            const cleaned = healAndDeduplicateMasterRows(sanitizedSaved);
-            if (cleaned.length >= 6000) {
+        if (saved && Array.isArray(saved) && saved.length > 0 && !hasSyncedLiveSheetRef.current) {
+          const sanitizedSaved = applyLocalStatusOverrides(saved.map(sanitizeProductOrderRow));
+          if (sanitizedSaved.length >= 6000) {
+            const cleaned = applyLocalStatusOverrides(healAndDeduplicateMasterRows(sanitizedSaved));
+            if (cleaned.length >= 6000 && !hasSyncedLiveSheetRef.current) {
               setRawResponses(cleaned);
-              saveOrdersToStorage(cleaned);
             }
-          } else if (closedInStorage.length > 0) {
-            // Even if live sheet already loaded first, preserve all local Closed Orders from IndexedDB!
-            const closedSigs = new Set(closedInStorage.map(makeCanonicalRowKey));
-            setRawResponses(prev =>
-              prev.map(r =>
-                closedSigs.has(makeCanonicalRowKey(r))
-                  ? { ...r, statusAN: 'Closed' as const, sheetSource: 'closed' as const }
-                  : r
-              )
-            );
           }
         }
       })
@@ -451,6 +542,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
   const DEFAULT_FIREBASE_RTDB_URL = 'https://delhi-product-order-default-rtdb.firebaseio.com';
   const DEFAULT_FIREBASE_SECRET = 'iIElINFgR124ssaG3QWjExz2lT72cRh5g502oP6J';
+  const DEFAULT_FMS_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbxPUdY_mWykEXYrveoWIgHW0zo5Dg21W9_Ba41TK5TC5IoyF23Bp6iZtK5oeLda0wX8/exec';
 
   // Helper to normalize Firebase Realtime Database URL (even if user pastes Console URL)
   const normalizeFirebaseDbUrl = (raw: string): string => {
@@ -501,9 +593,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [fmsWebAppUrl, setFmsWebAppUrl] = useState<string>(() => {
     try {
-      return (localStorage.getItem(LOCAL_STORAGE_FMS_WEBAPP_URL) || '').trim();
+      return (localStorage.getItem(LOCAL_STORAGE_FMS_WEBAPP_URL) || '').trim() || DEFAULT_FMS_WEBAPP_URL;
     } catch (e) {
-      return '';
+      return DEFAULT_FMS_WEBAPP_URL;
     }
   });
   const fmsWebAppUrlRef = useRef<string>(fmsWebAppUrl);
@@ -1001,39 +1093,34 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
       const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
       const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
-      const sanitizeFbKey = (k: string) => k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
       const nowIso = new Date().toISOString();
 
       const statusMapPatch: Record<string, string> = {};
       const statusAnPatch: Record<string, { status_an: string; updated_at: string }> = {};
       rows.forEach(r => {
         const st = forceStatus || (r.statusAN === 'Closed' || r.sheetSource === 'closed' ? 'Closed' : (r.statusAN || 'Open'));
-        const kWithDate = sanitizeFbKey(makeCanonicalRowKey(r));
-        const kNoDate = sanitizeFbKey(
-          `${normalizePoVal(r.customerPO)}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`
-        );
-        const poWithNa = normalizePoVal(r.customerPO) || 'n/a';
-        const kNaNoDate = sanitizeFbKey(
-          `${poWithNa}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`
-        );
-        statusMapPatch[kWithDate] = st;
-        statusMapPatch[kNoDate] = st;
-        statusMapPatch[kNaNoDate] = st;
-        statusAnPatch[kNoDate] = { status_an: st, updated_at: nowIso };
-        statusAnPatch[kNaNoDate] = { status_an: st, updated_at: nowIso };
+        const { fullKey, noDateKey, poNaNoDateKey } = buildStatusOverrideKeys(r);
+        statusMapPatch[fullKey] = st;
+        statusMapPatch[noDateKey] = st;
+        statusMapPatch[poNaNoDateKey] = st;
+        statusAnPatch[fullKey] = { status_an: st, updated_at: nowIso };
+        statusAnPatch[noDateKey] = { status_an: st, updated_at: nowIso };
+        statusAnPatch[poNaNoDateKey] = { status_an: st, updated_at: nowIso };
       });
 
+      const statusMapBody = JSON.stringify(statusMapPatch);
+      const statusAnBody = JSON.stringify(statusAnPatch);
+      const fetchJsonPatch = (url: string, body: string) =>
+        fetch(url, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+          ...(body.length < 60000 ? { keepalive: true } : {})
+        });
+
       await Promise.all([
-        fetch(`${baseTargetUrl}/cell_updates/status_map.json${authQuery}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(statusMapPatch)
-        }),
-        fetch(`${baseTargetUrl}/cell_updates/status_an.json${authQuery}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(statusAnPatch)
-        })
+        fetchJsonPatch(`${baseTargetUrl}/cell_updates/status_map.json${authQuery}`, statusMapBody),
+        fetchJsonPatch(`${baseTargetUrl}/cell_updates/status_an.json${authQuery}`, statusAnBody)
       ]);
     } catch (e) {
       // Ignore network errors silently
@@ -1069,8 +1156,11 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         }
         return nextRow;
       });
-      // Immediately patch centralized status_map + affected order block to Firebase Cloud (zero lag!)
       if (directlyChangedRows.length > 0) {
+        writeLocalStatusOverrides(directlyChangedRows, newStatus);
+        queueMicrotask(() => {
+          saveOrdersToStorage(updated).catch(() => {});
+        });
         patchCentralizedStatusMap(directlyChangedRows, newStatus)
           .then(() => {
             if (fmsWebAppUrlRef.current) {
@@ -1132,8 +1222,11 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const k = getDeterministicFirebaseOrderKey(row);
         return affectedOrderKeys.has(k) || idSet.has(row.orderId);
       });
-      // Immediately patch centralized status_map + affected orders to Firebase Cloud
       if (directlyChangedRows.length > 0) {
+        writeLocalStatusOverrides(directlyChangedRows, newStatus);
+        queueMicrotask(() => {
+          saveOrdersToStorage(updated).catch(() => {});
+        });
         patchCentralizedStatusMap(directlyChangedRows, newStatus)
           .then(() => {
             if (fmsWebAppUrlRef.current) {
@@ -1483,9 +1576,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       deliveryDate: string;
     }>;
   }) => {
-    const nowStr = new Date().toLocaleString('en-IN');
+    const nowStr = formatSheetColABTimestamp();
     const newRows: ProductOrderRow[] = orderData.items.map((it, idx) => ({
-      orderId: `ORD-${Date.now()}-${idx + 1}`,
+      orderId: `APP-${Date.now()}-${idx + 1}`,
       timestamp: nowStr,
       customerPO: orderData.customerPO,
       customerName: orderData.customerName,
@@ -1511,13 +1604,24 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       approvalStatus: 'APPROVED',
       branchHeadName: orderData.salesPerson,
       orderNo: orderData.orderNo,
+      orderNoTimestamp: orderData.orderNo ? nowStr : '',
       statusAN: orderData.statusAN
     }));
 
-    // Append new orders at the bottom of the sheet
+    // Append new orders at the bottom of the sheet & sync live to Firebase + FMS Sheet webhook
     setRawResponses(prev => [...prev, ...newRows]);
+    pushOrdersToFirebase(newRows, undefined, undefined, true).catch(() => {});
+    if (orderData.orderNo && orderData.orderNo.trim()) {
+      pushAAABOverrideToFirebase(newRows, false).catch(() => {});
+    }
+    postToFmsSheetWebhook({
+      action: 'add_product_order',
+      spreadsheetId: '15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0',
+      tabName: 'Product Order',
+      rows: newRows
+    }).catch(() => {});
     setShowNewOrderModal(false);
-    setSyncFeedback(`New Order "${orderData.customerPO}" added at the bottom with ${orderData.items.length} items!`);
+    setSyncFeedback(`New Order "${orderData.customerPO}" added at the bottom with ${orderData.items.length} items & synced to Cloud!`);
     setTimeout(() => setSyncFeedback(null), 4500);
   };
 
@@ -1544,7 +1648,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     payload: Record<string, any>
   ): Promise<{ configured: boolean; ok: boolean; updated_aa_ab?: number; error?: string }> => {
     try {
-      let targetUrl = (fmsWebAppUrlRef.current || '').trim();
+      let targetUrl = (fmsWebAppUrlRef.current || '').trim() || DEFAULT_FMS_WEBAPP_URL;
       if (!targetUrl) {
         const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
         const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
@@ -1772,14 +1876,23 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     setTimeout(() => setSyncFeedback(null), 4500);
   };
 
-  // Add new row into Product Order (Appends at the bottom like IMPORTRANGE)
+  // Add new row into Product Order (Appends at the bottom like IMPORTRANGE & syncs to Cloud/Webhook)
   const handleAddNewProductOrderRow = (newRow: ProductOrderRow) => {
     setRawResponses(prev => {
       const updated = [...prev, newRow];
       pushOrdersToFirebase([newRow], undefined, undefined, true).catch(() => {});
+      if (newRow.orderNo && newRow.orderNo.trim()) {
+        pushAAABOverrideToFirebase([newRow], false).catch(() => {});
+      }
+      postToFmsSheetWebhook({
+        action: 'add_product_order',
+        spreadsheetId: '15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0',
+        tabName: 'Product Order',
+        rows: [newRow]
+      }).catch(() => {});
       return updated;
     });
-    setSyncFeedback(`New Order ${newRow.customerPO} (${newRow.referenceNo}) added at the bottom of Product Order!`);
+    setSyncFeedback(`New Order ${newRow.customerPO} (${newRow.referenceNo}) added at the bottom & synced to Cloud!`);
     setTimeout(() => setSyncFeedback(null), 4000);
   };
 
@@ -3469,6 +3582,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       const localClosedToShare: ProductOrderRow[] = [];
       const unsyncedLocalAAAB: ProductOrderRow[] = [];
       const pendingSheetAAABRows: ProductOrderRow[] = [];
+      const pendingLocalStatusResyncRows: ProductOrderRow[] = [];
+      const localStatusOverrides = readLocalStatusOverrides();
 
       setRawResponses(prev => {
         // Strip initial demo rows
@@ -3491,35 +3606,26 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const sanitizeFbKey = (k: string) => k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
 
         const resolveCloudExplicitStatus = (r: ProductOrderRow): string | undefined => {
-          const fullKey = sanitizeFbKey(makeCanonicalRowKey(r));
-          const noDateKey = sanitizeFbKey(makeCanonItemKeyNoDate(r));
-          const poNaNoDateKey = sanitizeFbKey(
-            `${normalizePoVal(r.customerPO) || 'n/a'}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`
-          );
-          return (
-            cloudStatusMap[fullKey] ||
-            cloudStatusMap[noDateKey] ||
-            cloudStatusMap[poNaNoDateKey] ||
-            cloudStatusAnMap[noDateKey]?.status_an ||
-            cloudStatusAnMap[poNaNoDateKey]?.status_an
-          );
+          return resolveExplicitStatusWithOverrides(r, cloudStatusAnMap, cloudStatusMap, localStatusOverrides).status;
         };
 
         // Keep Firebase closed rows & valid local closed rows separate from Google Sheet Closed Orders CSV
-        // so that Reopened rows ('Open' / 'In-Progress' in Firebase status_map) are NEVER forced back to 'Closed' by un-synced Sheet CSV!
+        // so that Reopened rows ('Open' / 'In-Progress' in status_an or local overrides) are NEVER forced back to 'Closed'!
         const fbAndLocalClosedRows: ProductOrderRow[] = [...fbCloud.closedRows];
         const seenFbClosedSigs = new Set(fbAndLocalClosedRows.map(makeCanonicalRowKey));
         [...sheetAutoRows, ...cleanPrev].forEach(r => {
           if (r.statusAN === 'Closed' || r.sheetSource === 'closed') {
             const cloudOverride = resolveCloudExplicitStatus(r);
             if (cloudOverride === 'Open' || cloudOverride === 'In-Progress') {
-              return; // Do NOT re-close a row that was explicitly Reopened in Firebase!
+              return; // Do NOT re-close a row that was explicitly Reopened!
             }
             const sig = makeCanonicalRowKey(r);
             if (!seenFbClosedSigs.has(sig)) {
               fbAndLocalClosedRows.push(r);
               seenFbClosedSigs.add(sig);
-              localClosedToShare.push(r);
+              if (cloudOverride !== 'Closed') {
+                localClosedToShare.push(r);
+              }
             }
           }
         });
@@ -3617,8 +3723,22 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             0;
 
           const cloudOrdPatch = cloudOrderOverrides[sanitizeFbKey(baseOrderKey)] || {};
-          const explicitMapStatus = resolveCloudExplicitStatus(fRow);
+          const resolvedStatusInfo = resolveExplicitStatusWithOverrides(
+            fRow,
+            cloudStatusAnMap,
+            cloudStatusMap,
+            localStatusOverrides
+          );
+          const explicitMapStatus = resolvedStatusInfo.status;
           const isExplicitActive = explicitMapStatus === 'Open' || explicitMapStatus === 'In-Progress';
+
+          if (resolvedStatusInfo.localIsNewer && explicitMapStatus) {
+            pendingLocalStatusResyncRows.push({
+              ...fRow,
+              statusAN: explicitMapStatus,
+              sheetSource: explicitMapStatus === 'Closed' ? 'closed' : 'product_order'
+            });
+          }
 
           const fbClosedMatch =
             fbClosedLookupMap.get(k) ||
@@ -3707,17 +3827,27 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           };
         });
 
-        // CRITICAL: Product Order (mergedDelhiRows = 6,153 rows) is the single canonical master list!
-        // Never append extra duplicate FB-* / IMP-* rows on top of mergedDelhiRows, guaranteeing:
-        // Product Order (6,153) = Order Automation + Closed Orders across ALL systems!
-        finalMergedForCloud = mergedDelhiRows;
+        // CRITICAL: Product Order (mergedDelhiRows = 6,153+ rows) is the single canonical master list!
+        // Preserve any live APP-* rows created inside the Web App that have not appeared in Google Sheet CSV yet.
+        const delhiCanonicalSet = new Set(mergedDelhiRows.map(makeCanonicalRowKey));
+        const unmatchedLiveAppRows = cleanPrev.filter(
+          r => r.orderId.startsWith('APP-') && !delhiCanonicalSet.has(makeCanonicalRowKey(r))
+        );
+        finalMergedForCloud =
+          unmatchedLiveAppRows.length > 0 ? [...mergedDelhiRows, ...unmatchedLiveAppRows] : mergedDelhiRows;
         if (cleanPrev.length !== finalMergedForCloud.length) {
           hadCountMismatchHeal = true;
         }
         return finalMergedForCloud;
       });
 
-      // If this browser had local Closed Orders not yet in Firebase (e.g. 5,205 closed rows in local IndexedDB), immediately share them to centralized Firebase!
+      // If local browser had a newer Reopen/Close right before page refresh, sync it to Firebase immediately!
+      if (pendingLocalStatusResyncRows.length > 0) {
+        patchCentralizedStatusMap(pendingLocalStatusResyncRows).catch(() => {});
+        pushOrdersToFirebase(pendingLocalStatusResyncRows, undefined, undefined, true).catch(() => {});
+      }
+
+      // If this browser had local Closed Orders not yet in Firebase, share them cleanly without overwriting Open/Reopened rows
       if (localClosedToShare.length > 0) {
         patchCentralizedStatusMap(localClosedToShare, 'Closed').catch(() => {});
         pushOrdersToFirebase(localClosedToShare, undefined, undefined, true).catch(() => {});
@@ -3825,8 +3955,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         cellUpdatesCloud?.status_map && typeof cellUpdatesCloud.status_map === 'object' ? cellUpdatesCloud.status_map : {};
       const cloudStatusAnMap: Record<string, any> =
         cellUpdatesCloud?.status_an && typeof cellUpdatesCloud.status_an === 'object' ? cellUpdatesCloud.status_an : {};
+      const localStatusOverrides = readLocalStatusOverrides();
 
-      if (fbCloud.closedRows.length === 0 && fbCloud.activeRows.length === 0 && Object.keys(cloudStatusMap).length === 0 && Object.keys(cloudStatusAnMap).length === 0) return;
+      if (fbCloud.closedRows.length === 0 && fbCloud.activeRows.length === 0 && Object.keys(cloudStatusMap).length === 0 && Object.keys(cloudStatusAnMap).length === 0 && Object.keys(localStatusOverrides).length === 0) return;
 
       setRawResponses(prev => {
         const cleanPrev = healAndDeduplicateMasterRows(
@@ -3849,15 +3980,15 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const updated = baseRows.map(row => {
           const k = makeCanonicalRowKey(row);
           const canonItemK = makeCanonItemKeyNoDate(row);
-          const poNaCanonItemK = `${normalizePoVal(row.customerPO) || 'n/a'}|${(row.customerName || '').trim().toLowerCase()}|${(row.itemName || '').trim().toLowerCase()}|${(row.color || '').trim().toLowerCase()}|${(row.width || '').trim().toLowerCase()}|${Number(row.qty) || 0}`;
-          const explicitMapStatus =
-            cloudStatusMap[sanitizeFbKey(k)] ||
-            cloudStatusMap[sanitizeFbKey(canonItemK)] ||
-            cloudStatusMap[sanitizeFbKey(poNaCanonItemK)] ||
-            cloudStatusAnMap[sanitizeFbKey(canonItemK)]?.status_an ||
-            cloudStatusAnMap[sanitizeFbKey(poNaCanonItemK)]?.status_an;
+          const resolvedStatusInfo = resolveExplicitStatusWithOverrides(
+            row,
+            cloudStatusAnMap,
+            cloudStatusMap,
+            localStatusOverrides
+          );
+          const explicitMapStatus = resolvedStatusInfo.status;
 
-          // If explicitly Reopened / Active in Firebase centralized status_map, keep it active in Order Automation
+          // If explicitly Reopened / Active in local overrides or Firebase status_an, keep it active in Order Automation
           if (explicitMapStatus === 'Open' || explicitMapStatus === 'In-Progress') {
             return {
               ...row,
