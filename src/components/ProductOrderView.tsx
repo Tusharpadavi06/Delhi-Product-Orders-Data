@@ -641,7 +641,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
             <button
               type="button"
               disabled={isSyncingImportRange}
-              onClick={onSyncImportRange}
+              onClick={() => onSyncImportRange()}
               className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-bold bg-white hover:bg-blue-50 text-blue-800 border border-blue-300 rounded-lg shadow-2xs transition-colors cursor-pointer disabled:opacity-50"
               title="Sync Live Data & Col AA (Order No) / Col AB (Timestamp) with Google Sheet (15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0)"
             >
@@ -1136,7 +1136,11 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
                               title="Save Order No (Col AA) & Timestamp (Col AB) to Sheet & Order Automation"
                             >
                               <Sparkles className="w-2.5 h-2.5" />
-                              <span>{isEditingThisRow ? 'Save' : 'Gen O.N'}</span>
+                              <span>
+                                {isEditingThisRow || (inputOrderNos[row.orderId] ?? '').trim() !== ''
+                                  ? 'Save'
+                                  : 'Gen O.N'}
+                              </span>
                             </button>
                             {isEditingThisRow && (
                               <button

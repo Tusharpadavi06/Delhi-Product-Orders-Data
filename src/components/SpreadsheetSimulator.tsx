@@ -91,6 +91,7 @@ const LOCAL_STORAGE_COL_AJ_KEY = 'ginza_fms_col_aj_v10';
 const LOCAL_STORAGE_COL_AK_KEY = 'ginza_fms_col_ak_v10';
 const LOCAL_STORAGE_COL_AL_KEY = 'ginza_fms_col_al_v10';
 const LOCAL_STORAGE_TNA_RECORDS = 'ginza_fms_tna_records_v2';
+const LOCAL_STORAGE_FMS_WEBAPP_URL = 'ginza_fms_sheet_webapp_url_v1';
 
 /**
  * Normalizes Customer PO so blank, "N/A", "NA", "-", "nil" all match 100% identically across tabs & devices.
@@ -498,6 +499,15 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     return DEFAULT_FIREBASE_SECRET;
   });
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [fmsWebAppUrl, setFmsWebAppUrl] = useState<string>(() => {
+    try {
+      return (localStorage.getItem(LOCAL_STORAGE_FMS_WEBAPP_URL) || '').trim();
+    } catch (e) {
+      return '';
+    }
+  });
+  const fmsWebAppUrlRef = useRef<string>(fmsWebAppUrl);
+  fmsWebAppUrlRef.current = fmsWebAppUrl;
 
   // Col AE: Instant Confirmation Msg Status ("Message Sent" vs "Pending")
   const [aeStatuses, setAeStatuses] = useState<Record<string, string>>(() => {
@@ -1061,7 +1071,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       });
       // Immediately patch centralized status_map + affected order block to Firebase Cloud (zero lag!)
       if (directlyChangedRows.length > 0) {
-        patchCentralizedStatusMap(directlyChangedRows, newStatus).catch(() => {});
+        patchCentralizedStatusMap(directlyChangedRows, newStatus)
+          .then(() => {
+            if (fmsWebAppUrlRef.current) {
+              postToFmsSheetWebhook({ action: 'sync_automation' }).catch(() => {});
+            }
+          })
+          .catch(() => {});
       }
       if (affectedOrderRows.length > 0) {
         pushOrdersToFirebase(affectedOrderRows, undefined, undefined, true).catch(() => {});
@@ -1118,7 +1134,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       });
       // Immediately patch centralized status_map + affected orders to Firebase Cloud
       if (directlyChangedRows.length > 0) {
-        patchCentralizedStatusMap(directlyChangedRows, newStatus).catch(() => {});
+        patchCentralizedStatusMap(directlyChangedRows, newStatus)
+          .then(() => {
+            if (fmsWebAppUrlRef.current) {
+              postToFmsSheetWebhook({ action: 'sync_automation' }).catch(() => {});
+            }
+          })
+          .catch(() => {});
       }
       if (affectedRows.length > 0) {
         pushOrdersToFirebase(affectedRows, undefined, undefined, true).catch(() => {});
@@ -1239,6 +1261,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
     try {
       await pushCellUpdatesToFirebase(dispToSync, ordersToSync, dispMetaToSync);
+      if (fmsWebAppUrlRef.current) {
+        postToFmsSheetWebhook({ action: 'sync_automation' }).catch(() => {});
+      }
       const timeStr = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       setLastSavedTime(timeStr);
       setUnsavedChangesCount(0);
@@ -1514,20 +1539,78 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   };
 
-  // Push Order No (Col AA / 27) & Timestamp (Col AB / 28) updates to Firebase /product_order_aa_ab for 2-way Google Sheet <-> App sync
-  const pushAAABOverrideToFirebase = async (rowsUpdated: ProductOrderRow[]) => {
+  // Direct Google Apps Script doPost webhook for main FMS Sheet (15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0)
+  const postToFmsSheetWebhook = async (
+    payload: Record<string, any>
+  ): Promise<{ configured: boolean; ok: boolean; updated_aa_ab?: number; error?: string }> => {
+    try {
+      let targetUrl = (fmsWebAppUrlRef.current || '').trim();
+      if (!targetUrl) {
+        const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+        const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+        const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+        const cfg = await fetch(`${baseTargetUrl}/fms_config.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null);
+        if (cfg?.webapp_url && typeof cfg.webapp_url === 'string' && cfg.webapp_url.trim().startsWith('https://')) {
+          targetUrl = cfg.webapp_url.trim();
+          setFmsWebAppUrl(targetUrl);
+          fmsWebAppUrlRef.current = targetUrl;
+          try {
+            localStorage.setItem(LOCAL_STORAGE_FMS_WEBAPP_URL, targetUrl);
+          } catch (e) {}
+        }
+      }
+      if (!targetUrl || !targetUrl.startsWith('https://')) {
+        return { configured: false, ok: false };
+      }
+      const res = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload)
+      });
+      const txt = await res.text().catch(() => '');
+      try {
+        const parsed = JSON.parse(txt);
+        if (!res.ok || parsed?.ok === false) {
+          return { configured: true, ok: false, error: parsed?.error || `HTTP ${res.status}` };
+        }
+        return {
+          configured: true,
+          ok: true,
+          updated_aa_ab: Number(parsed?.updated_aa_ab ?? 0)
+        };
+      } catch {
+        return {
+          configured: true,
+          ok: res.ok,
+          error: res.ok ? undefined : `HTTP ${res.status}`
+        };
+      }
+    } catch (err: any) {
+      return { configured: true, ok: false, error: err?.message || 'Webhook POST failed' };
+    }
+  };
+
+  // Push Order No (Col AA / 27) & Timestamp (Col AB / 28) updates to Firebase /product_order_aa_ab + FMS Sheet webhook
+  const pushAAABOverrideToFirebase = async (
+    rowsUpdated: ProductOrderRow[],
+    showSheetResultBanner: boolean = false
+  ) => {
     if (!rowsUpdated || rowsUpdated.length === 0) return;
     try {
       const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
       const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
       const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
       const payload: Record<string, any> = {};
+      const aaAbRecords: any[] = [];
 
       rowsUpdated.forEach(r => {
         const rawPo = (r.customerPO || '').trim().toLowerCase();
         const canonPo = normalizePoVal(r.customerPO);
         const custLower = (r.customerName || '').trim().toLowerCase();
         const dateLower = (r.orderDate || '').trim().toLowerCase();
+        const isoDate = normalizeDateVal(r.orderDate, r.timestamp);
         const itemLower = (r.itemName || '').trim().toLowerCase();
         const colLower = (r.color || '').trim().toLowerCase();
         const widLower = (r.width || '').trim().toLowerCase();
@@ -1535,14 +1618,16 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
         const orderSig = `${rawPo}|${custLower}|${dateLower}`.replace(/[.#$/[\]\s]+/g, '_');
         const canonOrderSig = `${canonPo}|${custLower}|${dateLower}`.replace(/[.#$/[\]\s]+/g, '_');
+        const isoOrderSig = `${canonPo}|${custLower}|${isoDate}`.replace(/[.#$/[\]\s]+/g, '_');
         const rowMatchSig = `${rawPo}|${custLower}|${itemLower}|${colLower}|${widLower}|${qtyNum}|${dateLower}`.replace(/[.#$/[\]\s]+/g, '_');
-        const canonRowMatchSig = `${canonPo}|${custLower}|${itemLower}|${colLower}|${widLower}|${qtyNum}|${dateLower}`.replace(/[.#$/[\]\s]+/g, '_');
+        const canonRowMatchSig = `${canonPo}|${custLower}|${itemLower}|${colLower}|${widLower}|${qtyNum}|${isoDate}`.replace(/[.#$/[\]\s]+/g, '_');
         const sheetRowNum = r.orderId.startsWith('DELHI-') ? Number(r.orderId.replace('DELHI-', '')) : undefined;
+        const cleanRef = (r.referenceNo || '').trim();
 
         const record = {
           order_no: r.orderNo || '',
           order_no_timestamp: r.orderNoTimestamp || '',
-          reference_no: r.referenceNo || '',
+          reference_no: cleanRef,
           customer_po: r.customerPO || '',
           customer_name: r.customerName || '',
           order_date: r.orderDate || '',
@@ -1550,17 +1635,44 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           sheet_row: sheetRowNum || null,
           updated_at: new Date().toISOString()
         };
+        aaAbRecords.push(record);
+        if (cleanRef) payload[`ref_${cleanRef.replace(/[.#$/[\]\s]+/g, '_').substring(0, 140)}`] = record;
         if (orderSig) payload[`ord_${orderSig}`] = record;
         if (canonOrderSig) payload[`ord_${canonOrderSig}`] = record;
+        if (isoOrderSig) payload[`ord_${isoOrderSig}`] = record;
         if (rowMatchSig) payload[`row_${rowMatchSig}`] = record;
         if (canonRowMatchSig) payload[`row_${canonRowMatchSig}`] = record;
       });
 
-      await fetch(`${baseTargetUrl}/product_order_aa_ab.json${authQuery}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      const [, webhookRes] = await Promise.all([
+        fetch(`${baseTargetUrl}/product_order_aa_ab.json${authQuery}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }),
+        postToFmsSheetWebhook({
+          action: 'update_aa_ab',
+          spreadsheetId: '15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0',
+          tabName: 'Product Order',
+          rows: aaAbRecords
+        })
+      ]);
+
+      if (showSheetResultBanner) {
+        const firstNo = aaAbRecords[0]?.order_no || '';
+        const firstTs = aaAbRecords[0]?.order_no_timestamp || '';
+        if (webhookRes.configured && webhookRes.ok) {
+          setSyncFeedback(
+            `✓ Order No "${firstNo}" (${firstTs}) saved to Firebase AND written directly into Google Sheet "Product Order" Col AA & AB!`
+          );
+          setTimeout(() => setSyncFeedback(null), 5000);
+        } else if (webhookRes.configured && !webhookRes.ok) {
+          setSyncFeedback(
+            `✓ Order No "${firstNo}" saved to Firebase, but Google Sheet webhook failed (${webhookRes.error || 'Check Apps Script URL'}).`
+          );
+          setTimeout(() => setSyncFeedback(null), 6000);
+        }
+      }
     } catch (e) {
       // Ignore network errors silently
     }
@@ -1610,8 +1722,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         return row;
       });
 
-      // Immediately push ONLY changed rows to Firebase /product_order_aa_ab & /product_automation (zero lag!)
-      pushAAABOverrideToFirebase(changedRows);
+      // Immediately push ONLY changed rows to Firebase /product_order_aa_ab + FMS Sheet webhook + /product_automation (zero lag!)
+      pushAAABOverrideToFirebase(changedRows, true);
       if (changedRows.length > 0) {
         pushOrdersToFirebase(changedRows, undefined, undefined, true).catch(() => {});
       }
@@ -1619,7 +1731,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     });
 
     setSyncFeedback(
-      `Order No "${generatedNo}" & Timestamp (${nowStr}) updated in Col AA (27) & Col AB (28) and synced to Cloud!`
+      `Order No "${generatedNo}" & Timestamp (${nowStr}) updated in Col AA (27) & Col AB (28) — syncing to Firebase & Google Sheet...`
     );
     setTimeout(() => setSyncFeedback(null), 4500);
   };
@@ -1723,7 +1835,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         }
         return row;
       });
-      pushAAABOverrideToFirebase(changedRows);
+      pushAAABOverrideToFirebase(changedRows, true);
       if (changedRows.length > 0) {
         pushOrdersToFirebase(changedRows, undefined, undefined, true).catch(() => {});
       }
@@ -3044,12 +3156,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   // Dedicated Live 2-Way Sync for Google Sheet "15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0"
   // (Tabs: "Product Order", "Order Automation 1", "Closed Orders") + Firebase Realtime Database
   const handleSyncDelhiImportRange = async (silent: boolean = false) => {
+    const isSilent = silent === true;
     const fmsSheetId = '15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0';
     const delhiSheetId = '1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY';
     const delhiTab = 'Delhi';
-    if (!silent) {
+    if (!isSilent) {
       setIsSyncingImportRange(true);
-      setSyncFeedback('Syncing Product Order (Cols A:AB), Order Automation & Closed Orders with Firebase Cloud...');
+      setSyncFeedback('Syncing Product Order (Cols A:AB), Order Automation & Closed Orders with Google Sheet & Firebase...');
     }
 
     const cacheBust = `&_t=${Date.now()}`;
@@ -3268,7 +3381,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         return '';
       };
 
-      const [fbCloud, aaAbCloudData, cellUpdatesCloud, sheetAutoCsv, sheetClosedCsv] = await Promise.all([
+      const [fbCloud, aaAbCloudData, cellUpdatesCloud, fmsConfigCloud, sheetAutoCsv, sheetClosedCsv] = await Promise.all([
         fetchOrdersFromFirebase(),
         fetch(`${baseTargetUrl}/product_order_aa_ab.json${authQuery}`)
           .then(r => (r.ok ? r.json() : null))
@@ -3276,15 +3389,58 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         fetch(`${baseTargetUrl}/cell_updates.json${authQuery}`)
           .then(r => (r.ok ? r.json() : null))
           .catch(() => null),
+        fetch(`${baseTargetUrl}/fms_config.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null),
         fetchSheetTabCsvSilent(['Order Automation 1', 'Order Automation 1 ', 'Product Automation']),
         fetchSheetTabCsvSilent(['Closed Orders', 'Closed Orders '])
       ]);
+
+      if (fmsConfigCloud?.webapp_url && typeof fmsConfigCloud.webapp_url === 'string' && fmsConfigCloud.webapp_url.trim().startsWith('https://')) {
+        const cleanHook = fmsConfigCloud.webapp_url.trim();
+        setFmsWebAppUrl(cleanHook);
+        fmsWebAppUrlRef.current = cleanHook;
+        try {
+          localStorage.setItem(LOCAL_STORAGE_FMS_WEBAPP_URL, cleanHook);
+        } catch (e) {}
+      }
 
       const sheetAutoRows = parse45ColSheetCsvForSync(sheetAutoCsv, false);
       const sheetClosedRows = parse45ColSheetCsvForSync(sheetClosedCsv, true);
 
       const aaAbOverrides: Record<string, any> =
         aaAbCloudData && typeof aaAbCloudData === 'object' && !aaAbCloudData.error ? aaAbCloudData : {};
+
+      // Build normalized lookup maps for /product_order_aa_ab so date formats or Ref Nos always match 100%
+      const aaAbByRefNo: Record<string, any> = {};
+      const aaAbByCanonOrd: Record<string, any> = {};
+      const aaAbByCanonRow: Record<string, any> = {};
+      const aaAbBySheetRow: Record<number, any> = {};
+      const pickNewerRec = (existing: any, incoming: any) => {
+        if (!existing) return incoming;
+        return String(incoming?.updated_at || '') >= String(existing?.updated_at || '') ? incoming : existing;
+      };
+      Object.values(aaAbOverrides).forEach((rec: any) => {
+        if (!rec || typeof rec !== 'object' || !rec.order_no) return;
+        const refTrim = String(rec.reference_no || '').trim();
+        if (refTrim) aaAbByRefNo[refTrim] = pickNewerRec(aaAbByRefNo[refTrim], rec);
+        if (rec.sheet_row && Number(rec.sheet_row) > 1) {
+          const sr = Number(rec.sheet_row);
+          aaAbBySheetRow[sr] = pickNewerRec(aaAbBySheetRow[sr], rec);
+        }
+        const cPo = normalizePoVal(rec.customer_po);
+        const cCust = String(rec.customer_name || '').trim().toLowerCase();
+        const cIso = normalizeDateVal(rec.order_date);
+        const cItem = String(rec.item_name || '').trim().toLowerCase();
+        if (cCust) {
+          const ordK = `${cPo}|${cCust}|${cIso}`;
+          aaAbByCanonOrd[ordK] = pickNewerRec(aaAbByCanonOrd[ordK], rec);
+          if (cItem) {
+            const rowK = `${ordK}|${cItem}`;
+            aaAbByCanonRow[rowK] = pickNewerRec(aaAbByCanonRow[rowK], rec);
+          }
+        }
+      });
 
       const cloudDispOverrides: Record<string, number> =
         cellUpdatesCloud?.dispatch && typeof cellUpdatesCloud.dispatch === 'object' ? cellUpdatesCloud.dispatch : {};
@@ -3311,6 +3467,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       let finalMergedForCloud: ProductOrderRow[] = [];
       let hadCountMismatchHeal = false;
       const localClosedToShare: ProductOrderRow[] = [];
+      const unsyncedLocalAAAB: ProductOrderRow[] = [];
+      const pendingSheetAAABRows: ProductOrderRow[] = [];
 
       setRawResponses(prev => {
         // Strip initial demo rows
@@ -3392,17 +3550,45 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const mergedDelhiRows: ProductOrderRow[] = fetchedRows.map(fRow => {
           const k = makeCanonicalRowKey(fRow);
           const canonItemKey = makeCanonItemKeyNoDate(fRow);
+          const fPoCanon = normalizePoVal(fRow.customerPO);
+          const fCustLower = (fRow.customerName || '').trim().toLowerCase();
+          const fIsoDate = normalizeDateVal(fRow.orderDate, fRow.timestamp);
+          const fItemLower = (fRow.itemName || '').trim().toLowerCase();
+          const fRowNum = fRow.orderId.startsWith('DELHI-') ? Number(fRow.orderId.replace('DELHI-', '')) : 0;
+          const sheetRowHint = fRowNum > 1 ? aaAbBySheetRow[fRowNum] : undefined;
+          const validSheetRowHint =
+            sheetRowHint &&
+            (!sheetRowHint.customer_name || String(sheetRowHint.customer_name).trim().toLowerCase() === fCustLower)
+              ? sheetRowHint
+              : undefined;
+
           const cloudAAAB =
+            (fRow.referenceNo ? aaAbByRefNo[fRow.referenceNo.trim()] : undefined) ||
             aaAbOverrides[makeRowSigCanon(fRow)] ||
             aaAbOverrides[makeRowSigRaw(fRow)] ||
+            aaAbByCanonRow[`${fPoCanon}|${fCustLower}|${fIsoDate}|${fItemLower}`] ||
+            validSheetRowHint ||
             aaAbOverrides[makeOrderSigCanon(fRow)] ||
-            aaAbOverrides[makeOrderSigRaw(fRow)];
+            aaAbOverrides[makeOrderSigRaw(fRow)] ||
+            aaAbByCanonOrd[`${fPoCanon}|${fCustLower}|${fIsoDate}`];
+
+          const candidates = existingQueueByKey.get(k);
+          const match = candidates && candidates.length > 0 ? candidates[candidates.length - 1] : undefined;
+
           const resolvedOrderNo =
             (cloudAAAB?.order_no && (!fRow.orderNo || fRow.orderNo === cloudAAAB.order_no))
               ? cloudAAAB.order_no
-              : (fRow.orderNo || cloudAAAB?.order_no || '');
+              : (fRow.orderNo || cloudAAAB?.order_no || match?.orderNo || '');
           const resolvedOrderNoTs =
-            fRow.orderNoTimestamp || cloudAAAB?.order_no_timestamp || '';
+            fRow.orderNoTimestamp || cloudAAAB?.order_no_timestamp || match?.orderNoTimestamp || '';
+
+          if (!fRow.orderNo && resolvedOrderNo) {
+            const rowWithAA = { ...fRow, orderNo: resolvedOrderNo, orderNoTimestamp: resolvedOrderNoTs };
+            pendingSheetAAABRows.push(rowWithAA);
+            if (!cloudAAAB?.order_no && match?.orderNo) {
+              unsyncedLocalAAAB.push(rowWithAA);
+            }
+          }
 
           const baseOrderKey = [
             fRow.customerPO,
@@ -3471,8 +3657,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             };
           }
 
-          const candidates = existingQueueByKey.get(k);
-          const match = candidates && candidates.length > 0 ? candidates[candidates.length - 1] : undefined;
           if (match) {
             const finalDisp = savedDisp > 0 ? savedDisp : (match.dispatchQty || fRow.dispatchQty || 0);
             const resolvedStatus = isExplicitActive
@@ -3539,25 +3723,55 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         pushOrdersToFirebase(localClosedToShare, undefined, undefined, true).catch(() => {});
       }
 
+      if (unsyncedLocalAAAB.length > 0) {
+        pushAAABOverrideToFirebase(unsyncedLocalAAAB, false).catch(() => {});
+      }
+
       // Push canonical dataset to Firebase when manually clicked OR when healing a count mismatch
-      if ((!silent || hadCountMismatchHeal) && finalMergedForCloud.length > 0) {
+      if ((!isSilent || hadCountMismatchHeal) && finalMergedForCloud.length > 0) {
         setTimeout(() => {
           pushOrdersToFirebase(finalMergedForCloud).catch(() => {});
         }, 400);
       }
 
-      if (!silent) {
+      if (!isSilent) {
+        let webhookNote = '';
+        if (pendingSheetAAABRows.length > 0 || fmsWebAppUrlRef.current) {
+          const directAAABPayload = pendingSheetAAABRows.map(r => ({
+            order_no: r.orderNo || '',
+            order_no_timestamp: r.orderNoTimestamp || '',
+            reference_no: r.referenceNo || '',
+            customer_po: r.customerPO || '',
+            customer_name: r.customerName || '',
+            order_date: r.orderDate || '',
+            item_name: r.itemName || '',
+            sheet_row: r.orderId.startsWith('DELHI-') ? Number(r.orderId.replace('DELHI-', '')) : null
+          }));
+          const webhookRes = await postToFmsSheetWebhook({
+            action: 'full_sync',
+            spreadsheetId: fmsSheetId,
+            aa_ab_rows: directAAABPayload
+          });
+          if (webhookRes.configured && webhookRes.ok) {
+            webhookNote = ` | Google Sheet Updated ✓ (${webhookRes.updated_aa_ab ?? directAAABPayload.length} AA/AB rows)`;
+          } else if (webhookRes.configured && !webhookRes.ok) {
+            webhookNote = ` | Sheet Webhook Notice: ${webhookRes.error || 'Check Apps Script URL'}`;
+          } else if (pendingSheetAAABRows.length > 0) {
+            webhookNote = ` | ${pendingSheetAAABRows.length} AA/AB saved in Firebase (Run Sheet Script or link FMS Web App URL in Firebase Sync for instant Google Sheet write)`;
+          }
+        }
+
         const countWithAA = finalMergedForCloud.filter(r => r.orderNo && r.orderNo.trim() !== '').length;
         const countWithAB = finalMergedForCloud.filter(r => r.orderNoTimestamp && r.orderNoTimestamp.trim() !== '').length;
         const closedCount = finalMergedForCloud.filter(r => r.statusAN === 'Closed' || r.sheetSource === 'closed').length;
         const openCount = finalMergedForCloud.length - closedCount;
         setSyncFeedback(
-          `✓ 2-Way Synced Google Sheet & Firebase! Total Product Order: ${finalMergedForCloud.length.toLocaleString()} (Order Automation: ${openCount.toLocaleString()} | Closed Orders: ${closedCount.toLocaleString()} | Col AA Order Nos: ${countWithAA.toLocaleString()} | Col AB Timestamps: ${countWithAB.toLocaleString()}).`
+          `✓ Synced Sheet & Firebase! Product Order: ${finalMergedForCloud.length.toLocaleString()} (Automation: ${openCount.toLocaleString()} | Closed: ${closedCount.toLocaleString()} | Col AA: ${countWithAA.toLocaleString()} | Col AB: ${countWithAB.toLocaleString()})${webhookNote}`
         );
-        setTimeout(() => setSyncFeedback(null), 5000);
+        setTimeout(() => setSyncFeedback(null), 6500);
       }
     } catch (err: any) {
-      if (!silent) {
+      if (!isSilent) {
         setImportSheetId(fmsSheetId);
         setImportTabName('Product Order');
         setImportReplaceMode(false);
@@ -3568,7 +3782,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         setSyncFeedback(null);
       }
     } finally {
-      if (!silent) {
+      if (!isSilent) {
         setIsSyncingImportRange(false);
       }
     }
@@ -3584,12 +3798,24 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       `${normalizePoVal(r.customerPO)}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`;
 
     try {
-      const [cellUpdatesCloud, fbCloud] = await Promise.all([
+      const [cellUpdatesCloud, fbCloud, fmsConfigCloud] = await Promise.all([
         fetch(`${baseTargetUrl}/cell_updates.json${authQuery}`)
           .then(r => (r.ok ? r.json() : null))
           .catch(() => null),
-        fetchOrdersFromFirebase()
+        fetchOrdersFromFirebase(),
+        fetch(`${baseTargetUrl}/fms_config.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null)
       ]);
+
+      if (fmsConfigCloud?.webapp_url && typeof fmsConfigCloud.webapp_url === 'string' && fmsConfigCloud.webapp_url.trim().startsWith('https://')) {
+        const cleanHook = fmsConfigCloud.webapp_url.trim();
+        setFmsWebAppUrl(cleanHook);
+        fmsWebAppUrlRef.current = cleanHook;
+        try {
+          localStorage.setItem(LOCAL_STORAGE_FMS_WEBAPP_URL, cleanHook);
+        } catch (e) {}
+      }
 
       if (cellUpdatesCloud?.dispatch && typeof cellUpdatesCloud.dispatch === 'object') {
         setDispatchRecords(prev => ({ ...cellUpdatesCloud.dispatch, ...prev }));
@@ -5418,7 +5644,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             freezeRows={freezeRows}
             autoFitColumns={autoFitColumns}
             isSyncingImportRange={isSyncingImportRange}
-            onSyncImportRange={handleSyncDelhiImportRange}
+            onSyncImportRange={() => handleSyncDelhiImportRange(false)}
             onGenerateOrderNo={handleGenerateOrderNo}
             onGenerateAllPending={handleGenerateAllPendingOrderNo}
             onDeleteRow={handleDeleteItem}
@@ -6663,6 +6889,26 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                     ✓ Aapne Rules me <code>".read": true, ".write": true</code> lagaya hai, isliye Secret blank rakh sakte hain!
                   </span>
                 </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                    3. Main FMS Google Sheet Web App URL (Optional — Instant Col AA/AB &amp; Automation Sheet Sync):
+                  </label>
+                  <input
+                    type="text"
+                    value={fmsWebAppUrl}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setFmsWebAppUrl(val);
+                      fmsWebAppUrlRef.current = val.trim();
+                    }}
+                    placeholder="https://script.google.com/macros/s/.../exec"
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg font-mono focus:ring-1 focus:ring-amber-500 focus:outline-none bg-slate-50"
+                  />
+                  <span className="text-[10px] text-slate-600 mt-0.5 block leading-relaxed">
+                    Google Sheet (<code>15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0</code>) ke Apps Script me <strong>Deploy &gt; Web app</strong> URL yahan save karne par Product Order Col AA/AB turant sheet me update honge.
+                  </span>
+                </div>
               </div>
 
               {/* Upload Progress Bar if active */}
@@ -6689,14 +6935,30 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                 <div className="flex items-center gap-2 w-full sm:w-auto">
                   <button
                     type="button"
-                    onClick={() => {
+                    onClick={async () => {
                       const cleanUrl = normalizeFirebaseDbUrl(firebaseUrl);
+                      const cleanFmsHook = fmsWebAppUrl.trim();
                       setFirebaseUrl(cleanUrl);
+                      setFmsWebAppUrl(cleanFmsHook);
+                      fmsWebAppUrlRef.current = cleanFmsHook;
                       localStorage.setItem(
                         LOCAL_STORAGE_FIREBASE_CONFIG,
                         JSON.stringify({ url: cleanUrl, secret: firebaseSecret })
                       );
-                      setFirebaseStatusMsg({ type: 'success', text: `✓ Saved Firebase URL (${cleanUrl})!` });
+                      localStorage.setItem(LOCAL_STORAGE_FMS_WEBAPP_URL, cleanFmsHook);
+                      if (cleanFmsHook) {
+                        const cleanSec = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+                        const authParam = cleanSec ? `?auth=${encodeURIComponent(cleanSec)}` : '';
+                        await fetch(`${cleanUrl}/fms_config.json${authParam}`, {
+                          method: 'PUT',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ webapp_url: cleanFmsHook, updated_at: new Date().toISOString() })
+                        }).catch(() => {});
+                      }
+                      setFirebaseStatusMsg({
+                        type: 'success',
+                        text: `✓ Saved Firebase URL (${cleanUrl})${cleanFmsHook ? ' & FMS Sheet Webhook URL' : ''}!`
+                      });
                       setSyncFeedback('Saved Firebase URL & Config!');
                       setTimeout(() => setSyncFeedback(null), 3000);
                     }}

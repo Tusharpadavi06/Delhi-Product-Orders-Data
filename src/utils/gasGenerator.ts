@@ -3050,12 +3050,140 @@ function setupCompleteTwoWaySync() {
    3B. INSTANT WEBHOOK (doPost) & LIGHTWEIGHT SINGLE-ROW SHEET EDIT (onEdit)
    ========================================================= */
 
+function applyDirectAAABBatch_(rows) {
+  if (!rows || !rows.length) return { updated: 0 };
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(FIREBASE_CONFIG.SOURCE_TAB);
+  if (!sheet) return { updated: 0, error: "Source tab not found: " + FIREBASE_CONFIG.SOURCE_TAB };
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < FIREBASE_CONFIG.FIRST_DATA_ROW) return { updated: 0 };
+
+  const rowCount = lastRow - FIREBASE_CONFIG.FIRST_DATA_ROW + 1;
+  const maxCols = Math.max(sheet.getLastColumn(), 28);
+  const displayValues = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols).getDisplayValues();
+  const rawDateValues = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 6, rowCount, 1).getValues();
+  const tz = ss.getSpreadsheetTimeZone() || "Asia/Kolkata";
+  const nowFormatted = Utilities.formatDate(new Date(), tz, "dd/MM/yyyy HH:mm:ss");
+
+  const byRefNo = {};
+  const byCanonOrd = {};
+  const bySheetRow = {};
+
+  rows.forEach(function(rec) {
+    if (!rec || !rec.order_no) return;
+    if (rec.reference_no) {
+      byRefNo[String(rec.reference_no).trim()] = rec;
+    }
+    if (rec.sheet_row && Number(rec.sheet_row) >= FIREBASE_CONFIG.FIRST_DATA_ROW) {
+      bySheetRow[Number(rec.sheet_row)] = rec;
+    }
+    const cPo = fmsNormalizePo_(rec.customer_po);
+    const cCust = String(rec.customer_name || "").trim().toLowerCase();
+    const cDt = fmsFormatDateDDMMYYYY_(rec.order_date, tz).toLowerCase();
+    if (cCust) {
+      byCanonOrd[fmsFbKey_(cPo + "|" + cCust + "|" + cDt)] = rec;
+    }
+  });
+
+  const aaAbBatch = displayValues.map(function(r) {
+    return [r[26] || "", r[27] || ""];
+  });
+
+  let updatedCount = 0;
+  let lastPo = "";
+  let lastCust = "";
+  let lastOrdDate = "";
+
+  for (let i = 0; i < displayValues.length; i++) {
+    const row = displayValues[i];
+    const sheetRowNum = FIREBASE_CONFIG.FIRST_DATA_ROW + i;
+    const refNo = String(row[0] || "").trim();
+    const rawPo = String(row[2] || "").trim();
+    const rawCust = String(row[3] || "").trim();
+    const rawDate = fmsFormatDateDDMMYYYY_(rawDateValues[i][0] || row[5], tz) || String(row[5] || "").trim();
+    const itemName = String(row[7] || "").trim();
+    if (!rawCust && !itemName && !lastCust) continue;
+
+    if (rawCust) {
+      lastPo = rawPo || "N/A";
+      lastCust = rawCust;
+      lastOrdDate = rawDate;
+    }
+
+    const po = rawCust ? (rawPo || "N/A") : (lastPo || "N/A");
+    const cust = rawCust || lastCust;
+    const ordDate = rawCust ? rawDate : lastOrdDate;
+    const normPo = fmsNormalizePo_(po);
+    const canonOrdLookup = fmsFbKey_(normPo + "|" + cust.toLowerCase() + "|" + ordDate.toLowerCase());
+
+    const rowHintRec = bySheetRow[sheetRowNum];
+    const validRowHint =
+      rowHintRec &&
+      (!rowHintRec.customer_name || String(rowHintRec.customer_name).trim().toLowerCase() === cust.toLowerCase())
+        ? rowHintRec
+        : null;
+
+    const match = (refNo && byRefNo[refNo]) || validRowHint || byCanonOrd[canonOrdLookup];
+    if (!match || !match.order_no) continue;
+
+    const nextAA = String(match.order_no).trim();
+    const nextAB = String(match.order_no_timestamp || aaAbBatch[i][1] || nowFormatted).trim();
+    if (nextAA && (String(aaAbBatch[i][0] || "").trim() !== nextAA || (!aaAbBatch[i][1] && nextAB))) {
+      aaAbBatch[i][0] = nextAA;
+      aaAbBatch[i][1] = nextAB;
+      updatedCount++;
+    }
+  }
+
+  if (updatedCount > 0) {
+    sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 27, rowCount, 2).setValues(aaAbBatch);
+  }
+  return { updated: updatedCount };
+}
+
 function doPost(e) {
   try {
+    let body = {};
+    if (e && e.postData && e.postData.contents) {
+      try {
+        body = JSON.parse(e.postData.contents) || {};
+      } catch (parseErr) {
+        body = {};
+      }
+    }
+
+    if (body.action === "update_aa_ab" && Array.isArray(body.rows)) {
+      const resAAAB = applyDirectAAABBatch_(body.rows);
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: true,
+        action: "update_aa_ab",
+        updated_aa_ab: resAAAB.updated || 0,
+        synced_at: new Date().toISOString()
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (body.action === "sync_automation") {
+      syncWebAppUpdatesToAutomationSheet();
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: true,
+        action: "sync_automation",
+        synced_at: new Date().toISOString()
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    let directRes = { updated: 0 };
+    if (Array.isArray(body.aa_ab_rows) && body.aa_ab_rows.length > 0) {
+      directRes = applyDirectAAABBatch_(body.aa_ab_rows);
+    }
     syncProductOrderAAABWithFirebase();
     syncWebAppUpdatesToAutomationSheet();
-    return ContentService.createTextOutput(JSON.stringify({ ok: true, synced_at: new Date().toISOString() }))
-      .setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true,
+      action: "full_sync",
+      updated_aa_ab: directRes.updated || 0,
+      synced_at: new Date().toISOString()
+    })).setMimeType(ContentService.MimeType.JSON);
   } catch (err) {
     return ContentService.createTextOutput(JSON.stringify({ ok: false, error: String(err) }))
       .setMimeType(ContentService.MimeType.JSON);
