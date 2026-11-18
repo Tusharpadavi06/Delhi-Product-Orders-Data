@@ -2443,9 +2443,43 @@ function fmsNormalizePo_(po) {
   return ["n/a", "na", "-", "—", "nil", "none", "null"].indexOf(s) !== -1 ? "" : s;
 }
 
+function fmsFormatDateDDMMYYYY_(val, tz) {
+  if (val == null || val === "") return "";
+  if (val instanceof Date && !isNaN(val.getTime())) {
+    return Utilities.formatDate(val, tz || "Asia/Kolkata", "dd/MM/yyyy");
+  }
+  const s = String(val).trim();
+  if (!s) return "";
+  // ISO YYYY-MM-DD
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return ("0" + m[3]).slice(-2) + "/" + ("0" + m[2]).slice(-2) + "/" + m[1];
+  // DD-MMM-YYYY or D-MMM-YY (e.g. 17-Nov-2026)
+  const monNames = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+  m = s.match(/^(\d{1,2})[\s\-\/]([A-Za-z]{3})[A-Za-z]*[\s\-\/](\d{2,4})/);
+  if (m) {
+    const monIdx = monNames.indexOf(m[2].toLowerCase()) + 1;
+    if (monIdx > 0) {
+      const yr = m[3].length === 2 ? "20" + m[3] : m[3];
+      return ("0" + m[1]).slice(-2) + "/" + ("0" + monIdx).slice(-2) + "/" + yr;
+    }
+  }
+  // DD/MM/YYYY or D/M/YYYY
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  if (m) {
+    const yr = m[3].length === 2 ? "20" + m[3] : m[3];
+    return ("0" + m[1]).slice(-2) + "/" + ("0" + m[2]).slice(-2) + "/" + yr;
+  }
+  return s;
+}
+
+function fmsFbKey_(raw) {
+  return String(raw || "").replace(/[.#$/\[\]\s]+/g, "_").substring(0, 180);
+}
+
 /* =========================================================
    0A. 2-WAY MULTIPURPOSE SYNC: "PRODUCT ORDER" COL AA (27) & COL AB (28) <-> WEB APP
    - Pulls Order Numbers entered in Web App (/product_order_aa_ab) into Sheet Col AA & Col AB
+   - Matches by Reference No (Col A), Normalized PO+Customer+Date (dd/MM/yyyy), or Row Signature
    - Pushes Order Numbers entered in Sheet Col AA & Col AB to Firebase (/product_order_aa_ab)
    ========================================================= */
 
@@ -2464,6 +2498,7 @@ function syncProductOrderAAABWithFirebase() {
   const rowCount = lastRow - FIREBASE_CONFIG.FIRST_DATA_ROW + 1;
   const maxCols = Math.max(sheet.getLastColumn(), 28);
   const displayValues = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols).getDisplayValues();
+  const rawDateValues = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 6, rowCount, 1).getValues();
 
   // 1. Fetch existing Web App overrides from Firebase /product_order_aa_ab
   let cloudAAAB = {};
@@ -2474,7 +2509,24 @@ function syncProductOrderAAABWithFirebase() {
     }
   } catch (e) {}
 
+  // Build fast lookup by reference_no & normalized po|cust|date so date formatting never blocks matching
   const tz = ss.getSpreadsheetTimeZone() || "Asia/Kolkata";
+  const cloudByRefNo = {};
+  const cloudByCanonOrd = {};
+  Object.keys(cloudAAAB).forEach(function(k) {
+    const rec = cloudAAAB[k];
+    if (!rec || !rec.order_no) return;
+    if (rec.reference_no) {
+      cloudByRefNo[String(rec.reference_no).trim()] = rec;
+    }
+    const cPo = fmsNormalizePo_(rec.customer_po);
+    const cCust = String(rec.customer_name || "").trim().toLowerCase();
+    const cDt = fmsFormatDateDDMMYYYY_(rec.order_date, tz).toLowerCase();
+    if (cCust) {
+      cloudByCanonOrd[fmsFbKey_(cPo + "|" + cCust + "|" + cDt)] = rec;
+    }
+  });
+
   const nowFormatted = Utilities.formatDate(new Date(), tz, "dd/MM/yyyy HH:mm:ss");
   const outgoingPatch = {};
   let updatedInSheetCount = 0;
@@ -2494,7 +2546,7 @@ function syncProductOrderAAABWithFirebase() {
     const refNo = String(row[0] || "").trim();
     const rawPo = String(row[2] || "").trim();
     const rawCust = String(row[3] || "").trim();
-    const rawDate = String(row[5] || "").trim();
+    const rawDate = fmsFormatDateDDMMYYYY_(rawDateValues[i][0] || row[5], tz) || String(row[5] || "").trim();
     const itemName = String(row[7] || "").trim();
     if (!rawCust && !itemName && !lastCust) continue;
 
@@ -2509,13 +2561,19 @@ function syncProductOrderAAABWithFirebase() {
     const ordDate = rawCust ? rawDate : lastOrdDate;
     const normPo = fmsNormalizePo_(po);
 
-    const ordSig = "ord_" + (po.toLowerCase() + "|" + cust.toLowerCase() + "|" + ordDate.toLowerCase()).replace(/[.#$/\[\]\s]+/g, "_");
-    const normOrdSig = "ord_" + (normPo + "|" + cust.toLowerCase() + "|" + ordDate.toLowerCase()).replace(/[.#$/\[\]\s]+/g, "_");
+    const ordSig = "ord_" + fmsFbKey_(po.toLowerCase() + "|" + cust.toLowerCase() + "|" + ordDate.toLowerCase());
+    const normOrdSig = "ord_" + fmsFbKey_(normPo + "|" + cust.toLowerCase() + "|" + ordDate.toLowerCase());
+    const canonOrdLookup = fmsFbKey_(normPo + "|" + cust.toLowerCase() + "|" + ordDate.toLowerCase());
 
     let sheetAA = String(row[26] || "").trim(); // Col AA (27)
     let sheetAB = String(row[27] || "").trim(); // Col AB (28)
 
-    const cloudEntry = cloudAAAB[ordSig] || cloudAAAB[normOrdSig];
+    const cloudEntry =
+      (refNo && cloudByRefNo[refNo]) ||
+      cloudAAAB[ordSig] ||
+      cloudAAAB[normOrdSig] ||
+      cloudByCanonOrd[canonOrdLookup];
+
     if (cloudEntry && cloudEntry.order_no && String(cloudEntry.order_no).trim() !== "" && sheetAA !== String(cloudEntry.order_no).trim()) {
       // Order No was entered or updated in Web App -> Update in-memory batch for Col AA (27) & Col AB (28)
       sheetAA = String(cloudEntry.order_no).trim();
@@ -2568,8 +2626,10 @@ function syncProductOrderAAABWithFirebase() {
 }
 
 /* =========================================================
-   0B. PULL WEB APP UPDATES (DISPATCH QNT, REMARKS, STATUS, LR, WHATSAPP, OPEN/CLOSE) INTO GOOGLE SHEET
-   Uses 1-Batch Memory Update on Cols X..AO (Cols 24..41) — ZERO cell-by-cell setValue hang!
+   0B. FULL 2-WAY SYNC FOR "ORDER AUTOMATION 1" <-> "CLOSED ORDERS" <-> FIREBASE WEB APP
+   - Pulls Dispatch Qty, Remarks, Follow-ups, LR No, Order No & Open/Closed Status into Google Sheet
+   - Moves Closed rows from "Order Automation 1" -> "Closed Orders" in 1 fast batch
+   - Moves Reopened (Open / In-Progress) rows from "Closed Orders" -> "Order Automation 1" in 1 fast batch
    ========================================================= */
 
 function syncWebAppUpdatesToAutomationSheet() {
@@ -2582,9 +2642,12 @@ function syncWebAppUpdatesToAutomationSheet() {
     ss.getSheetByName("Product Automation");
   if (!sheet) return;
 
-  const lastRow = sheet.getLastRow();
-  if (lastRow < FIREBASE_CONFIG.FIRST_DATA_ROW) return;
+  // Keep ONLY Row 1 (Heading Row) frozen in Order Automation
+  try {
+    if (sheet.getFrozenRows() !== 1) sheet.setFrozenRows(1);
+  } catch (e) {}
 
+  const tz = ss.getSpreadsheetTimeZone() || "Asia/Kolkata";
   const baseUrl = FIREBASE_CONFIG.DATABASE_URL.replace(new RegExp('/+$'), '');
   const authParam = FIREBASE_CONFIG.DATABASE_SECRET ? "?auth=" + encodeURIComponent(FIREBASE_CONFIG.DATABASE_SECRET) : "";
 
@@ -2609,217 +2672,302 @@ function syncWebAppUpdatesToAutomationSheet() {
   const statusAnMap = cellUpdates.status_an || {};
   const statusMap = cellUpdates.status_map || {};
 
-  const rowCount = lastRow - FIREBASE_CONFIG.FIRST_DATA_ROW + 1;
-  const maxCols = Math.max(sheet.getLastColumn(), 45);
-  const displayValues = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols).getDisplayValues();
-  const rawValues = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols).getValues();
-
-  // Extract Cols X..AO (indices 23..40, 18 columns) into an in-memory block for 1 single batch write
-  const blockColsXtoAO = rawValues.map(function(r) {
-    return r.slice(23, 41);
+  // Index cloudAAAB by normalized po|cust|date too
+  const aaAbByCanonOrd = {};
+  Object.keys(cloudAAAB).forEach(function(k) {
+    const rec = cloudAAAB[k];
+    if (!rec || !rec.order_no) return;
+    const cPo = fmsNormalizePo_(rec.customer_po);
+    const cCust = String(rec.customer_name || "").trim().toLowerCase();
+    const cDt = fmsFormatDateDDMMYYYY_(rec.order_date, tz).toLowerCase();
+    if (cCust) {
+      aaAbByCanonOrd[fmsFbKey_(cPo + "|" + cCust + "|" + cDt)] = rec;
+    }
   });
 
-  let currentPo = "";
-  let currentCust = "";
-  let currentEmail = "";
-  let currentPhone = "";
-  let currentDate = "";
-  let updatedCellsCount = 0;
-
-  for (let i = 0; i < displayValues.length; i++) {
-    const row = displayValues[i];
-    const isBlockStart = Boolean(String(row[0] || "").trim() || String(row[1] || "").trim() || String(row[2] || "").trim());
-
-    if (isBlockStart) {
-      currentPo = String(row[1] || "").trim();
-      currentCust = String(row[2] || "").trim();
-      currentEmail = String(row[3] || "").trim();
-      currentDate = String(row[4] || "").trim();
-      currentPhone = String(row[15] || "").trim();
-    }
-
-    if (!currentCust) continue;
-
-    const normPo = fmsNormalizePo_(currentPo);
-    const poWithNa = normPo || "N/A";
-    const itemName = String(row[6] || "").trim();
-    const color = String(row[7] || "").trim();
-    const width = String(row[8] || "").trim();
-    const qtyNum = parseFloat(rawValues[i][10]) || 0;
-
-    // 1. Check Dispatch Qty (Col Y = index 1 in blockColsXtoAO, Balance Col Z = index 2)
-    const normItemSig = (normPo + "|" + currentCust.toLowerCase() + "|" + itemName.toLowerCase() + "|" + color.toLowerCase() + "|" + width.toLowerCase() + "|" + qtyNum).replace(/[.#$/\[\]\s]+/g, "_");
-    const naItemSig = (poWithNa.toLowerCase() + "|" + currentCust.toLowerCase() + "|" + itemName.toLowerCase() + "|" + color.toLowerCase() + "|" + width.toLowerCase() + "|" + qtyNum).replace(/[.#$/\[\]\s]+/g, "_");
-
-    let cloudDisp = undefined;
-    if (dispItemsMap[normItemSig] && dispItemsMap[normItemSig].dispatch_qty !== undefined) {
-      cloudDisp = Number(dispItemsMap[normItemSig].dispatch_qty);
-    } else if (dispItemsMap[naItemSig] && dispItemsMap[naItemSig].dispatch_qty !== undefined) {
-      cloudDisp = Number(dispItemsMap[naItemSig].dispatch_qty);
-    } else if (dispMap[normItemSig] !== undefined) {
-      cloudDisp = Number(dispMap[normItemSig]);
-    } else if (dispMap[naItemSig] !== undefined) {
-      cloudDisp = Number(dispMap[naItemSig]);
-    }
-
-    if (cloudDisp !== undefined && !isNaN(cloudDisp)) {
-      const currentSheetDisp = parseFloat(rawValues[i][24]) || 0;
-      if (currentSheetDisp !== cloudDisp) {
-        const newBal = Number((qtyNum - cloudDisp).toFixed(4));
-        blockColsXtoAO[i][1] = cloudDisp; // Col Y (25)
-        blockColsXtoAO[i][2] = newBal;    // Col Z (26)
-        updatedCellsCount++;
-      }
-    }
-
-    // 2. Check Open / Close Status (Col AN = 40 -> index 16 in blockColsXtoAO)
-    const cloudStatusObj = statusAnMap[normItemSig] || statusAnMap[naItemSig];
-    const resolvedCloudStatus =
-      (cloudStatusObj && cloudStatusObj.status_an) ||
-      statusMap[normItemSig] ||
-      statusMap[naItemSig];
-    if (resolvedCloudStatus) {
-      const currentSheetStatus = String(row[39] || "Open").trim();
-      if (currentSheetStatus !== resolvedCloudStatus) {
-        blockColsXtoAO[i][16] = resolvedCloudStatus; // Col AN (40)
-        updatedCellsCount++;
-      }
-    }
-
-    // 3. Check Order-level fields on first row of order block (Col X Order No, Cols AA-AO)
-    if (isBlockStart) {
-      const ordSig1 = "ord_" + (poWithNa.toLowerCase() + "|" + currentCust.toLowerCase() + "|" + currentDate.toLowerCase()).replace(/[.#$/\[\]\s]+/g, "_");
-      const ordSig2 = "ord_" + (normPo + "|" + currentCust.toLowerCase() + "|" + currentDate.toLowerCase()).replace(/[.#$/\[\]\s]+/g, "_");
-      const aaAbMatch = cloudAAAB[ordSig1] || cloudAAAB[ordSig2];
-      if (aaAbMatch && aaAbMatch.order_no && String(row[23] || "").trim() !== String(aaAbMatch.order_no).trim()) {
-        blockColsXtoAO[i][0] = String(aaAbMatch.order_no).trim(); // Col X (24)
-        updatedCellsCount++;
-      }
-
-      const ordKeyNa = [poWithNa, currentCust, currentEmail, currentPhone, currentDate].join("_").replace(/[.#$/\[\]\s]+/g, "_").substring(0, 180);
-      const ordKeyBlank = [normPo, currentCust, currentEmail, currentPhone, currentDate].join("_").replace(/[.#$/\[\]\s]+/g, "_").substring(0, 180);
-      const ordKeySimple = (normPo + "|" + currentCust.toLowerCase() + "|" + currentDate.toLowerCase()).replace(/[.#$/\[\]\s]+/g, "_").substring(0, 180);
-
-      const ordPatch = ordersMap[ordKeyNa] || ordersMap[ordKeyBlank] || ordersMap[ordKeySimple];
-      if (ordPatch) {
-        if (ordPatch.colAA !== undefined && String(row[26] || "") !== String(ordPatch.colAA)) {
-          blockColsXtoAO[i][3] = ordPatch.colAA; // Col AA (27)
-          updatedCellsCount++;
-        }
-        if (ordPatch.colAB !== undefined && String(row[27] || "") !== String(ordPatch.colAB)) {
-          blockColsXtoAO[i][4] = ordPatch.colAB; // Col AB (28)
-          updatedCellsCount++;
-        }
-        if (ordPatch.colAE !== undefined && String(row[30] || "") !== String(ordPatch.colAE)) {
-          blockColsXtoAO[i][7] = ordPatch.colAE; // Col AE (31)
-          updatedCellsCount++;
-        }
-        if (ordPatch.colAG !== undefined && Boolean(rawValues[i][32]) !== Boolean(ordPatch.colAG)) {
-          blockColsXtoAO[i][9] = Boolean(ordPatch.colAG); // Col AG (33)
-          updatedCellsCount++;
-        }
-        if (ordPatch.colAH !== undefined && String(row[33] || "") !== String(ordPatch.colAH)) {
-          blockColsXtoAO[i][10] = ordPatch.colAH; // Col AH (34)
-          updatedCellsCount++;
-        }
-        if (ordPatch.colAI !== undefined && String(row[34] || "") !== String(ordPatch.colAI)) {
-          blockColsXtoAO[i][11] = ordPatch.colAI; // Col AI (35)
-          updatedCellsCount++;
-        }
-        if (ordPatch.colAJ !== undefined && Boolean(rawValues[i][35]) !== Boolean(ordPatch.colAJ)) {
-          blockColsXtoAO[i][12] = Boolean(ordPatch.colAJ); // Col AJ (36)
-          updatedCellsCount++;
-        }
-        if (ordPatch.colAK !== undefined && String(row[36] || "") !== String(ordPatch.colAK)) {
-          blockColsXtoAO[i][13] = ordPatch.colAK; // Col AK (37)
-          updatedCellsCount++;
-        }
-        if (ordPatch.colAL !== undefined && String(row[37] || "") !== String(ordPatch.colAL)) {
-          blockColsXtoAO[i][14] = ordPatch.colAL; // Col AL (38)
-          updatedCellsCount++;
-        }
-        if (ordPatch.lrNumber !== undefined && String(row[38] || "") !== String(ordPatch.lrNumber)) {
-          blockColsXtoAO[i][15] = ordPatch.lrNumber; // Col AM (39)
-          updatedCellsCount++;
-        }
-        if (ordPatch.colAO !== undefined && String(row[40] || "") !== String(ordPatch.colAO)) {
-          blockColsXtoAO[i][17] = ordPatch.colAO; // Col AO (41)
-          updatedCellsCount++;
-        }
-      }
-    }
-
-    // Apply in-memory updates from blockColsXtoAO back into rawValues[i] (cols 23..40)
-    for (let c = 0; c < 18; c++) {
-      rawValues[i][23 + c] = blockColsXtoAO[i][c];
-    }
-    // Ensure sub-rows of merged order blocks carry order header info (A..E) when moved to Closed Orders
-    if (!String(rawValues[i][2] || "").trim() && currentCust) {
-      rawValues[i][1] = currentPo;
-      rawValues[i][2] = currentCust;
-      rawValues[i][3] = currentEmail;
-      rawValues[i][4] = currentDate;
-      rawValues[i][15] = currentPhone;
-    }
+  function resolveCloudStatus_(po, cust, itemName, color, width, qtyNum) {
+    const normPo = fmsNormalizePo_(po);
+    const poWithNa = normPo || "n/a";
+    const sig1 = fmsFbKey_(normPo + "|" + cust.toLowerCase() + "|" + itemName.toLowerCase() + "|" + color.toLowerCase() + "|" + width.toLowerCase() + "|" + qtyNum);
+    const sig2 = fmsFbKey_(poWithNa + "|" + cust.toLowerCase() + "|" + itemName.toLowerCase() + "|" + color.toLowerCase() + "|" + width.toLowerCase() + "|" + qtyNum);
+    const obj = statusAnMap[sig1] || statusAnMap[sig2];
+    if (obj && obj.status_an) return String(obj.status_an).trim();
+    if (statusMap[sig1]) return String(statusMap[sig1]).trim();
+    if (statusMap[sig2]) return String(statusMap[sig2]).trim();
+    return "";
   }
 
-  // Separate Open/In-Progress rows from Closed rows so Closed orders move from "Order Automation 1" to "Closed Orders" in 1 fast batch!
   const closedSheet =
     ss.getSheetByName(FIREBASE_CONFIG.CLOSED_TAB) ||
     ss.getSheetByName("Closed Orders") ||
     ss.getSheetByName("Closed Orders ");
 
-  const stillOpenRows = [];
-  const newlyClosedRows = [];
+  // STEP 1: Check "Closed Orders" tab first for any rows REOPENED in Web App (status_an === "Open" / "In-Progress")
+  const reopenedRowsFromClosed = [];
+  if (closedSheet && closedSheet.getLastRow() >= FIREBASE_CONFIG.FIRST_DATA_ROW) {
+    const clLastRow = closedSheet.getLastRow();
+    const clRowCount = clLastRow - FIREBASE_CONFIG.FIRST_DATA_ROW + 1;
+    const clMaxCols = Math.max(closedSheet.getLastColumn(), 45);
+    const clDisp = closedSheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, clRowCount, clMaxCols).getDisplayValues();
+    const clRaw = closedSheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, clRowCount, clMaxCols).getValues();
 
-  for (let i = 0; i < rawValues.length; i++) {
-    const r = rawValues[i];
-    const st = String(r[39] || "Open").trim().toLowerCase();
-    if (st === "closed" || st === "close") {
-      r[39] = "Closed";
-      newlyClosedRows.push(r);
-    } else {
-      stillOpenRows.push(r);
+    let clPo = "", clCust = "", clEmail = "", clPhone = "", clDate = "";
+    const remainingClosedRows = [];
+
+    for (let i = 0; i < clDisp.length; i++) {
+      const rDisp = clDisp[i];
+      const rRaw = clRaw[i];
+      if (rRaw.every(function(c) { return c === "" || c == null; })) continue;
+
+      if (String(rDisp[0] || "").trim() || String(rDisp[1] || "").trim() || String(rDisp[2] || "").trim()) {
+        clPo = String(rDisp[1] || "").trim();
+        clCust = String(rDisp[2] || "").trim();
+        clEmail = String(rDisp[3] || "").trim();
+        clDate = fmsFormatDateDDMMYYYY_(rRaw[4] || rDisp[4], tz) || String(rDisp[4] || "").trim();
+        clPhone = String(rDisp[15] || "").trim();
+      }
+
+      if (!String(rRaw[2] || "").trim() && clCust) {
+        rRaw[1] = clPo;
+        rRaw[2] = clCust;
+        rRaw[3] = clEmail;
+        rRaw[4] = clDate;
+        rRaw[15] = clPhone;
+      }
+
+      const itemName = String(rDisp[6] || "").trim();
+      const color = String(rDisp[7] || "").trim();
+      const width = String(rDisp[8] || "").trim();
+      const qtyNum = parseFloat(rRaw[10]) || 0;
+      const cloudSt = clCust ? resolveCloudStatus_(clPo, clCust, itemName, color, width, qtyNum) : "";
+
+      if (cloudSt === "Open" || cloudSt === "In-Progress") {
+        rRaw[39] = cloudSt;
+        reopenedRowsFromClosed.push(rRaw);
+      } else {
+        remainingClosedRows.push(rRaw);
+      }
+    }
+
+    if (reopenedRowsFromClosed.length > 0) {
+      closedSheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, clRowCount, clMaxCols).breakApart();
+      if (remainingClosedRows.length > 0) {
+        closedSheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, remainingClosedRows.length, clMaxCols).setValues(remainingClosedRows);
+      }
+      if (remainingClosedRows.length < clRowCount) {
+        closedSheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW + remainingClosedRows.length, 1, clRowCount - remainingClosedRows.length, clMaxCols).clearContent();
+      }
     }
   }
 
-  if (newlyClosedRows.length > 0 && closedSheet) {
-    // Append newly closed rows to "Closed Orders" tab in 1 batch write
-    const closedStartRow = Math.max(FIREBASE_CONFIG.FIRST_DATA_ROW, closedSheet.getLastRow() + 1);
-    const neededRows = closedStartRow + newlyClosedRows.length - 1;
-    if (neededRows > closedSheet.getMaxRows()) {
-      closedSheet.insertRowsAfter(closedSheet.getMaxRows(), neededRows - closedSheet.getMaxRows());
-    }
-    if (closedSheet.getMaxColumns() < maxCols) {
-      closedSheet.insertColumnsAfter(closedSheet.getMaxColumns(), maxCols - closedSheet.getMaxColumns());
-    }
-    closedSheet.getRange(closedStartRow, 1, newlyClosedRows.length, maxCols).setValues(newlyClosedRows);
+  // STEP 2: Process "Order Automation 1" rows (update Cols X..AO & move Closed rows to "Closed Orders")
+  const lastRow = sheet.getLastRow();
+  let newlyClosedRows = [];
+  let stillOpenRows = [];
+  let updatedCellsCount = 0;
 
-    // Rewrite only stillOpenRows to "Order Automation 1" in 1 batch write & clear leftover bottom rows (ZERO slow deleteRows loop!)
-    const fullAutoRange = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols);
-    fullAutoRange.breakApart();
-    if (stillOpenRows.length > 0) {
-      sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, stillOpenRows.length, maxCols).setValues(stillOpenRows);
+  if (lastRow >= FIREBASE_CONFIG.FIRST_DATA_ROW) {
+    const rowCount = lastRow - FIREBASE_CONFIG.FIRST_DATA_ROW + 1;
+    const maxCols = Math.max(sheet.getLastColumn(), 45);
+    const displayValues = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols).getDisplayValues();
+    const rawValues = sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols).getValues();
+
+    const blockColsXtoAO = rawValues.map(function(r) {
+      return r.slice(23, 41);
+    });
+
+    let currentPo = "";
+    let currentCust = "";
+    let currentEmail = "";
+    let currentPhone = "";
+    let currentDate = "";
+
+    for (let i = 0; i < displayValues.length; i++) {
+      const row = displayValues[i];
+      if (rawValues[i].every(function(c) { return c === "" || c == null; })) continue;
+
+      const isBlockStart = Boolean(String(row[0] || "").trim() || String(row[1] || "").trim() || String(row[2] || "").trim());
+      if (isBlockStart) {
+        currentPo = String(row[1] || "").trim();
+        currentCust = String(row[2] || "").trim();
+        currentEmail = String(row[3] || "").trim();
+        currentDate = fmsFormatDateDDMMYYYY_(rawValues[i][4] || row[4], tz) || String(row[4] || "").trim();
+        currentPhone = String(row[15] || "").trim();
+      }
+
+      if (!currentCust) continue;
+
+      const normPo = fmsNormalizePo_(currentPo);
+      const poWithNa = normPo || "N/A";
+      const itemName = String(row[6] || "").trim();
+      const color = String(row[7] || "").trim();
+      const width = String(row[8] || "").trim();
+      const qtyNum = parseFloat(rawValues[i][10]) || 0;
+
+      // 1. Check Dispatch Qty (Col Y = 25, Balance Col Z = 26)
+      const normItemSig = fmsFbKey_(normPo + "|" + currentCust.toLowerCase() + "|" + itemName.toLowerCase() + "|" + color.toLowerCase() + "|" + width.toLowerCase() + "|" + qtyNum);
+      const naItemSig = fmsFbKey_(poWithNa.toLowerCase() + "|" + currentCust.toLowerCase() + "|" + itemName.toLowerCase() + "|" + color.toLowerCase() + "|" + width.toLowerCase() + "|" + qtyNum);
+
+      let cloudDisp = undefined;
+      if (dispItemsMap[normItemSig] && dispItemsMap[normItemSig].dispatch_qty !== undefined) {
+        cloudDisp = Number(dispItemsMap[normItemSig].dispatch_qty);
+      } else if (dispItemsMap[naItemSig] && dispItemsMap[naItemSig].dispatch_qty !== undefined) {
+        cloudDisp = Number(dispItemsMap[naItemSig].dispatch_qty);
+      } else if (dispMap[normItemSig] !== undefined) {
+        cloudDisp = Number(dispMap[normItemSig]);
+      } else if (dispMap[naItemSig] !== undefined) {
+        cloudDisp = Number(dispMap[naItemSig]);
+      }
+
+      if (cloudDisp !== undefined && !isNaN(cloudDisp)) {
+        const currentSheetDisp = parseFloat(rawValues[i][24]) || 0;
+        if (currentSheetDisp !== cloudDisp) {
+          const newBal = Number((qtyNum - cloudDisp).toFixed(4));
+          blockColsXtoAO[i][1] = cloudDisp; // Col Y (25)
+          blockColsXtoAO[i][2] = newBal;    // Col Z (26)
+          updatedCellsCount++;
+        }
+      }
+
+      // 2. Check Open / Close Status (Col AN = 40 -> index 16 in blockColsXtoAO)
+      const resolvedCloudStatus = resolveCloudStatus_(currentPo, currentCust, itemName, color, width, qtyNum);
+      if (resolvedCloudStatus) {
+        const currentSheetStatus = String(row[39] || "Open").trim();
+        if (currentSheetStatus !== resolvedCloudStatus) {
+          blockColsXtoAO[i][16] = resolvedCloudStatus; // Col AN (40)
+          updatedCellsCount++;
+        }
+      }
+
+      // 3. Check Order-level fields (Order No Col X, Cols AA-AO)
+      if (isBlockStart) {
+        const ordSig1 = "ord_" + fmsFbKey_(poWithNa.toLowerCase() + "|" + currentCust.toLowerCase() + "|" + currentDate.toLowerCase());
+        const ordSig2 = "ord_" + fmsFbKey_(normPo + "|" + currentCust.toLowerCase() + "|" + currentDate.toLowerCase());
+        const canonOrd = fmsFbKey_(normPo + "|" + currentCust.toLowerCase() + "|" + currentDate.toLowerCase());
+        const aaAbMatch = cloudAAAB[ordSig1] || cloudAAAB[ordSig2] || aaAbByCanonOrd[canonOrd];
+        if (aaAbMatch && aaAbMatch.order_no && String(row[23] || "").trim() !== String(aaAbMatch.order_no).trim()) {
+          blockColsXtoAO[i][0] = String(aaAbMatch.order_no).trim(); // Col X (24)
+          updatedCellsCount++;
+        }
+
+        const ordKeyNa = fmsFbKey_([poWithNa, currentCust, currentEmail, currentPhone, currentDate].join("_"));
+        const ordKeyBlank = fmsFbKey_([normPo, currentCust, currentEmail, currentPhone, currentDate].join("_"));
+        const ordKeySimple = fmsFbKey_(normPo + "|" + currentCust.toLowerCase() + "|" + currentDate.toLowerCase());
+
+        const ordPatch = ordersMap[ordKeyNa] || ordersMap[ordKeyBlank] || ordersMap[ordKeySimple];
+        if (ordPatch) {
+          if (ordPatch.colAA !== undefined && String(row[26] || "") !== String(ordPatch.colAA)) {
+            blockColsXtoAO[i][3] = ordPatch.colAA;
+            updatedCellsCount++;
+          }
+          if (ordPatch.colAB !== undefined && String(row[27] || "") !== String(ordPatch.colAB)) {
+            blockColsXtoAO[i][4] = ordPatch.colAB;
+            updatedCellsCount++;
+          }
+          if (ordPatch.colAE !== undefined && String(row[30] || "") !== String(ordPatch.colAE)) {
+            blockColsXtoAO[i][7] = ordPatch.colAE;
+            updatedCellsCount++;
+          }
+          if (ordPatch.colAG !== undefined && Boolean(rawValues[i][32]) !== Boolean(ordPatch.colAG)) {
+            blockColsXtoAO[i][9] = Boolean(ordPatch.colAG);
+            updatedCellsCount++;
+          }
+          if (ordPatch.colAH !== undefined && String(row[33] || "") !== String(ordPatch.colAH)) {
+            blockColsXtoAO[i][10] = ordPatch.colAH;
+            updatedCellsCount++;
+          }
+          if (ordPatch.colAI !== undefined && String(row[34] || "") !== String(ordPatch.colAI)) {
+            blockColsXtoAO[i][11] = ordPatch.colAI;
+            updatedCellsCount++;
+          }
+          if (ordPatch.colAJ !== undefined && Boolean(rawValues[i][35]) !== Boolean(ordPatch.colAJ)) {
+            blockColsXtoAO[i][12] = Boolean(ordPatch.colAJ);
+            updatedCellsCount++;
+          }
+          if (ordPatch.colAK !== undefined && String(row[36] || "") !== String(ordPatch.colAK)) {
+            blockColsXtoAO[i][13] = ordPatch.colAK;
+            updatedCellsCount++;
+          }
+          if (ordPatch.colAL !== undefined && String(row[37] || "") !== String(ordPatch.colAL)) {
+            blockColsXtoAO[i][14] = ordPatch.colAL;
+            updatedCellsCount++;
+          }
+          if (ordPatch.lrNumber !== undefined && String(row[38] || "") !== String(ordPatch.lrNumber)) {
+            blockColsXtoAO[i][15] = ordPatch.lrNumber;
+            updatedCellsCount++;
+          }
+          if (ordPatch.colAO !== undefined && String(row[40] || "") !== String(ordPatch.colAO)) {
+            blockColsXtoAO[i][17] = ordPatch.colAO;
+            updatedCellsCount++;
+          }
+        }
+      }
+
+      // Apply in-memory updates from blockColsXtoAO back into rawValues[i] (cols 23..40)
+      for (let c = 0; c < 18; c++) {
+        rawValues[i][23 + c] = blockColsXtoAO[i][c];
+      }
+      if (!String(rawValues[i][2] || "").trim() && currentCust) {
+        rawValues[i][1] = currentPo;
+        rawValues[i][2] = currentCust;
+        rawValues[i][3] = currentEmail;
+        rawValues[i][4] = currentDate;
+        rawValues[i][15] = currentPhone;
+      }
+
+      const st = String(rawValues[i][39] || "Open").trim().toLowerCase();
+      if (st === "closed" || st === "close") {
+        rawValues[i][39] = "Closed";
+        newlyClosedRows.push(rawValues[i]);
+      } else {
+        stillOpenRows.push(rawValues[i]);
+      }
     }
-    if (stillOpenRows.length < rowCount) {
-      sheet
-        .getRange(
-          FIREBASE_CONFIG.FIRST_DATA_ROW + stillOpenRows.length,
-          1,
-          rowCount - stillOpenRows.length,
-          maxCols
-        )
-        .clearContent();
+
+    // Write newlyClosedRows to "Closed Orders" & keep stillOpenRows (+ any reopenedRowsFromClosed) in "Order Automation 1"
+    if (newlyClosedRows.length > 0 && closedSheet) {
+      const closedStartRow = Math.max(FIREBASE_CONFIG.FIRST_DATA_ROW, closedSheet.getLastRow() + 1);
+      const neededRows = closedStartRow + newlyClosedRows.length - 1;
+      if (neededRows > closedSheet.getMaxRows()) {
+        closedSheet.insertRowsAfter(closedSheet.getMaxRows(), neededRows - closedSheet.getMaxRows());
+      }
+      if (closedSheet.getMaxColumns() < maxCols) {
+        closedSheet.insertColumnsAfter(closedSheet.getMaxColumns(), maxCols - closedSheet.getMaxColumns());
+      }
+      closedSheet.getRange(closedStartRow, 1, newlyClosedRows.length, maxCols).setValues(newlyClosedRows);
     }
-    ss.toast(
-      "Moved " + newlyClosedRows.length + " Closed rows to 'Closed Orders' & kept " + stillOpenRows.length + " Open rows in '" + sheet.getName() + "'!",
-      "2-Way Sync Complete",
-      5
-    );
-  } else if (updatedCellsCount > 0) {
-    // Write all updated cells in ONE single batch operation (prevents Google Sheet from recalculating 5,000 times!)
-    sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 24, rowCount, 18).setValues(blockColsXtoAO);
-    ss.toast("Updated " + updatedCellsCount + " cells in Google Sheet in 1 fast batch!", "2-Way Sync Complete", 4);
+
+    if (newlyClosedRows.length > 0 || reopenedRowsFromClosed.length > 0) {
+      const finalOpenRows = stillOpenRows.concat(reopenedRowsFromClosed);
+      const neededOpenMax = FIREBASE_CONFIG.FIRST_DATA_ROW + finalOpenRows.length - 1;
+      if (neededOpenMax > sheet.getMaxRows()) {
+        sheet.insertRowsAfter(sheet.getMaxRows(), neededOpenMax - sheet.getMaxRows());
+      }
+      const clearRowCount = Math.max(rowCount, finalOpenRows.length);
+      sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, rowCount, maxCols).breakApart();
+      if (finalOpenRows.length > 0) {
+        sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 1, finalOpenRows.length, maxCols).setValues(finalOpenRows);
+      }
+      if (finalOpenRows.length < clearRowCount) {
+        sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW + finalOpenRows.length, 1, clearRowCount - finalOpenRows.length, maxCols).clearContent();
+      }
+      ss.toast(
+        "Synced! Closed: " + newlyClosedRows.length + " -> 'Closed Orders' | Reopened: " + reopenedRowsFromClosed.length + " -> '" + sheet.getName() + "' | Active: " + finalOpenRows.length,
+        "2-Way Sync Complete",
+        5
+      );
+    } else if (updatedCellsCount > 0) {
+      sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 24, rowCount, 18).setValues(blockColsXtoAO);
+      ss.toast("Updated " + updatedCellsCount + " cells in Google Sheet in 1 fast batch!", "2-Way Sync Complete", 4);
+    }
+  } else if (reopenedRowsFromClosed.length > 0) {
+    const startAuto = FIREBASE_CONFIG.FIRST_DATA_ROW;
+    const maxCols = reopenedRowsFromClosed[0].length;
+    if (sheet.getMaxRows() < startAuto + reopenedRowsFromClosed.length - 1) {
+      sheet.insertRowsAfter(sheet.getMaxRows(), startAuto + reopenedRowsFromClosed.length - 1 - sheet.getMaxRows());
+    }
+    sheet.getRange(startAuto, 1, reopenedRowsFromClosed.length, maxCols).setValues(reopenedRowsFromClosed);
+    ss.toast("Reopened " + reopenedRowsFromClosed.length + " rows back to '" + sheet.getName() + "'!", "2-Way Sync Complete", 4);
   }
 }
 
@@ -2880,6 +3028,24 @@ function syncAllTabsToFirebase() {
   syncWebAppUpdatesToAutomationSheet();
 }
 
+function setupCompleteTwoWaySync() {
+  syncAllTabsToFirebase();
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(function(trig) {
+    const fn = trig.getHandlerFunction();
+    if (fn === "syncProductAutomationToFirebase" || fn === "syncAllTabsToFirebase") {
+      ScriptApp.deleteTrigger(trig);
+    }
+  });
+  ScriptApp.newTrigger("syncAllTabsToFirebase")
+    .timeBased()
+    .everyMinutes(5)
+    .create();
+  try {
+    SpreadsheetApp.getUi().alert("✅ 2-Way Sync Complete & Auto 5-Min Trigger Active!\\nWeb App <-> Google Sheet ab har 5 minute me sync hota rahega.");
+  } catch (e) {}
+}
+
 /* =========================================================
    3B. INSTANT WEBHOOK (doPost) & LIGHTWEIGHT SINGLE-ROW SHEET EDIT (onEdit)
    ========================================================= */
@@ -2904,7 +3070,10 @@ function onEdit(e) {
   const row = e.range.getRow();
   if (row < FIREBASE_CONFIG.FIRST_DATA_ROW) return;
 
-  // 1. If Order No (Col AA = 27) edited in "Product Order" -> Auto-fill Timestamp in Col AB (28) ONLY on that single row (0.05s, zero sheet scan!)
+  const baseUrl = FIREBASE_CONFIG.DATABASE_URL.replace(new RegExp('/+$'), '');
+  const authParam = FIREBASE_CONFIG.DATABASE_SECRET ? "?auth=" + encodeURIComponent(FIREBASE_CONFIG.DATABASE_SECRET) : "";
+
+  // 1. If Order No (Col AA = 27) edited in "Product Order" -> Auto-fill Timestamp in Col AB (28) + push to Firebase
   if (sheetName === FIREBASE_CONFIG.SOURCE_TAB && col === 27) {
     const val = String(e.range.getValue() || "").trim();
     if (val !== "") {
@@ -2924,6 +3093,30 @@ function onEdit(e) {
     const disp = (dispRaw !== "" && dispRaw != null && !isNaN(Number(dispRaw))) ? Number(dispRaw) : 0;
     const bal = Number((qty - disp).toFixed(4));
     sheet.getRange(row, 26).setValue(bal);
+    return;
+  }
+
+  // 3. If Open/Close (Col AN = 40) edited directly in Google Sheet -> Patch Firebase status_an + status_map
+  if (col === 40 && (sheetName === FIREBASE_CONFIG.AUTOMATION_TAB || sheetName.indexOf("Automation") !== -1 || sheetName === FIREBASE_CONFIG.CLOSED_TAB)) {
+    const newSt = String(e.range.getValue() || "").trim();
+    if (newSt === "Closed" || newSt === "Open" || newSt === "In-Progress") {
+      try {
+        const rowVals = sheet.getRange(row, 1, 1, 15).getDisplayValues()[0];
+        const po = fmsNormalizePo_(rowVals[1]);
+        const cust = String(rowVals[2] || "").trim().toLowerCase();
+        const item = String(rowVals[6] || "").trim().toLowerCase();
+        const color = String(rowVals[7] || "").trim().toLowerCase();
+        const width = String(rowVals[8] || "").trim().toLowerCase();
+        const qty = parseFloat(sheet.getRange(row, 11).getValue()) || 0;
+        if (cust && item) {
+          const sig = fmsFbKey_(po + "|" + cust + "|" + item + "|" + color + "|" + width + "|" + qty);
+          const statusMapPatch = {}; statusMapPatch[sig] = newSt;
+          const statusAnPatch = {}; statusAnPatch[sig] = { status_an: newSt, updated_at: new Date().toISOString() };
+          UrlFetchApp.fetch(baseUrl + "/cell_updates/status_map.json" + authParam, { method: "PATCH", contentType: "application/json", payload: JSON.stringify(statusMapPatch), muteHttpExceptions: true });
+          UrlFetchApp.fetch(baseUrl + "/cell_updates/status_an.json" + authParam, { method: "PATCH", contentType: "application/json", payload: JSON.stringify(statusAnPatch), muteHttpExceptions: true });
+        }
+      } catch (err) {}
+    }
   }
 }
 

@@ -672,7 +672,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
       </div>
 
       {/* Main Single Row Flat Table Grid */}
-      <div className={`overflow-x-auto overflow-y-auto ${isFullWidth ? 'h-[calc(100vh-185px)] max-h-[85vh]' : 'h-[620px] max-h-[75vh]'} select-text relative fms-sheet-scroll border border-slate-300 rounded-lg shadow-inner bg-white`}>
+      <div className={`overflow-x-auto overflow-y-auto ${isFullWidth ? 'h-[calc(100vh-215px)] min-h-[360px]' : 'h-[580px] max-h-[72vh]'} select-text relative fms-sheet-scroll border border-slate-300 rounded-lg shadow-inner bg-white`}>
         <table className={`${autoFitColumns ? 'w-max min-w-full table-auto' : 'w-full'} border-collapse text-xs text-left`}>
           {/* Header Row: 28 Columns with Freeze / Unfreeze & Hide/Show Support */}
           <thead className={`${freezeRows > 0 ? 'sticky top-0 z-30' : ''} select-none border-b-2 border-slate-900 font-mono text-[11px]`}>

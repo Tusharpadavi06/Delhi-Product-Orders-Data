@@ -2,6 +2,24 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { GroupedOrder, ProductOrderRow, OrderItem } from '../types/fms';
 import { initialRawResponses, initialExistingDispatch, fmsColumnMapping, productOrderColumns } from '../data/sampleOrders';
 import { ProductOrderView, isDateOrTimestampStr, DEFAULT_BRANCH_HEAD_NAME, DEFAULT_BRANCH_HEAD_EMAIL, MONTH_OPTIONS, parseOrderDateParts } from './ProductOrderView';
+import { TNAView, TnaDateFieldKey } from './TNAView';
+import {
+  TNA_SPREADSHEET_ID,
+  TNA_TAB_NAME,
+  DEFAULT_TNA_WEBAPP_URL,
+  TnaDateHistoryEntry,
+  TnaManualEntry,
+  TnaRowItem,
+  buildTnaAltKey,
+  buildOpenTnaRows,
+  buildAllTnaRowsLookup,
+  computeTnaDelayDays,
+  computeTnaOrderStatus,
+  emptyTnaManual,
+  normalizeTnaManual,
+  toFirebaseSafeTnaKey,
+  toTnaStorageDate
+} from '../utils/tnaUtils';
 import { saveOrdersToStorage, loadOrdersFromStorage, clearOrdersFromStorage } from '../utils/orderStorage';
 import {
   RotateCcw,
@@ -62,7 +80,7 @@ const LOCAL_STORAGE_KEY = 'ginza_fms_sheet_orders_v13';
 const LOCAL_STORAGE_DISPATCH_KEY = 'ginza_fms_sheet_dispatch_v9';
 const LOCAL_STORAGE_COL_VISIBILITY = 'ginza_fms_col_visibility_v10';
 const LOCAL_STORAGE_FIREBASE_CONFIG = 'ginza_fms_firebase_cfg_v9';
-const LOCAL_STORAGE_FREEZE_CONFIG = 'ginza_fms_freeze_cfg_v9';
+const LOCAL_STORAGE_FREEZE_CONFIG = 'ginza_fms_freeze_cfg_v10';
 const LOCAL_STORAGE_CONFIRM_KEY = 'ginza_fms_confirm_msg_v9';
 const LOCAL_STORAGE_COL_AA_KEY = 'ginza_fms_col_aa_v10';
 const LOCAL_STORAGE_COL_AB_KEY = 'ginza_fms_col_ab_v10';
@@ -72,6 +90,7 @@ const LOCAL_STORAGE_COL_AI_KEY = 'ginza_fms_col_ai_v10';
 const LOCAL_STORAGE_COL_AJ_KEY = 'ginza_fms_col_aj_v10';
 const LOCAL_STORAGE_COL_AK_KEY = 'ginza_fms_col_ak_v10';
 const LOCAL_STORAGE_COL_AL_KEY = 'ginza_fms_col_al_v10';
+const LOCAL_STORAGE_TNA_RECORDS = 'ginza_fms_tna_records_v2';
 
 /**
  * Normalizes Customer PO so blank, "N/A", "NA", "-", "nil" all match 100% identically across tabs & devices.
@@ -373,13 +392,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     return initial;
   });
 
-  // Freeze Configuration: freezeColumns (0, 1: #, 2: # + PO, 3: # + PO + Name), freezeRows (1: Header, 0: None)
+  // Freeze Configuration: Default is ONLY Header Row frozen (cols: 0, rows: 1) as requested
   const [freezeColumns, setFreezeColumns] = useState<number>(() => {
     try {
       const saved = localStorage.getItem(LOCAL_STORAGE_FREEZE_CONFIG);
-      if (saved) return JSON.parse(saved).cols ?? 2;
+      if (saved) return JSON.parse(saved).cols ?? 0;
     } catch (e) {}
-    return 2; // Default: Freeze # and Customer PO for easy scrolling
+    return 0; // Default: Do not freeze columns horizontally; freeze Header Row only
   });
 
   const [freezeRows, setFreezeRows] = useState<number>(() => {
@@ -387,7 +406,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       const saved = localStorage.getItem(LOCAL_STORAGE_FREEZE_CONFIG);
       if (saved) return JSON.parse(saved).rows ?? 1;
     } catch (e) {}
-    return 1;
+    return 1; // Default: Heading row frozen
   });
   const [showFreezeMenu, setShowFreezeMenu] = useState(false);
 
@@ -603,8 +622,28 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     };
   });
 
-  // Active Sheet tab: 'product_order' (28-Col Raw Flat Sheet), 'automation' (Product Automation: Active Orders), 'closed' (Closed Orders Archive)
-  const [activeSheetTab, setActiveSheetTab] = useState<'product_order' | 'automation' | 'closed'>('product_order');
+  // Active Sheet tab: 'product_order' | 'automation' | 'closed' | 'tna'
+  const [activeSheetTab, setActiveSheetTab] = useState<'product_order' | 'automation' | 'closed' | 'tna'>('product_order');
+
+  // Centralized TNA manual records (/tna_records in Firebase + localStorage cache)
+  const [tnaRecords, setTnaRecords] = useState<Record<string, TnaManualEntry>>(() => {
+    try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_TNA_RECORDS);
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return {};
+  });
+  const [tnaWebAppUrl, setTnaWebAppUrl] = useState<string>(DEFAULT_TNA_WEBAPP_URL);
+  const [isSyncingTna, setIsSyncingTna] = useState<boolean>(false);
+  const [tnaSyncNotice, setTnaSyncNotice] = useState<string | null>(null);
+  const tnaRecordsRef = useRef<Record<string, TnaManualEntry>>(tnaRecords);
+  const pendingTnaPatchRef = useRef<Record<string, TnaManualEntry>>({});
+  const tnaSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tnaLoadedFromCloudRef = useRef<boolean>(false);
+  const lastTnaOpenSigRef = useRef<string>('');
+  const tnaSheetKnownKeysRef = useRef<Record<string, boolean>>({});
+  const tnaSheetDeletedKeysRef = useRef<Record<string, boolean>>({});
+  const tnaSheetMetaLoadedRef = useRef<boolean>(false);
 
   // Status Filter in Toolbar
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'Open' | 'In-Progress' | 'Closed'>('ALL');
@@ -941,6 +980,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       };
     });
   }, [baseGroupedOrders, dispatchRecords]);
+  const groupedOrdersRef = useRef<GroupedOrder[]>(groupedOrders);
+  groupedOrdersRef.current = groupedOrders;
 
   // Helper to immediately patch centralized status_map & status_an in Firebase (< 50ms, never hits 256MB limit)
   // Also syncs with Google Sheet's syncWebAppUpdatesToAutomationSheet() which reads /cell_updates/status_an & /cell_updates/status_map
@@ -3251,6 +3292,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         cellUpdatesCloud?.orders && typeof cellUpdatesCloud.orders === 'object' ? cellUpdatesCloud.orders : {};
       const cloudStatusMap: Record<string, string> =
         cellUpdatesCloud?.status_map && typeof cellUpdatesCloud.status_map === 'object' ? cellUpdatesCloud.status_map : {};
+      const cloudStatusAnMap: Record<string, any> =
+        cellUpdatesCloud?.status_an && typeof cellUpdatesCloud.status_an === 'object' ? cellUpdatesCloud.status_an : {};
 
       // Merge any non-zero Dispatch Qty from Google Sheet "Order Automation 1" / "Closed Orders" + Firebase /cell_updates
       const sheetDispPatches: Record<string, number> = {};
@@ -3289,24 +3332,52 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
         const sanitizeFbKey = (k: string) => k.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
 
-        const allKnownClosedRows: ProductOrderRow[] = [...sheetClosedRows, ...fbCloud.closedRows];
-        const seenClosedSigs = new Set(allKnownClosedRows.map(makeCanonicalRowKey));
+        const resolveCloudExplicitStatus = (r: ProductOrderRow): string | undefined => {
+          const fullKey = sanitizeFbKey(makeCanonicalRowKey(r));
+          const noDateKey = sanitizeFbKey(makeCanonItemKeyNoDate(r));
+          const poNaNoDateKey = sanitizeFbKey(
+            `${normalizePoVal(r.customerPO) || 'n/a'}|${(r.customerName || '').trim().toLowerCase()}|${(r.itemName || '').trim().toLowerCase()}|${(r.color || '').trim().toLowerCase()}|${(r.width || '').trim().toLowerCase()}|${Number(r.qty) || 0}`
+          );
+          return (
+            cloudStatusMap[fullKey] ||
+            cloudStatusMap[noDateKey] ||
+            cloudStatusMap[poNaNoDateKey] ||
+            cloudStatusAnMap[noDateKey]?.status_an ||
+            cloudStatusAnMap[poNaNoDateKey]?.status_an
+          );
+        };
+
+        // Keep Firebase closed rows & valid local closed rows separate from Google Sheet Closed Orders CSV
+        // so that Reopened rows ('Open' / 'In-Progress' in Firebase status_map) are NEVER forced back to 'Closed' by un-synced Sheet CSV!
+        const fbAndLocalClosedRows: ProductOrderRow[] = [...fbCloud.closedRows];
+        const seenFbClosedSigs = new Set(fbAndLocalClosedRows.map(makeCanonicalRowKey));
         [...sheetAutoRows, ...cleanPrev].forEach(r => {
           if (r.statusAN === 'Closed' || r.sheetSource === 'closed') {
+            const cloudOverride = resolveCloudExplicitStatus(r);
+            if (cloudOverride === 'Open' || cloudOverride === 'In-Progress') {
+              return; // Do NOT re-close a row that was explicitly Reopened in Firebase!
+            }
             const sig = makeCanonicalRowKey(r);
-            if (!seenClosedSigs.has(sig)) {
-              allKnownClosedRows.push(r);
-              seenClosedSigs.add(sig);
+            if (!seenFbClosedSigs.has(sig)) {
+              fbAndLocalClosedRows.push(r);
+              seenFbClosedSigs.add(sig);
               localClosedToShare.push(r);
             }
           }
         });
 
-        const closedLookupMap = new Map<string, ProductOrderRow>();
-        const closedNoDateLookupMap = new Map<string, ProductOrderRow>();
-        allKnownClosedRows.forEach(r => {
-          closedLookupMap.set(makeCanonicalRowKey(r), r);
-          closedNoDateLookupMap.set(makeCanonItemKeyNoDate(r), r);
+        const fbClosedLookupMap = new Map<string, ProductOrderRow>();
+        const fbClosedNoDateLookupMap = new Map<string, ProductOrderRow>();
+        fbAndLocalClosedRows.forEach(r => {
+          fbClosedLookupMap.set(makeCanonicalRowKey(r), r);
+          fbClosedNoDateLookupMap.set(makeCanonItemKeyNoDate(r), r);
+        });
+
+        const sheetClosedLookupMap = new Map<string, ProductOrderRow>();
+        const sheetClosedNoDateLookupMap = new Map<string, ProductOrderRow>();
+        sheetClosedRows.forEach(r => {
+          sheetClosedLookupMap.set(makeCanonicalRowKey(r), r);
+          sheetClosedNoDateLookupMap.set(makeCanonItemKeyNoDate(r), r);
         });
 
         const existingQueueByKey = new Map<string, ProductOrderRow[]>();
@@ -3360,16 +3431,19 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             0;
 
           const cloudOrdPatch = cloudOrderOverrides[sanitizeFbKey(baseOrderKey)] || {};
-          const explicitMapStatus =
-            cloudStatusMap[sanitizeFbKey(k)] || cloudStatusMap[sanitizeFbKey(canonItemKey)];
+          const explicitMapStatus = resolveCloudExplicitStatus(fRow);
+          const isExplicitActive = explicitMapStatus === 'Open' || explicitMapStatus === 'In-Progress';
 
-          const directClosedMatch =
-            closedLookupMap.get(k) ||
-            closedNoDateLookupMap.get(canonItemKey);
+          const fbClosedMatch =
+            fbClosedLookupMap.get(k) ||
+            fbClosedNoDateLookupMap.get(canonItemKey);
+          const sheetClosedMatch =
+            sheetClosedLookupMap.get(k) ||
+            sheetClosedNoDateLookupMap.get(canonItemKey);
 
-          const closedMatch =
-            directClosedMatch ||
-            (explicitMapStatus === 'Closed' ? fRow : undefined);
+          const closedMatch = isExplicitActive
+            ? undefined
+            : (fbClosedMatch || (explicitMapStatus === 'Closed' ? fRow : undefined) || sheetClosedMatch);
 
           if (closedMatch) {
             const finalDisp = savedDisp > 0 ? savedDisp : (closedMatch.dispatchQty || fRow.dispatchQty || 0);
@@ -3401,14 +3475,15 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           const match = candidates && candidates.length > 0 ? candidates[candidates.length - 1] : undefined;
           if (match) {
             const finalDisp = savedDisp > 0 ? savedDisp : (match.dispatchQty || fRow.dispatchQty || 0);
-            const resolvedStatus =
-              (explicitMapStatus as any) || cloudOrdPatch.statusAN || match.statusAN || fRow.statusAN || 'Open';
+            const resolvedStatus = isExplicitActive
+              ? (explicitMapStatus as 'Open' | 'In-Progress')
+              : ((explicitMapStatus as any) || match.statusAN || fRow.statusAN || 'Open');
             return {
               ...fRow,
               orderNo: resolvedOrderNo || match.orderNo || '',
               orderNoTimestamp: resolvedOrderNoTs || match.orderNoTimestamp || '',
               statusAN: resolvedStatus,
-              sheetSource: resolvedStatus === 'Closed' ? 'closed' : (fRow.sheetSource || 'product_order'),
+              sheetSource: resolvedStatus === 'Closed' ? 'closed' : 'product_order',
               dispatchQty: finalDisp,
               balanceQty: Number(((fRow.qty || 0) - finalDisp).toFixed(4)),
               colAA: cloudOrdPatch.colAA ?? match.colAA ?? fRow.colAA,
@@ -3430,6 +3505,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             ...fRow,
             orderNo: resolvedOrderNo,
             orderNoTimestamp: resolvedOrderNoTs,
+            statusAN: isExplicitActive ? (explicitMapStatus as 'Open' | 'In-Progress') : fRow.statusAN,
+            sheetSource: isExplicitActive ? 'product_order' : fRow.sheetSource,
             dispatchQty: savedDisp,
             balanceQty: Number(((fRow.qty || 0) - savedDisp).toFixed(4)),
             colAA: cloudOrdPatch.colAA ?? fRow.colAA,
@@ -3520,8 +3597,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
       const cloudStatusMap: Record<string, string> =
         cellUpdatesCloud?.status_map && typeof cellUpdatesCloud.status_map === 'object' ? cellUpdatesCloud.status_map : {};
+      const cloudStatusAnMap: Record<string, any> =
+        cellUpdatesCloud?.status_an && typeof cellUpdatesCloud.status_an === 'object' ? cellUpdatesCloud.status_an : {};
 
-      if (fbCloud.closedRows.length === 0 && fbCloud.activeRows.length === 0 && Object.keys(cloudStatusMap).length === 0) return;
+      if (fbCloud.closedRows.length === 0 && fbCloud.activeRows.length === 0 && Object.keys(cloudStatusMap).length === 0 && Object.keys(cloudStatusAnMap).length === 0) return;
 
       setRawResponses(prev => {
         const cleanPrev = healAndDeduplicateMasterRows(
@@ -3544,8 +3623,22 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         const updated = baseRows.map(row => {
           const k = makeCanonicalRowKey(row);
           const canonItemK = makeCanonItemKeyNoDate(row);
+          const poNaCanonItemK = `${normalizePoVal(row.customerPO) || 'n/a'}|${(row.customerName || '').trim().toLowerCase()}|${(row.itemName || '').trim().toLowerCase()}|${(row.color || '').trim().toLowerCase()}|${(row.width || '').trim().toLowerCase()}|${Number(row.qty) || 0}`;
           const explicitMapStatus =
-            cloudStatusMap[sanitizeFbKey(k)] || cloudStatusMap[sanitizeFbKey(canonItemK)];
+            cloudStatusMap[sanitizeFbKey(k)] ||
+            cloudStatusMap[sanitizeFbKey(canonItemK)] ||
+            cloudStatusMap[sanitizeFbKey(poNaCanonItemK)] ||
+            cloudStatusAnMap[sanitizeFbKey(canonItemK)]?.status_an ||
+            cloudStatusAnMap[sanitizeFbKey(poNaCanonItemK)]?.status_an;
+
+          // If explicitly Reopened / Active in Firebase centralized status_map, keep it active in Order Automation
+          if (explicitMapStatus === 'Open' || explicitMapStatus === 'In-Progress') {
+            return {
+              ...row,
+              statusAN: explicitMapStatus as 'Open' | 'In-Progress',
+              sheetSource: 'product_order' as const
+            };
+          }
 
           const directClosedMatch =
             closedMap.get(k) ||
@@ -3565,14 +3658,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               sheetSource: 'closed' as const,
               dispatchQty: closedMatch.dispatchQty || row.dispatchQty || 0,
               balanceQty: closedMatch.balanceQty ?? row.balanceQty ?? 0
-            };
-          }
-
-          if (explicitMapStatus === 'Open' || explicitMapStatus === 'In-Progress') {
-            return {
-              ...row,
-              statusAN: explicitMapStatus as 'Open' | 'In-Progress',
-              sheetSource: 'product_order' as const
             };
           }
 
@@ -3602,12 +3687,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     });
     if (Object.keys(nonZeroDisp).length > 0) {
       pushCellUpdatesToFirebase(nonZeroDisp);
-    }
-
-    // Also push any locally closed orders in rawResponses to centralized /cell_updates/status_map on startup
-    const localClosed = rawResponses.filter(r => r.statusAN === 'Closed' || r.sheetSource === 'closed');
-    if (localClosed.length > 0) {
-      patchCentralizedStatusMap(localClosed, 'Closed').catch(() => {});
     }
 
     handleRefreshFromFirebaseCloud();
@@ -3755,10 +3834,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     const activeFilterEntries = Object.entries(colFilters).filter(([, vals]) => vals && vals.length > 0);
 
     groupedOrders.forEach(order => {
-      if (order.sheetSource === 'product_order' && activeSheetTab === 'closed') {
-        if (order.statusAN !== 'Closed') return;
-      }
-
       // Month & Year Filter on Order Automation / Closed Orders
       if (automationMonth !== 'ALL' || automationYear !== 'ALL') {
         const parsed = parseOrderDateParts(order.orderDate, order.timestamp);
@@ -3770,15 +3845,16 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         }
       }
 
-      // Filter items according to tab, status filter, duplicate filter, and ALL 45 column filters
+      // Filter items purely by item-level statusAN so Reopened records always appear in Order Automation
+      // and closing Reopened records immediately moves them cleanly back to Closed Orders
       const relevantItems = order.items.filter(item => {
         const itemStatus = item.statusAN || 'Open';
 
         // 1. Tab filter
         if (activeSheetTab === 'automation') {
-          if (order.sheetSource === 'closed' || itemStatus === 'Closed') return false;
+          if (itemStatus === 'Closed') return false;
         } else if (activeSheetTab === 'closed') {
-          if (order.sheetSource !== 'closed' && itemStatus !== 'Closed') return false;
+          if (itemStatus !== 'Closed') return false;
         }
 
         // 2. Duplicate Rows only filter
@@ -3897,7 +3973,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     let count = 0;
     groupedOrders.forEach(o => {
       o.items.forEach(it => {
-        if (o.sheetSource !== 'closed' && (it.statusAN || 'Open') !== 'Closed') count++;
+        if ((it.statusAN || 'Open') !== 'Closed') count++;
       });
     });
     return count;
@@ -3907,11 +3983,790 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     let count = 0;
     groupedOrders.forEach(o => {
       o.items.forEach(it => {
-        if (o.sheetSource === 'closed' || (it.statusAN || 'Open') === 'Closed') count++;
+        if ((it.statusAN || 'Open') === 'Closed') count++;
       });
     });
     return count;
   }, [groupedOrders]);
+
+  // Open-only TNA rows (Col AN === 'Open' and non-blank Item Name)
+  const openTnaRows = useMemo(
+    () => buildOpenTnaRows(groupedOrders, tnaRecords),
+    [groupedOrders, tnaRecords]
+  );
+
+  // Keep tnaRecordsRef in sync and save TNA records locally whenever updated
+  useEffect(() => {
+    tnaRecordsRef.current = tnaRecords;
+    try {
+      localStorage.setItem(LOCAL_STORAGE_TNA_RECORDS, JSON.stringify(tnaRecords));
+    } catch (e) {}
+  }, [tnaRecords]);
+
+  // Helper: Build compact snapshot payload matching Firebase /tna_open_snapshot & Apps Script doPost
+  const buildTnaSnapshotPayload = (rows: TnaRowItem[]) => ({
+    count: rows.length,
+    target_spreadsheet_id: TNA_SPREADSHEET_ID,
+    updated_at: new Date().toISOString(),
+    rows: rows.map(r => ({
+      tnaKey: r.tnaKey,
+      altKey: r.altKey,
+      orderDate: r.orderDate,
+      orderNo: r.orderNo,
+      customerName: r.customerName,
+      itemName: r.itemName,
+      color: r.color,
+      width: r.width,
+      unit: r.unit,
+      qty: r.qty,
+      unitOfItem: r.unitOfItem,
+      deliveryDate: r.deliveryDate,
+      manual: r.manual
+    }))
+  });
+
+  // Helper: Parse live TNA Google Sheet CSV ("T&A Order Master") into structured sheet rows with matching tnaKey/altKey
+  const parseTnaSheetCsvRows = (sheetCsv: string): TnaRowItem[] | null => {
+    if (!sheetCsv || sheetCsv.startsWith('<!DOCTYPE') || sheetCsv.includes('<html')) return null;
+    const parsedCsv = parseCsvRows(sheetCsv);
+    if (!parsedCsv || parsedCsv.length === 0) return null;
+
+    const occ: Record<string, number> = {};
+    const parsedList: TnaRowItem[] = [];
+
+    parsedCsv.forEach((row, rIdx) => {
+      if (rIdx === 0) return;
+      const orderDate = toTnaStorageDate(row[0] || '') || String(row[0] || '').trim();
+      const orderNo = (row[1] || '').trim();
+      const customerName = (row[2] || '').trim();
+      const itemName = (row[3] || '').trim();
+      if (!itemName || itemName.toLowerCase() === 'item name') return;
+      const color = (row[4] || '').trim();
+      const width = (row[5] || '').trim();
+      const unit = (row[6] || '').trim();
+      const qty = Number(row[7]) || 0;
+      const unitOfItem = (row[8] || '').trim();
+      const deliveryDate = toTnaStorageDate(row[9] || '') || String(row[9] || '').trim();
+
+      const altKey = buildTnaAltKey(orderNo, customerName, itemName, color, width, qty);
+      occ[altKey] = (occ[altKey] || 0) + 1;
+      const tnaKey = `${altKey}|_${occ[altKey]}`.substring(0, 180);
+
+      const manual = normalizeTnaManual({
+        labdipCommittedDate: toTnaStorageDate(row[11] || ''),
+        labdipActualDate: toTnaStorageDate(row[12] || ''),
+        labdipRejectionDate: toTnaStorageDate(row[13] || ''),
+        labdipApprovalDate: toTnaStorageDate(row[14] || ''),
+        fobCommittedDate: toTnaStorageDate(row[16] || ''),
+        fobActualDate: toTnaStorageDate(row[17] || ''),
+        fobRejectionDate: toTnaStorageDate(row[18] || ''),
+        fobApprovalDate: toTnaStorageDate(row[19] || ''),
+        actualDispatchDate: toTnaStorageDate(row[21] || ''),
+        totalDispatchedQty: String(row[22] || '').trim(),
+        pendingQty: String(row[23] || '').trim(),
+        committedBalanceDate: toTnaStorageDate(row[24] || ''),
+        actualBalanceDispatchDate: toTnaStorageDate(row[25] || ''),
+        balanceDispatchQty: String(row[26] || '').trim(),
+        orderRemarks: String(row[27] || '').trim()
+      });
+
+      parsedList.push({
+        tnaKey,
+        altKey,
+        orderKey: `${orderNo}_${customerName}`,
+        orderDate,
+        orderNo,
+        customerName,
+        itemName,
+        color,
+        width,
+        unit,
+        qty,
+        unitOfItem,
+        deliveryDate,
+        orderStatus: computeTnaOrderStatus(manual),
+        manual,
+        labdipDelayDays: computeTnaDelayDays(manual.labdipActualDate, manual.labdipApprovalDate),
+        fobDelayDays: computeTnaDelayDays(manual.fobActualDate, manual.fobApprovalDate),
+        balanceDelayDays: computeTnaDelayDays(manual.committedBalanceDate, manual.actualBalanceDispatchDate)
+      });
+    });
+
+    return parsedList;
+  };
+
+  // Helper: Merge two TnaManualEntry objects without losing Date/Remark history or overwriting non-empty Firebase dates
+  const mergeTnaManualPreferFirebase = (
+    curRaw?: Partial<TnaManualEntry> | null,
+    sheetRaw?: Partial<TnaManualEntry> | null
+  ): TnaManualEntry => {
+    const cur = normalizeTnaManual(curRaw);
+    const sVal = normalizeTnaManual(sheetRaw);
+    return {
+      labdipCommittedDate: cur.labdipCommittedDate || sVal.labdipCommittedDate,
+      labdipActualDate: cur.labdipActualDate || sVal.labdipActualDate,
+      labdipRejectionDate: cur.labdipRejectionDate || sVal.labdipRejectionDate,
+      labdipApprovalDate: cur.labdipApprovalDate || sVal.labdipApprovalDate,
+      fobCommittedDate: cur.fobCommittedDate || sVal.fobCommittedDate,
+      fobActualDate: cur.fobActualDate || sVal.fobActualDate,
+      fobRejectionDate: cur.fobRejectionDate || sVal.fobRejectionDate,
+      fobApprovalDate: cur.fobApprovalDate || sVal.fobApprovalDate,
+      actualDispatchDate: cur.actualDispatchDate || sVal.actualDispatchDate,
+      totalDispatchedQty: cur.totalDispatchedQty || sVal.totalDispatchedQty,
+      pendingQty: cur.pendingQty || sVal.pendingQty,
+      committedBalanceDate: cur.committedBalanceDate || sVal.committedBalanceDate,
+      actualBalanceDispatchDate: cur.actualBalanceDispatchDate || sVal.actualBalanceDispatchDate,
+      balanceDispatchQty: cur.balanceDispatchQty || sVal.balanceDispatchQty,
+      orderRemarks: cur.orderRemarks || sVal.orderRemarks,
+      labdipRejectionHistory: cur.labdipRejectionHistory || [],
+      fobRejectionHistory: cur.fobRejectionHistory || [],
+      stepDateHistory: cur.stepDateHistory || {},
+      updatedAt: cur.updatedAt || sVal.updatedAt || ''
+    };
+  };
+
+  // Helper: Push TNA patches + Reconciled Google Sheet payload (Preserves Closed rows already in Google Sheet + respects manual row deletes in Google Sheet)
+  const pushTnaToFirebaseAndSheet = async (
+    openRowsToPush: TnaRowItem[],
+    patchEntries?: Record<string, TnaManualEntry>,
+    overrideWebAppUrl?: string,
+    preFetchedSheetCsv?: string
+  ): Promise<{ ok: boolean; count: number; tabName?: string; error?: string }> => {
+    const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+    const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+    const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+    const targetExecUrl = (overrideWebAppUrl || tnaWebAppUrl || DEFAULT_TNA_WEBAPP_URL).trim();
+
+    const tasks: Promise<any>[] = [];
+
+    if (patchEntries && Object.keys(patchEntries).length > 0) {
+      const safePatchEntries: Record<string, TnaManualEntry> = {};
+      Object.entries(patchEntries).forEach(([k, v]) => {
+        safePatchEntries[toFirebaseSafeTnaKey(k)] = v;
+      });
+      tasks.push(
+        fetch(`${baseTargetUrl}/tna_records.json${authQuery}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(safePatchEntries)
+        }).catch(() => null)
+      );
+    }
+
+    // Ensure known/deleted sheet tracking metadata is loaded from Firebase
+    if (!tnaSheetMetaLoadedRef.current) {
+      try {
+        const [knownMeta, deletedMeta] = await Promise.all([
+          fetch(`${baseTargetUrl}/tna_sheet_known_keys.json${authQuery}`)
+            .then(r => (r.ok ? r.json() : null))
+            .catch(() => null),
+          fetch(`${baseTargetUrl}/tna_sheet_deleted.json${authQuery}`)
+            .then(r => (r.ok ? r.json() : null))
+            .catch(() => null)
+        ]);
+        if (knownMeta && typeof knownMeta === 'object' && !knownMeta.error) {
+          tnaSheetKnownKeysRef.current = knownMeta;
+        }
+        if (deletedMeta && typeof deletedMeta === 'object' && !deletedMeta.error) {
+          tnaSheetDeletedKeysRef.current = deletedMeta;
+        }
+        tnaSheetMetaLoadedRef.current = true;
+      } catch (e) {}
+    }
+
+    // Read live Google Sheet CSV so we preserve existing/Closed rows AND detect rows manually deleted by user in Google Sheet
+    let liveCsvText = preFetchedSheetCsv ?? '';
+    if (!liveCsvText) {
+      try {
+        liveCsvText = await fetch(
+          `https://docs.google.com/spreadsheets/d/${TNA_SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(TNA_TAB_NAME)}&_cb=${Date.now()}`
+        )
+          .then(r => (r.ok ? r.text() : ''))
+          .catch(() => '');
+      } catch (e) {
+        liveCsvText = '';
+      }
+    }
+
+    const parsedSheetRows = parseTnaSheetCsvRows(liveCsvText);
+    const allMasterLookup = buildAllTnaRowsLookup(groupedOrdersRef.current, tnaRecordsRef.current);
+    let rowsForGoogleSheet: TnaRowItem[] = [];
+    const addedKeys = new Set<string>();
+    const usedMasterKeys = new Set<string>();
+
+    if (parsedSheetRows !== null) {
+      const sheetSafeKeySet = new Set(parsedSheetRows.map(r => toFirebaseSafeTnaKey(r.tnaKey)));
+      const nextDeleted: Record<string, boolean> = { ...tnaSheetDeletedKeysRef.current };
+
+      // Detect rows previously synced to Google Sheet that are now missing -> user manually deleted them in Google Sheet
+      Object.keys(tnaSheetKnownKeysRef.current).forEach(knownKey => {
+        const safeKnown = toFirebaseSafeTnaKey(knownKey);
+        if (tnaSheetKnownKeysRef.current[knownKey] && !sheetSafeKeySet.has(safeKnown)) {
+          nextDeleted[safeKnown] = true;
+        }
+      });
+
+      // If a row is present in Google Sheet right now, make sure it is not flagged deleted
+      sheetSafeKeySet.forEach(sk => {
+        if (nextDeleted[sk]) delete nextDeleted[sk];
+      });
+
+      // Step A: Keep every row currently in Google Sheet (including Closed orders & manual sheet rows) with latest master/Firebase edits
+      parsedSheetRows.forEach(sheetRow => {
+        if (addedKeys.has(sheetRow.tnaKey)) return;
+        let masterRow = allMasterLookup.get(sheetRow.tnaKey);
+        if (!masterRow && !usedMasterKeys.has(sheetRow.altKey)) {
+          masterRow = allMasterLookup.get(sheetRow.altKey);
+        }
+
+        if (masterRow) {
+          usedMasterKeys.add(masterRow.tnaKey);
+          usedMasterKeys.add(sheetRow.altKey);
+          // If Web App/Firebase already has authoritative edits (updatedAt set), preserve cleared fields too
+          const mergedManual = masterRow.manual.updatedAt
+            ? masterRow.manual
+            : mergeTnaManualPreferFirebase(masterRow.manual, sheetRow.manual);
+          rowsForGoogleSheet.push({
+            ...masterRow,
+            tnaKey: sheetRow.tnaKey,
+            altKey: sheetRow.altKey,
+            manual: mergedManual,
+            orderStatus: computeTnaOrderStatus(mergedManual),
+            labdipDelayDays: computeTnaDelayDays(mergedManual.labdipActualDate, mergedManual.labdipApprovalDate),
+            fobDelayDays: computeTnaDelayDays(mergedManual.fobActualDate, mergedManual.fobApprovalDate),
+            balanceDelayDays: computeTnaDelayDays(mergedManual.committedBalanceDate, mergedManual.actualBalanceDispatchDate)
+          });
+        } else {
+          // Row not found in groupedOrders (e.g. manually added row in Sheet or older archived order) -> keep intact!
+          const savedOverride =
+            tnaRecordsRef.current[sheetRow.tnaKey] ||
+            tnaRecordsRef.current[toFirebaseSafeTnaKey(sheetRow.tnaKey)] ||
+            tnaRecordsRef.current[sheetRow.altKey];
+          const mergedManual = mergeTnaManualPreferFirebase(savedOverride, sheetRow.manual);
+          rowsForGoogleSheet.push({
+            ...sheetRow,
+            manual: mergedManual,
+            orderStatus: computeTnaOrderStatus(mergedManual),
+            labdipDelayDays: computeTnaDelayDays(mergedManual.labdipActualDate, mergedManual.labdipApprovalDate),
+            fobDelayDays: computeTnaDelayDays(mergedManual.fobActualDate, mergedManual.fobApprovalDate),
+            balanceDelayDays: computeTnaDelayDays(mergedManual.committedBalanceDate, mergedManual.actualBalanceDispatchDate)
+          });
+        }
+        addedKeys.add(sheetRow.tnaKey);
+      });
+
+      // Step B: Append newly Open TNA rows that are not yet in Google Sheet AND were not manually deleted by user
+      openRowsToPush.forEach(openRow => {
+        const safeOpenKey = toFirebaseSafeTnaKey(openRow.tnaKey);
+        if (addedKeys.has(openRow.tnaKey)) return;
+        if (nextDeleted[safeOpenKey] || nextDeleted[openRow.tnaKey]) return;
+        rowsForGoogleSheet.push(openRow);
+        addedKeys.add(openRow.tnaKey);
+      });
+
+      const nextKnown: Record<string, boolean> = {};
+      addedKeys.forEach(k => {
+        nextKnown[toFirebaseSafeTnaKey(k)] = true;
+      });
+      tnaSheetKnownKeysRef.current = nextKnown;
+      tnaSheetDeletedKeysRef.current = nextDeleted;
+
+      tasks.push(
+        fetch(`${baseTargetUrl}/tna_sheet_known_keys.json${authQuery}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(nextKnown)
+        }).catch(() => null),
+        fetch(`${baseTargetUrl}/tna_sheet_deleted.json${authQuery}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(nextDeleted)
+        }).catch(() => null)
+      );
+    } else {
+      // Fallback if live gviz CSV fetch failed: preserve existing /tna_open_snapshot rows (including Closed) + merge Open updates
+      try {
+        const existingSnap = await fetch(`${baseTargetUrl}/tna_open_snapshot.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null);
+        const snapRows: any[] = Array.isArray(existingSnap?.rows) ? existingSnap.rows : [];
+        snapRows.forEach(sr => {
+          const k = String(sr?.tnaKey || '').trim();
+          if (!k || addedKeys.has(k) || tnaSheetDeletedKeysRef.current[k]) return;
+          const masterRow = allMasterLookup.get(k) || (sr.altKey ? allMasterLookup.get(String(sr.altKey)) : undefined);
+          if (masterRow) {
+            rowsForGoogleSheet.push(masterRow);
+          } else {
+            const mergedManual = mergeTnaManualPreferFirebase(tnaRecordsRef.current[k], sr.manual);
+            rowsForGoogleSheet.push({
+              tnaKey: k,
+              altKey: String(sr.altKey || k),
+              orderKey: `${sr.orderNo || ''}_${sr.customerName || ''}`,
+              orderDate: String(sr.orderDate || ''),
+              orderNo: String(sr.orderNo || ''),
+              customerName: String(sr.customerName || ''),
+              itemName: String(sr.itemName || ''),
+              color: String(sr.color || ''),
+              width: String(sr.width || ''),
+              unit: String(sr.unit || ''),
+              qty: Number(sr.qty) || 0,
+              unitOfItem: String(sr.unitOfItem || ''),
+              deliveryDate: String(sr.deliveryDate || ''),
+              orderStatus: computeTnaOrderStatus(mergedManual),
+              manual: mergedManual,
+              labdipDelayDays: computeTnaDelayDays(mergedManual.labdipActualDate, mergedManual.labdipApprovalDate),
+              fobDelayDays: computeTnaDelayDays(mergedManual.fobActualDate, mergedManual.fobApprovalDate),
+              balanceDelayDays: computeTnaDelayDays(mergedManual.committedBalanceDate, mergedManual.actualBalanceDispatchDate)
+            });
+          }
+          addedKeys.add(k);
+        });
+      } catch (e) {}
+
+      openRowsToPush.forEach(openRow => {
+        if (addedKeys.has(openRow.tnaKey) || tnaSheetDeletedKeysRef.current[openRow.tnaKey]) return;
+        rowsForGoogleSheet.push(openRow);
+        addedKeys.add(openRow.tnaKey);
+      });
+    }
+
+    const sheetSnapshotPayload = buildTnaSnapshotPayload(rowsForGoogleSheet);
+
+    tasks.push(
+      fetch(`${baseTargetUrl}/tna_open_snapshot.json${authQuery}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sheetSnapshotPayload)
+      }).catch(() => null)
+    );
+
+    let postResult: { ok: boolean; count: number; tabName?: string; error?: string } = {
+      ok: true,
+      count: rowsForGoogleSheet.length
+    };
+
+    if (targetExecUrl && targetExecUrl.startsWith('https://')) {
+      const postPromise = fetch(targetExecUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          spreadsheetId: TNA_SPREADSHEET_ID,
+          tabName: TNA_TAB_NAME,
+          preferWebApp: true,
+          updatedAt: sheetSnapshotPayload.updated_at,
+          rows: sheetSnapshotPayload.rows
+        })
+      })
+        .then(async res => {
+          const text = await res.text().catch(() => '');
+          try {
+            const parsed = JSON.parse(text);
+            if (!res.ok || parsed?.ok === false) {
+              postResult = {
+                ok: false,
+                count: rowsForGoogleSheet.length,
+                tabName: parsed?.tabName,
+                error: parsed?.error || `HTTP ${res.status}`
+              };
+            } else {
+              postResult = {
+                ok: true,
+                count: Number(parsed?.count ?? rowsForGoogleSheet.length),
+                tabName: parsed?.tabName
+              };
+            }
+          } catch {
+            if (!res.ok) {
+              postResult = { ok: false, count: rowsForGoogleSheet.length, error: `HTTP ${res.status}` };
+            }
+          }
+        })
+        .catch(err => {
+          postResult = {
+            ok: false,
+            count: rowsForGoogleSheet.length,
+            error: err?.message || 'Apps Script POST failed'
+          };
+        });
+      tasks.push(postPromise);
+    }
+
+    await Promise.all(tasks);
+    return postResult;
+  };
+
+  // Load centralized TNA records + Web App URL + Sheet tracking state from Firebase RTDB on mount and periodically (every 45s)
+  const fetchCentralizedTnaRecords = async () => {
+    try {
+      const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+      const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+      const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+
+      const [cloudRecords, cloudConfig, knownMeta, deletedMeta] = await Promise.all([
+        fetch(`${baseTargetUrl}/tna_records.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null),
+        fetch(`${baseTargetUrl}/tna_config.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null),
+        fetch(`${baseTargetUrl}/tna_sheet_known_keys.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null),
+        fetch(`${baseTargetUrl}/tna_sheet_deleted.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null)
+      ]);
+
+      if (cloudConfig?.webapp_url && typeof cloudConfig.webapp_url === 'string') {
+        setTnaWebAppUrl(cloudConfig.webapp_url.trim());
+      }
+      if (knownMeta && typeof knownMeta === 'object' && !knownMeta.error) {
+        tnaSheetKnownKeysRef.current = knownMeta;
+      }
+      if (deletedMeta && typeof deletedMeta === 'object' && !deletedMeta.error) {
+        tnaSheetDeletedKeysRef.current = deletedMeta;
+      }
+      tnaSheetMetaLoadedRef.current = true;
+
+      if (cloudRecords && typeof cloudRecords === 'object' && !cloudRecords.error) {
+        setTnaRecords(prev => {
+          const merged: Record<string, TnaManualEntry> = { ...prev };
+          Object.entries(cloudRecords).forEach(([k, v]) => {
+            if (!v || typeof v !== 'object') return;
+            if (pendingTnaPatchRef.current[k]) return; // Preserve un-flushed local edit
+            const cloudNorm = normalizeTnaManual(v as Partial<TnaManualEntry>);
+            const localNorm = prev[k];
+            if (!localNorm || !localNorm.updatedAt || (cloudNorm.updatedAt && cloudNorm.updatedAt >= localNorm.updatedAt)) {
+              merged[k] = cloudNorm;
+            }
+          });
+          return merged;
+        });
+      }
+      tnaLoadedFromCloudRef.current = true;
+    } catch (e) {}
+  };
+
+  useEffect(() => {
+    fetchCentralizedTnaRecords();
+    const timer = setInterval(() => {
+      if (Object.keys(pendingTnaPatchRef.current).length === 0) {
+        fetchCentralizedTnaRecords();
+      }
+    }, 45000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Auto-sync when AN status changes Open <-> Closed:
+  // Order leaves Web App TNA tab, while Google Sheet keeps existing/Closed rows intact!
+  useEffect(() => {
+    if (!hasSyncedLiveSheetRef.current || !tnaLoadedFromCloudRef.current) return;
+    const sig = openTnaRows.map(r => r.tnaKey).join('|');
+    if (lastTnaOpenSigRef.current === '') {
+      lastTnaOpenSigRef.current = sig;
+      return;
+    }
+    if (sig !== lastTnaOpenSigRef.current) {
+      lastTnaOpenSigRef.current = sig;
+      const timer = setTimeout(() => {
+        pushTnaToFirebaseAndSheet(openTnaRows).catch(() => {});
+      }, 1200);
+      return () => clearTimeout(timer);
+    }
+  }, [openTnaRows]);
+
+  // Queue & flush a TNA record update to state, Firebase, and Target Google Sheet
+  const commitTnaRecordUpdate = (tnaKey: string, altKey: string, updatedEntry: TnaManualEntry) => {
+    const safeTnaKey = toFirebaseSafeTnaKey(tnaKey);
+    const safeAltKey = toFirebaseSafeTnaKey(altKey);
+    const curMap = tnaRecordsRef.current;
+    const nextMap: Record<string, TnaManualEntry> = {
+      ...curMap,
+      [tnaKey]: updatedEntry,
+      [altKey]: updatedEntry,
+      [safeTnaKey]: updatedEntry,
+      [safeAltKey]: updatedEntry
+    };
+    tnaRecordsRef.current = nextMap;
+    pendingTnaPatchRef.current[safeTnaKey] = updatedEntry;
+    pendingTnaPatchRef.current[safeAltKey] = updatedEntry;
+    setTnaRecords(nextMap);
+    setTnaSyncNotice('Saving to Sheet...');
+
+    if (tnaSyncTimerRef.current) clearTimeout(tnaSyncTimerRef.current);
+    tnaSyncTimerRef.current = setTimeout(async () => {
+      const patch = { ...pendingTnaPatchRef.current };
+      pendingTnaPatchRef.current = {};
+      if (Object.keys(patch).length > 0) {
+        const freshRows = buildOpenTnaRows(groupedOrdersRef.current, tnaRecordsRef.current);
+        const res = await pushTnaToFirebaseAndSheet(freshRows, patch).catch(
+          (): { ok: boolean; count: number; tabName?: string; error?: string } => ({
+            ok: false,
+            count: 0,
+            error: 'Sync failed'
+          })
+        );
+        if (!res.ok) {
+          setTnaSyncNotice(`Sheet Error: ${res.error || 'Check Apps Script'}`);
+          setTimeout(() => setTnaSyncNotice(null), 5000);
+        } else if (res.tabName && res.tabName !== TNA_TAB_NAME) {
+          setTnaSyncNotice(`Saved (${res.tabName}) — Script me '${TNA_TAB_NAME}' update karein`);
+          setTimeout(() => setTnaSyncNotice(null), 6000);
+        } else {
+          setTnaSyncNotice('Saved to Firebase & Sheet ✓');
+          setTimeout(() => setTnaSyncNotice(null), 2500);
+        }
+      }
+    }, 900);
+  };
+
+  // Handle manual non-date cell edit inside TNA tab (Isolated to TNA + Centralized Firebase + Target TNA Google Sheet)
+  const handleUpdateTnaField = (
+    tnaKey: string,
+    altKey: string,
+    field: keyof TnaManualEntry,
+    value: string
+  ) => {
+    const nowIso = new Date().toISOString();
+    const curMap = tnaRecordsRef.current;
+    const existing = normalizeTnaManual(curMap[tnaKey] || curMap[altKey]);
+    const updatedEntry: TnaManualEntry = {
+      ...existing,
+      [field]: value,
+      updatedAt: nowIso
+    };
+    commitTnaRecordUpdate(tnaKey, altKey, updatedEntry);
+  };
+
+  // Handle saving any Step 1-4 date field (or Rejection Date + Remark from Card) while preserving all older dates in history
+  const handleSaveTnaDateWithHistory = (
+    tnaKey: string,
+    altKey: string,
+    field: TnaDateFieldKey,
+    newDate: string,
+    remark = '',
+    fromCard = false
+  ) => {
+    const nowIso = new Date().toISOString();
+    const curMap = tnaRecordsRef.current;
+    const existing = normalizeTnaManual(curMap[tnaKey] || curMap[altKey]);
+    const prevDate = String(existing[field] || '').trim();
+    const cleanNewDate = String(newDate || '').trim();
+
+    const getExistingHist = (): TnaDateHistoryEntry[] => {
+      if (field === 'labdipRejectionDate') return [...(existing.labdipRejectionHistory || [])];
+      if (field === 'fobRejectionDate') return [...(existing.fobRejectionHistory || [])];
+      return [...(existing.stepDateHistory?.[field] || [])];
+    };
+
+    const nextHist = getExistingHist();
+    const makeId = () => `hist_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+    // Preserve previous upper-cell date in card history if not yet recorded
+    if (prevDate && (fromCard || cleanNewDate !== prevDate)) {
+      const lastEntry = nextHist[nextHist.length - 1];
+      if (!lastEntry || lastEntry.date !== prevDate) {
+        nextHist.push({
+          id: makeId(),
+          date: prevDate,
+          remark: '',
+          createdAt: nowIso
+        });
+      }
+    }
+
+    // Record the new date (always append if submitted via Card with remark, or if date changed)
+    if (cleanNewDate) {
+      const lastEntry = nextHist[nextHist.length - 1];
+      if (fromCard || !lastEntry || lastEntry.date !== cleanNewDate) {
+        nextHist.push({
+          id: makeId(),
+          date: cleanNewDate,
+          remark: remark.trim(),
+          createdAt: nowIso
+        });
+      }
+    }
+
+    const updatedEntry: TnaManualEntry = {
+      ...existing,
+      [field]: cleanNewDate,
+      updatedAt: nowIso
+    };
+
+    if (field === 'labdipRejectionDate') {
+      updatedEntry.labdipRejectionHistory = nextHist;
+    } else if (field === 'fobRejectionDate') {
+      updatedEntry.fobRejectionHistory = nextHist;
+    } else {
+      updatedEntry.stepDateHistory = {
+        ...(existing.stepDateHistory || {}),
+        [field]: nextHist
+      };
+    }
+
+    commitTnaRecordUpdate(tnaKey, altKey, updatedEntry);
+  };
+
+  // Handle deleting a saved history entry inside the Date & Remark Card
+  const handleDeleteTnaDateHistoryEntry = (
+    tnaKey: string,
+    altKey: string,
+    field: TnaDateFieldKey,
+    entryId: string
+  ) => {
+    const nowIso = new Date().toISOString();
+    const curMap = tnaRecordsRef.current;
+    const existing = normalizeTnaManual(curMap[tnaKey] || curMap[altKey]);
+
+    const currentHist: TnaDateHistoryEntry[] =
+      field === 'labdipRejectionDate'
+        ? existing.labdipRejectionHistory || []
+        : field === 'fobRejectionDate'
+        ? existing.fobRejectionHistory || []
+        : existing.stepDateHistory?.[field] || [];
+
+    const filteredHist = currentHist.filter(en => en.id !== entryId);
+    const nextLatestDate = filteredHist.length > 0 ? filteredHist[filteredHist.length - 1].date : '';
+
+    const updatedEntry: TnaManualEntry = {
+      ...existing,
+      [field]: nextLatestDate,
+      updatedAt: nowIso
+    };
+
+    if (field === 'labdipRejectionDate') {
+      updatedEntry.labdipRejectionHistory = filteredHist;
+    } else if (field === 'fobRejectionDate') {
+      updatedEntry.fobRejectionHistory = filteredHist;
+    } else {
+      updatedEntry.stepDateHistory = {
+        ...(existing.stepDateHistory || {}),
+        [field]: filteredHist
+      };
+    }
+
+    commitTnaRecordUpdate(tnaKey, altKey, updatedEntry);
+  };
+
+  // Manual Sync TNA Sheet: pulls Firebase + Target Google Sheet CSV (1Wdu7PtyAEEnOY3R3OgvNM-Hnu9LnTnw1WKJQf06z-Qo) & syncs without removing Closed rows or re-adding manually deleted Google Sheet rows
+  const handleSyncTnaSheet = async () => {
+    if (isSyncingTna) return;
+    setIsSyncingTna(true);
+    setTnaSyncNotice('Syncing...');
+    try {
+      const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+      const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+      const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+
+      const [cloudRecords, cloudConfig, knownMeta, deletedMeta, sheetCsv] = await Promise.all([
+        fetch(`${baseTargetUrl}/tna_records.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null),
+        fetch(`${baseTargetUrl}/tna_config.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null),
+        fetch(`${baseTargetUrl}/tna_sheet_known_keys.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null),
+        fetch(`${baseTargetUrl}/tna_sheet_deleted.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null),
+        fetch(
+          `https://docs.google.com/spreadsheets/d/${TNA_SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(TNA_TAB_NAME)}&_cb=${Date.now()}`
+        )
+          .then(r => (r.ok ? r.text() : ''))
+          .catch(() => '')
+      ]);
+
+      const activeUrl =
+        cloudConfig?.webapp_url && typeof cloudConfig.webapp_url === 'string'
+          ? cloudConfig.webapp_url.trim()
+          : tnaWebAppUrl;
+      if (activeUrl) setTnaWebAppUrl(activeUrl);
+
+      if (knownMeta && typeof knownMeta === 'object' && !knownMeta.error) {
+        tnaSheetKnownKeysRef.current = knownMeta;
+      }
+      if (deletedMeta && typeof deletedMeta === 'object' && !deletedMeta.error) {
+        tnaSheetDeletedKeysRef.current = deletedMeta;
+      }
+      tnaSheetMetaLoadedRef.current = true;
+
+      const sheetMergedPatches: Record<string, TnaManualEntry> = {};
+      const parsedSheetRows = parseTnaSheetCsvRows(sheetCsv);
+      if (parsedSheetRows) {
+        parsedSheetRows.forEach(sRow => {
+          const m = sRow.manual;
+          const hasManual =
+            m.labdipCommittedDate ||
+            m.labdipActualDate ||
+            m.labdipRejectionDate ||
+            m.labdipApprovalDate ||
+            m.fobCommittedDate ||
+            m.fobActualDate ||
+            m.fobRejectionDate ||
+            m.fobApprovalDate ||
+            m.actualDispatchDate ||
+            m.totalDispatchedQty ||
+            m.pendingQty ||
+            m.committedBalanceDate ||
+            m.actualBalanceDispatchDate ||
+            m.balanceDispatchQty ||
+            m.orderRemarks;
+          if (hasManual) {
+            sheetMergedPatches[sRow.tnaKey] = m;
+          }
+        });
+      }
+
+      const finalTnaMap: Record<string, TnaManualEntry> = { ...tnaRecordsRef.current };
+      if (cloudRecords && typeof cloudRecords === 'object' && !cloudRecords.error) {
+        Object.entries(cloudRecords).forEach(([k, v]) => {
+          if (!v || typeof v !== 'object') return;
+          if (pendingTnaPatchRef.current[k]) return;
+          const cNorm = normalizeTnaManual(v as Partial<TnaManualEntry>);
+          const lNorm = finalTnaMap[k];
+          if (!lNorm || !lNorm.updatedAt || (cNorm.updatedAt && cNorm.updatedAt >= lNorm.updatedAt)) {
+            finalTnaMap[k] = cNorm;
+          }
+        });
+      }
+      Object.entries(sheetMergedPatches).forEach(([k, sVal]) => {
+        const mergedEntry = mergeTnaManualPreferFirebase(finalTnaMap[k], sVal);
+        if (!mergedEntry.updatedAt) mergedEntry.updatedAt = new Date().toISOString();
+        finalTnaMap[k] = mergedEntry;
+      });
+
+      tnaRecordsRef.current = finalTnaMap;
+      setTnaRecords(finalTnaMap);
+
+      const refreshedRows = buildOpenTnaRows(groupedOrders, finalTnaMap);
+      const [pushRes, webAppInfo] = await Promise.all([
+        pushTnaToFirebaseAndSheet(refreshedRows, pendingTnaPatchRef.current, activeUrl, sheetCsv),
+        activeUrl && activeUrl.startsWith('https://')
+          ? fetch(activeUrl).then(r => (r.ok ? r.json() : null)).catch(() => null)
+          : Promise.resolve(null)
+      ]);
+      pendingTnaPatchRef.current = {};
+      const detectedTab = pushRes.tabName || webAppInfo?.tabName;
+      if (!pushRes.ok) {
+        setTnaSyncNotice(`Sheet Sync Error: ${pushRes.error || 'Check Web App Deploy'}`);
+        setTimeout(() => setTnaSyncNotice(null), 6000);
+      } else if (detectedTab && detectedTab !== TNA_TAB_NAME) {
+        setTnaSyncNotice(`⚠️ Script tab '${detectedTab}' par likh raha hai ('${TNA_TAB_NAME}' ke liye script update karein)`);
+        setTimeout(() => setTnaSyncNotice(null), 7000);
+      } else {
+        setTnaSyncNotice(`Synced ${pushRes.count.toLocaleString()} rows to ${detectedTab || TNA_TAB_NAME} ✓`);
+        setTimeout(() => setTnaSyncNotice(null), 4000);
+      }
+    } catch (err: any) {
+      setTnaSyncNotice(`Sync notice: ${err?.message || 'Check connection'}`);
+      setTimeout(() => setTnaSyncNotice(null), 5000);
+    } finally {
+      setIsSyncingTna(false);
+    }
+  };
 
   const duplicateItemsCount = useMemo(() => {
     let count = 0;
@@ -3965,8 +4820,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     groupedOrders.forEach(o => {
       o.items.forEach(it => {
         const itemStatus = it.statusAN || 'Open';
-        if (activeSheetTab === 'automation' && (o.sheetSource === 'closed' || itemStatus === 'Closed')) return;
-        if (activeSheetTab === 'closed' && o.sheetSource !== 'closed' && itemStatus !== 'Closed') return;
+        if (activeSheetTab === 'automation' && itemStatus === 'Closed') return;
+        if (activeSheetTab === 'closed' && itemStatus !== 'Closed') return;
 
         const val = getOrderItemColValue(o, it, col);
         if (val !== '') {
@@ -3981,8 +4836,91 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     <div className="space-y-4">
       {/* SPREADSHEET TOOLBAR & CONTROLS */}
       <div className="bg-white rounded-xl border border-slate-300 shadow-xs overflow-hidden">
+        {/* ALWAYS-VISIBLE TOP SHEET TABS BAR (No scrolling down needed to switch tabs!) */}
+        <div className="bg-slate-200 border-b border-slate-300 px-2 pt-1.5 pb-0 flex flex-wrap items-center justify-between gap-2 select-none">
+          <div className="flex items-center gap-1">
+            {/* Tab 1: Product Order (28-Col Flat Sheet - Shows ALL 6,000+ Total Orders) */}
+            <button
+              onClick={() => setActiveSheetTab('product_order')}
+              className={`px-3 py-1.5 text-xs font-bold rounded-t-md transition-colors flex items-center gap-1.5 cursor-pointer ${
+                activeSheetTab === 'product_order'
+                  ? 'bg-white text-blue-900 shadow-2xs border-t-2 border-x border-slate-300 border-t-blue-600 -mb-px'
+                  : 'bg-slate-300/75 text-slate-700 hover:bg-slate-300'
+              }`}
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 text-blue-600" />
+              <span>Product Order</span>
+              <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-blue-100 text-blue-800 font-mono font-bold">
+                {productOrderRows.length.toLocaleString()}
+              </span>
+            </button>
+
+            {/* Tab 2: Order Automation */}
+            <button
+              onClick={() => {
+                setViewMode('merged');
+                setActiveSheetTab('automation');
+              }}
+              className={`px-3 py-1.5 text-xs font-bold rounded-t-md transition-colors flex items-center gap-1.5 cursor-pointer ${
+                activeSheetTab === 'automation'
+                  ? 'bg-white text-emerald-800 shadow-2xs border-t-2 border-x border-slate-300 border-t-emerald-600 -mb-px'
+                  : 'bg-slate-300/75 text-slate-700 hover:bg-slate-300'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Order Automation</span>
+              <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-emerald-100 text-emerald-800 font-mono font-bold">
+                {activeItemsCount.toLocaleString()}
+              </span>
+            </button>
+
+            {/* Tab 3: Closed Orders (Archive) */}
+            <button
+              onClick={() => {
+                setActiveSheetTab('closed');
+                handleRefreshFromFirebaseCloud();
+              }}
+              className={`px-3 py-1.5 text-xs font-bold rounded-t-md transition-colors flex items-center gap-1.5 cursor-pointer ${
+                activeSheetTab === 'closed'
+                  ? 'bg-white text-indigo-900 shadow-2xs border-t-2 border-x border-slate-300 border-t-indigo-600 -mb-px'
+                  : 'bg-slate-300/75 text-slate-700 hover:bg-slate-300'
+              }`}
+            >
+              <Archive className="w-3.5 h-3.5 text-indigo-600" />
+              <span>Closed Orders</span>
+              <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-indigo-100 text-indigo-800 font-mono font-bold">
+                {closedItemsCount.toLocaleString()}
+              </span>
+            </button>
+
+            {/* Tab 4: TNA (Open AN Orders Only) */}
+            <button
+              onClick={() => {
+                setActiveSheetTab('tna');
+                fetchCentralizedTnaRecords();
+              }}
+              className={`px-3 py-1.5 text-xs font-bold rounded-t-md transition-colors flex items-center gap-1.5 cursor-pointer ${
+                activeSheetTab === 'tna'
+                  ? 'bg-white text-teal-900 shadow-2xs border-t-2 border-x border-slate-300 border-t-teal-600 -mb-px'
+                  : 'bg-slate-300/75 text-slate-700 hover:bg-slate-300'
+              }`}
+            >
+              <Clock className="w-3.5 h-3.5 text-teal-600" />
+              <span>TNA</span>
+              <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-teal-100 text-teal-800 font-mono font-bold">
+                {openTnaRows.length.toLocaleString()}
+              </span>
+            </button>
+          </div>
+
+          <div className="text-[10px] text-slate-600 flex items-center gap-1.5 pb-1">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+            <span className="font-semibold text-emerald-800">Live Sync Active</span>
+          </div>
+        </div>
+
         {/* Top Control Bar - Shown on Order Automation & Closed Orders tabs (with visible horizontal scrollbar) */}
-        {activeSheetTab !== 'product_order' && (
+        {(activeSheetTab === 'automation' || activeSheetTab === 'closed') && (
           <div className="px-2.5 pt-1.5 pb-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 overflow-x-auto select-none fms-toolbar-scroll whitespace-nowrap">
             {/* Left Controls Group in Single Line */}
             <div className="flex items-center gap-2 shrink-0">
@@ -4275,7 +5213,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                 </button>
               </div>
 
-              {/* FREEZE / UNFREEZE PANES SPLIT BUTTON (Direct click toggles Freeze (2) <-> Unfreeze) */}
+              {/* FREEZE / UNFREEZE PANES SPLIT BUTTON (Direct click toggles Header Row Freeze <-> Unfreeze) */}
               <div className="relative shrink-0 inline-flex items-center">
                 <button
                   type="button"
@@ -4284,12 +5222,12 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                       setFreezeColumns(0);
                       setFreezeRows(0);
                       setShowFreezeMenu(false);
-                      setSyncFeedback('🔓 Unfrozen all columns and header rows!');
+                      setSyncFeedback('🔓 Unfrozen header row and columns!');
                     } else {
-                      setFreezeColumns(2);
+                      setFreezeColumns(0);
                       setFreezeRows(1);
                       setShowFreezeMenu(false);
-                      setSyncFeedback('📌 Frozen 2 columns (# + PO) and Header Row!');
+                      setSyncFeedback('📌 Frozen Header Row only!');
                     }
                     setTimeout(() => setSyncFeedback(null), 3000);
                   }}
@@ -4300,15 +5238,17 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   }`}
                   title={
                     freezeColumns > 0 || freezeRows > 0
-                      ? 'Click to Unfreeze all columns & rows'
-                      : 'Click to Freeze 2 columns (# + PO) & Header Row'
+                      ? 'Click to Unfreeze'
+                      : 'Click to Freeze Header Row'
                   }
                 >
                   <Pin className={`w-3 h-3 ${freezeColumns > 0 || freezeRows > 0 ? 'text-emerald-700' : 'text-slate-400'}`} />
                   <span>
-                    {freezeColumns > 0 || freezeRows > 0
-                      ? `Freeze (${freezeColumns}) · Click to Unfreeze`
-                      : 'Unfrozen (Click to Freeze)'}
+                    {freezeRows > 0 && freezeColumns === 0
+                      ? 'Header Row Frozen'
+                      : freezeColumns > 0
+                      ? `Header + ${freezeColumns} Col${freezeColumns > 1 ? 's' : ''} Frozen`
+                      : 'Unfrozen (Freeze Header)'}
                   </span>
                 </button>
                 <button
@@ -4499,8 +5439,19 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             }}
             onAddNewRow={handleAddNewProductOrderRow}
           />
+        ) : activeSheetTab === 'tna' ? (
+          <TNAView
+            tnaRows={openTnaRows}
+            onUpdateField={handleUpdateTnaField}
+            onSaveDateWithHistory={handleSaveTnaDateWithHistory}
+            onDeleteDateHistoryEntry={handleDeleteTnaDateHistoryEntry}
+            onSyncSheet={handleSyncTnaSheet}
+            isSyncing={isSyncingTna}
+            syncNotice={tnaSyncNotice}
+            isFullWidth={isFullWidth}
+          />
         ) : (
-          <div className={`overflow-x-auto overflow-y-auto ${isFullWidth ? 'h-[calc(100vh-140px)] max-h-[89vh]' : 'h-[640px] max-h-[74vh]'} select-text relative fms-sheet-scroll border border-slate-300 rounded-lg shadow-inner bg-white`}>
+          <div className={`overflow-x-auto overflow-y-auto ${isFullWidth ? 'h-[calc(100vh-215px)] min-h-[360px]' : 'h-[580px] max-h-[72vh]'} select-text relative fms-sheet-scroll border border-slate-300 rounded-lg shadow-inner bg-white`}>
             <table className={`${autoFitColumns ? 'w-max min-w-full table-auto' : 'w-full'} border-collapse text-xs text-left`}>
             {/* The Sticky Column Letters Header with Rich Fill Colors */}
             <thead className={`${freezeRows === 1 ? 'sticky top-0 z-30' : ''} select-none border-b-2 border-slate-900`}>
@@ -4514,7 +5465,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   #
                 </th>
                 {/* Action Column */}
-                <th className="w-14 px-1.5 py-0.5 text-center bg-slate-900 text-slate-300 border-r border-slate-800 font-bold">
+                <th className="w-24 px-1.5 py-0.5 text-center bg-slate-900 text-slate-300 border-r border-slate-800 font-bold">
                   Action
                 </th>
 
@@ -5031,71 +5982,6 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           );
         })()}
 
-        {/* COMPACT GOOGLE SHEETS BOTTOM TABS BAR */}
-        <div className="bg-slate-200 border-t border-slate-300 px-2 py-1 flex flex-wrap items-center justify-between gap-2 select-none">
-          {/* Tabs */}
-          <div className="flex items-center gap-1">
-            {/* Tab 1: Product Order (28-Col Flat Sheet - Shows ALL 6,000+ Total Orders) */}
-            <button
-              onClick={() => setActiveSheetTab('product_order')}
-              className={`px-2.5 py-1 text-[11px] font-bold rounded-t-md transition-colors flex items-center gap-1 cursor-pointer ${
-                activeSheetTab === 'product_order'
-                  ? 'bg-white text-blue-900 shadow-2xs border-t-2 border-blue-600'
-                  : 'bg-slate-300/80 text-slate-700 hover:bg-slate-300'
-              }`}
-            >
-              <FileSpreadsheet className="w-3 h-3 text-blue-600" />
-              <span>Product Order</span>
-              <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-blue-100 text-blue-800 font-mono font-bold">
-                {productOrderRows.length.toLocaleString()}
-              </span>
-            </button>
-
-            {/* Tab 2: Order Automation */}
-            <button
-              onClick={() => {
-                setViewMode('merged');
-                setActiveSheetTab('automation');
-              }}
-              className={`px-2.5 py-1 text-[11px] font-bold rounded-t-md transition-colors flex items-center gap-1 cursor-pointer ${
-                activeSheetTab === 'automation'
-                  ? 'bg-white text-emerald-800 shadow-2xs border-t-2 border-emerald-600'
-                  : 'bg-slate-300/80 text-slate-700 hover:bg-slate-300'
-              }`}
-            >
-              <Layers className="w-3 h-3 text-emerald-600" />
-              <span>Order Automation</span>
-              <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-emerald-100 text-emerald-800 font-mono font-bold">
-                {activeItemsCount.toLocaleString()}
-              </span>
-            </button>
-
-            {/* Tab 3: Closed Orders (Archive) */}
-            <button
-              onClick={() => {
-                setActiveSheetTab('closed');
-                handleRefreshFromFirebaseCloud();
-              }}
-              className={`px-2.5 py-1 text-[11px] font-bold rounded-t-md transition-colors flex items-center gap-1 cursor-pointer ${
-                activeSheetTab === 'closed'
-                  ? 'bg-white text-indigo-900 shadow-2xs border-t-2 border-indigo-600'
-                  : 'bg-slate-300/80 text-slate-700 hover:bg-slate-300'
-              }`}
-            >
-              <Archive className="w-3 h-3 text-indigo-600" />
-              <span>Closed Orders</span>
-              <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-indigo-100 text-indigo-800 font-mono font-bold">
-                {closedItemsCount.toLocaleString()}
-              </span>
-            </button>
-          </div>
-
-          {/* Compact Status indicator */}
-          <div className="text-[10px] text-slate-600 flex items-center gap-1.5">
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-            <span className="font-semibold text-emerald-800">Live Web</span>
-          </div>
-        </div>
       </div>
 
       {/* MODAL: CLEAR PRODUCT AUTOMATION TAB & ADD NEW DATA */}
@@ -6391,6 +7277,25 @@ function renderSpreadsheetRows(
                 className="w-3 h-3 rounded border-slate-400 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
                 title={useMerge && isFirst && order.items.length > 1 ? `Select all ${order.items.length} items in this order` : 'Select this item row'}
               />
+              {(item.statusAN || 'Open') === 'Closed' ? (
+                <button
+                  type="button"
+                  onClick={() => handlers.onItemStatusChange(item.id, 'Open')}
+                  className="px-1.5 py-0.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[9px] font-bold leading-none shadow-2xs cursor-pointer"
+                  title="Reopen this record back to Order Automation"
+                >
+                  Reopen
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => handlers.onItemStatusChange(item.id, 'Closed')}
+                  className="px-1.5 py-0.5 rounded bg-indigo-600 hover:bg-indigo-700 text-white text-[9px] font-bold leading-none shadow-2xs cursor-pointer"
+                  title="Close this record & move to Closed Orders tab"
+                >
+                  Close
+                </button>
+              )}
               {item.isDuplicate ? (
                 <span className="inline-flex items-center gap-0.5 px-1 py-0 rounded bg-rose-700 text-amber-200 text-[9px] font-mono font-extrabold tracking-tight border border-amber-300/80 shadow-2xs">
                   DUP ×{item.duplicateCount}
