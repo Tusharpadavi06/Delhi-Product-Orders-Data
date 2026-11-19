@@ -3,6 +3,7 @@ import { GroupedOrder, ProductOrderRow, OrderItem } from '../types/fms';
 import { initialRawResponses, initialExistingDispatch, fmsColumnMapping, productOrderColumns } from '../data/sampleOrders';
 import { ProductOrderView, isDateOrTimestampStr, DEFAULT_BRANCH_HEAD_NAME, DEFAULT_BRANCH_HEAD_EMAIL, MONTH_OPTIONS, parseOrderDateParts } from './ProductOrderView';
 import { TNAView, TnaDateFieldKey } from './TNAView';
+import { MercMeetingsView, MercRemarkFieldKey } from './MercMeetingsView';
 import {
   TNA_SPREADSHEET_ID,
   TNA_TAB_NAME,
@@ -20,6 +21,18 @@ import {
   toFirebaseSafeTnaKey,
   toTnaStorageDate
 } from '../utils/tnaUtils';
+import {
+  MercManualOrder,
+  MercMeetingManualData,
+  MercMeetingRow,
+  MercRemarkEntry,
+  buildMercMeetingRows,
+  formatMercDateToday,
+  formatMercTimestampNow,
+  normalizeMercManualData,
+  normalizeMercManualOrder,
+  toFirebaseSafeMercKey
+} from '../utils/mercMeetingsUtils';
 import { saveOrdersToStorage, loadOrdersFromStorage, clearOrdersFromStorage } from '../utils/orderStorage';
 import {
   RotateCcw,
@@ -73,7 +86,8 @@ import {
   Link2,
   ChevronLeft,
   ChevronRight,
-  Calendar
+  Calendar,
+  Users
 } from 'lucide-react';
 
 const LOCAL_STORAGE_KEY = 'ginza_fms_sheet_orders_v13';
@@ -91,6 +105,9 @@ const LOCAL_STORAGE_COL_AJ_KEY = 'ginza_fms_col_aj_v10';
 const LOCAL_STORAGE_COL_AK_KEY = 'ginza_fms_col_ak_v10';
 const LOCAL_STORAGE_COL_AL_KEY = 'ginza_fms_col_al_v10';
 const LOCAL_STORAGE_TNA_RECORDS = 'ginza_fms_tna_records_v2';
+const LOCAL_STORAGE_MERC_RECORDS = 'ginza_fms_merc_records_v1';
+const LOCAL_STORAGE_MERC_MANUAL_ORDERS = 'ginza_fms_merc_manual_orders_v1';
+const LOCAL_STORAGE_MERC_EDITOR_NAME = 'ginza_fms_merc_editor_name_v1';
 const LOCAL_STORAGE_FMS_WEBAPP_URL = 'ginza_fms_sheet_webapp_url_v1';
 const LOCAL_STORAGE_STATUS_OVERRIDES = 'ginza_fms_status_overrides_v1';
 
@@ -724,8 +741,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     };
   });
 
-  // Active Sheet tab: 'product_order' | 'automation' | 'closed' | 'tna'
-  const [activeSheetTab, setActiveSheetTab] = useState<'product_order' | 'automation' | 'closed' | 'tna'>('product_order');
+  // Active Sheet tab: 'product_order' | 'automation' | 'closed' | 'tna' | 'merc_meetings'
+  const [activeSheetTab, setActiveSheetTab] = useState<'product_order' | 'automation' | 'closed' | 'tna' | 'merc_meetings'>('product_order');
 
   // Centralized TNA manual records (/tna_records in Firebase + localStorage cache)
   const [tnaRecords, setTnaRecords] = useState<Record<string, TnaManualEntry>>(() => {
@@ -746,6 +763,35 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   const tnaSheetKnownKeysRef = useRef<Record<string, boolean>>({});
   const tnaSheetDeletedKeysRef = useRef<Record<string, boolean>>({});
   const tnaSheetMetaLoadedRef = useRef<boolean>(false);
+
+  // Centralized Merc Meetings state (/merc_meeting_records & /merc_manual_orders in Firebase + localStorage cache)
+  const [mercRecords, setMercRecords] = useState<Record<string, MercMeetingManualData>>(() => {
+    try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_MERC_RECORDS);
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return {};
+  });
+  const [mercManualOrders, setMercManualOrders] = useState<Record<string, MercManualOrder>>(() => {
+    try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_MERC_MANUAL_ORDERS);
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return {};
+  });
+  const [mercEditorName, setMercEditorName] = useState<string>(() => {
+    try {
+      return localStorage.getItem(LOCAL_STORAGE_MERC_EDITOR_NAME) || '';
+    } catch (e) {
+      return '';
+    }
+  });
+  const [isSyncingMerc, setIsSyncingMerc] = useState<boolean>(false);
+  const [mercSyncNotice, setMercSyncNotice] = useState<string | null>(null);
+  const mercRecordsRef = useRef<Record<string, MercMeetingManualData>>(mercRecords);
+  const mercManualOrdersRef = useRef<Record<string, MercManualOrder>>(mercManualOrders);
+  const pendingMercRecordPatchRef = useRef<Record<string, MercMeetingManualData>>({});
+  const pendingMercManualPatchRef = useRef<Record<string, MercManualOrder>>({});
 
   // Status Filter in Toolbar
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'Open' | 'In-Progress' | 'Closed'>('ALL');
@@ -4360,6 +4406,38 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     } catch (e) {}
   }, [tnaRecords]);
 
+  // Merc Meetings rows: Order Automation (AN === 'Open' & Unit === CKU / WARP(UDHANA)) + Manual Merc Orders
+  const mercMeetingRows = useMemo(
+    () => buildMercMeetingRows(groupedOrders, mercRecords, mercManualOrders),
+    [groupedOrders, mercRecords, mercManualOrders]
+  );
+
+  const openMercMeetingsCount = useMemo(
+    () => mercMeetingRows.filter(r => r.orderStatus === 'Open').length,
+    [mercMeetingRows]
+  );
+
+  // Keep Merc refs and localStorage in sync
+  useEffect(() => {
+    mercRecordsRef.current = mercRecords;
+    try {
+      localStorage.setItem(LOCAL_STORAGE_MERC_RECORDS, JSON.stringify(mercRecords));
+    } catch (e) {}
+  }, [mercRecords]);
+
+  useEffect(() => {
+    mercManualOrdersRef.current = mercManualOrders;
+    try {
+      localStorage.setItem(LOCAL_STORAGE_MERC_MANUAL_ORDERS, JSON.stringify(mercManualOrders));
+    } catch (e) {}
+  }, [mercManualOrders]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LOCAL_STORAGE_MERC_EDITOR_NAME, mercEditorName);
+    } catch (e) {}
+  }, [mercEditorName]);
+
   // Helper: Build compact snapshot payload matching Firebase /tna_open_snapshot & Apps Script doPost
   const buildTnaSnapshotPayload = (rows: TnaRowItem[]) => ({
     count: rows.length,
@@ -4806,9 +4884,16 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
   useEffect(() => {
     fetchCentralizedTnaRecords();
+    fetchCentralizedMercMeetingsData(false);
     const timer = setInterval(() => {
       if (Object.keys(pendingTnaPatchRef.current).length === 0) {
         fetchCentralizedTnaRecords();
+      }
+      if (
+        Object.keys(pendingMercRecordPatchRef.current).length === 0 &&
+        Object.keys(pendingMercManualPatchRef.current).length === 0
+      ) {
+        fetchCentralizedMercMeetingsData(false);
       }
     }, 45000);
     return () => clearInterval(timer);
@@ -5004,6 +5089,338 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }
 
     commitTnaRecordUpdate(tnaKey, altKey, updatedEntry);
+  };
+
+  // ==================== MERC MEETINGS CLOUD SYNC & CRUD HANDLERS ====================
+  const patchMercFirebaseNode = async (
+    nodePath: string,
+    payload: any,
+    method: 'PATCH' | 'PUT' | 'DELETE' = 'PATCH'
+  ): Promise<boolean> => {
+    try {
+      const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+      const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+      const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+      const opts: RequestInit = {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        keepalive: true
+      };
+      if (method !== 'DELETE') {
+        opts.body = JSON.stringify(payload);
+      }
+      let res = await fetch(`${baseTargetUrl}${nodePath}.json${authQuery}`, opts);
+      if ((res.status === 401 || res.status === 403) && authQuery) {
+        res = await fetch(`${baseTargetUrl}${nodePath}.json`, opts);
+      }
+      return res.ok;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  const fetchCentralizedMercMeetingsData = async (showBanner = false) => {
+    if (showBanner) {
+      setIsSyncingMerc(true);
+      setMercSyncNotice('Syncing with Firebase...');
+    }
+    try {
+      const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+      const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+      const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+
+      const safeFetchNode = async (path: string): Promise<{ ok: boolean; data: any }> => {
+        try {
+          let r = await fetch(`${baseTargetUrl}${path}.json${authQuery}`);
+          if ((r.status === 401 || r.status === 403) && authQuery) {
+            r = await fetch(`${baseTargetUrl}${path}.json`);
+          }
+          if (!r.ok) return { ok: false, data: null };
+          const json = await r.json();
+          if (json && typeof json === 'object' && json.error) return { ok: false, data: null };
+          return { ok: true, data: json };
+        } catch (e) {
+          return { ok: false, data: null };
+        }
+      };
+
+      const [recRes, manRes] = await Promise.all([
+        safeFetchNode('/merc_meeting_records'),
+        safeFetchNode('/merc_manual_orders')
+      ]);
+
+      if (recRes.ok && recRes.data && typeof recRes.data === 'object') {
+        setMercRecords(prev => {
+          const merged: Record<string, MercMeetingManualData> = { ...prev };
+          Object.entries(recRes.data).forEach(([k, v]) => {
+            if (!v || typeof v !== 'object') return;
+            if (pendingMercRecordPatchRef.current[k]) return;
+            const cloudNorm = normalizeMercManualData(v as Partial<MercMeetingManualData>);
+            const localNorm = prev[k];
+            if (!localNorm || !localNorm.updatedAt || (cloudNorm.updatedAt && cloudNorm.updatedAt >= localNorm.updatedAt)) {
+              merged[k] = cloudNorm;
+            }
+          });
+          return merged;
+        });
+      }
+
+      if (manRes.ok) {
+        setMercManualOrders(prev => {
+          const merged: Record<string, MercManualOrder> = {};
+          if (manRes.data && typeof manRes.data === 'object') {
+            Object.entries(manRes.data).forEach(([id, raw]) => {
+              const cloudOrder = normalizeMercManualOrder(id, raw);
+              if (!cloudOrder) return;
+              const pendingLocal = pendingMercManualPatchRef.current[id];
+              if (pendingLocal) {
+                merged[id] = pendingLocal;
+                return;
+              }
+              const localOrder = prev[id];
+              if (
+                localOrder &&
+                localOrder.updatedAt &&
+                (!cloudOrder.updatedAt || localOrder.updatedAt > cloudOrder.updatedAt)
+              ) {
+                merged[id] = localOrder;
+              } else {
+                merged[id] = cloudOrder;
+              }
+            });
+          }
+          // Preserve any newly added manual orders still waiting to flush
+          Object.entries(pendingMercManualPatchRef.current).forEach(([id, ord]) => {
+            if (ord && !merged[id]) merged[id] = ord;
+          });
+          return merged;
+        });
+      }
+
+      if (showBanner) {
+        setMercSyncNotice(recRes.ok || manRes.ok ? 'Synced with Cloud ✓' : 'Offline Cache Active');
+        setTimeout(() => setMercSyncNotice(null), 3000);
+      }
+    } catch (e) {
+      if (showBanner) {
+        setMercSyncNotice('Sync failed — Local cache preserved');
+        setTimeout(() => setMercSyncNotice(null), 4000);
+      }
+    } finally {
+      if (showBanner) setIsSyncingMerc(false);
+    }
+  };
+
+  const persistMercRowRemarkState = async (
+    row: MercMeetingRow,
+    nextData: MercMeetingManualData
+  ) => {
+    setMercSyncNotice('Saving...');
+    if (row.source === 'manual' && row.manualOrderId) {
+      const id = row.manualOrderId;
+      const curOrder = mercManualOrdersRef.current[id];
+      if (!curOrder) return;
+      const updatedOrder: MercManualOrder = {
+        ...curOrder,
+        merchantRemark: nextData.merchantRemark,
+        meetingUpdate: nextData.meetingUpdate,
+        merchantRemarkHistory: nextData.merchantRemarkHistory,
+        meetingUpdateHistory: nextData.meetingUpdateHistory,
+        updatedAt: nextData.updatedAt
+      };
+      const nextManualMap = { ...mercManualOrdersRef.current, [id]: updatedOrder };
+      mercManualOrdersRef.current = nextManualMap;
+      pendingMercManualPatchRef.current[id] = updatedOrder;
+      setMercManualOrders(nextManualMap);
+      const ok = await patchMercFirebaseNode(`/merc_manual_orders/${encodeURIComponent(id)}`, updatedOrder, 'PATCH');
+      delete pendingMercManualPatchRef.current[id];
+      setMercSyncNotice(ok ? 'Saved to Cloud ✓' : 'Saved Locally (Offline)');
+      setTimeout(() => setMercSyncNotice(null), 2500);
+    } else {
+      const safeKey = toFirebaseSafeMercKey(row.mercKey);
+      const nextRecMap = {
+        ...mercRecordsRef.current,
+        [row.mercKey]: nextData,
+        [safeKey]: nextData
+      };
+      mercRecordsRef.current = nextRecMap;
+      pendingMercRecordPatchRef.current[safeKey] = nextData;
+      setMercRecords(nextRecMap);
+      const ok = await patchMercFirebaseNode(`/merc_meeting_records/${encodeURIComponent(safeKey)}`, nextData, 'PATCH');
+      delete pendingMercRecordPatchRef.current[safeKey];
+      setMercSyncNotice(ok ? 'Saved to Cloud ✓' : 'Saved Locally (Offline)');
+      setTimeout(() => setMercSyncNotice(null), 2500);
+    }
+  };
+
+  const getCurrentMercDataForRow = (row: MercMeetingRow): MercMeetingManualData => {
+    if (row.source === 'manual' && row.manualOrderId) {
+      const ord = mercManualOrdersRef.current[row.manualOrderId];
+      if (ord) {
+        return normalizeMercManualData({
+          merchantRemark: ord.merchantRemark,
+          meetingUpdate: ord.meetingUpdate,
+          merchantRemarkHistory: ord.merchantRemarkHistory,
+          meetingUpdateHistory: ord.meetingUpdateHistory,
+          updatedAt: ord.updatedAt
+        });
+      }
+    }
+    const safeKey = toFirebaseSafeMercKey(row.mercKey);
+    return normalizeMercManualData(mercRecordsRef.current[safeKey] || mercRecordsRef.current[row.mercKey] || {
+      merchantRemark: row.merchantRemark,
+      meetingUpdate: row.meetingUpdate,
+      merchantRemarkHistory: row.merchantRemarkHistory,
+      meetingUpdateHistory: row.meetingUpdateHistory
+    });
+  };
+
+  const handleAddMercRemarkEntry = (
+    row: MercMeetingRow,
+    field: MercRemarkFieldKey,
+    payload: { text: string; date: string; editorName: string }
+  ) => {
+    const cleanText = payload.text.trim();
+    if (!cleanText) return;
+    const nowIso = new Date().toISOString();
+    const newEntry: MercRemarkEntry = {
+      id: `mhist_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      text: cleanText,
+      date: payload.date.trim() || formatMercDateToday(),
+      timestamp: formatMercTimestampNow(),
+      editorName: payload.editorName.trim() || 'User',
+      createdAt: nowIso
+    };
+    const existing = getCurrentMercDataForRow(row);
+    const updated: MercMeetingManualData = {
+      ...existing,
+      [field]: cleanText,
+      updatedAt: nowIso
+    };
+    if (field === 'merchantRemark') {
+      updated.merchantRemarkHistory = [...existing.merchantRemarkHistory, newEntry];
+    } else {
+      updated.meetingUpdateHistory = [...existing.meetingUpdateHistory, newEntry];
+    }
+    persistMercRowRemarkState(row, updated);
+  };
+
+  const handleUpdateMercInlineRemark = (
+    row: MercMeetingRow,
+    field: MercRemarkFieldKey,
+    text: string,
+    editor: string
+  ) => {
+    const cleanText = text.trim();
+    const nowIso = new Date().toISOString();
+    const existing = getCurrentMercDataForRow(row);
+    const curHist = field === 'merchantRemark' ? existing.merchantRemarkHistory : existing.meetingUpdateHistory;
+    const lastHist = curHist.length > 0 ? curHist[curHist.length - 1] : null;
+    let nextHist = [...curHist];
+
+    if (cleanText && (!lastHist || lastHist.text !== cleanText)) {
+      nextHist.push({
+        id: `mhist_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        text: cleanText,
+        date: formatMercDateToday(),
+        timestamp: formatMercTimestampNow(),
+        editorName: editor.trim() || 'User',
+        createdAt: nowIso
+      });
+    }
+
+    const updated: MercMeetingManualData = {
+      ...existing,
+      [field]: cleanText,
+      updatedAt: nowIso
+    };
+    if (field === 'merchantRemark') {
+      updated.merchantRemarkHistory = nextHist;
+    } else {
+      updated.meetingUpdateHistory = nextHist;
+    }
+    persistMercRowRemarkState(row, updated);
+  };
+
+  const handleDeleteMercRemarkEntry = (
+    row: MercMeetingRow,
+    field: MercRemarkFieldKey,
+    entryId: string
+  ) => {
+    const nowIso = new Date().toISOString();
+    const existing = getCurrentMercDataForRow(row);
+    const curHist = field === 'merchantRemark' ? existing.merchantRemarkHistory : existing.meetingUpdateHistory;
+    const filtered = curHist.filter(e => e.id !== entryId);
+    const nextLatestText = filtered.length > 0 ? filtered[filtered.length - 1].text : '';
+
+    const updated: MercMeetingManualData = {
+      ...existing,
+      [field]: nextLatestText,
+      updatedAt: nowIso
+    };
+    if (field === 'merchantRemark') {
+      updated.merchantRemarkHistory = filtered;
+    } else {
+      updated.meetingUpdateHistory = filtered;
+    }
+    persistMercRowRemarkState(row, updated);
+  };
+
+  const handleAddMercManualOrder = async (
+    orderInput: Omit<MercManualOrder, 'id' | 'createdAt' | 'updatedAt'>
+  ) => {
+    const nowIso = new Date().toISOString();
+    const id = `MERC_MAN_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const newOrder: MercManualOrder = {
+      ...orderInput,
+      id,
+      createdAt: nowIso,
+      updatedAt: nowIso
+    };
+    const nextMap = { ...mercManualOrdersRef.current, [id]: newOrder };
+    mercManualOrdersRef.current = nextMap;
+    pendingMercManualPatchRef.current[id] = newOrder;
+    setMercManualOrders(nextMap);
+    setMercSyncNotice('Adding manual order...');
+    const ok = await patchMercFirebaseNode(`/merc_manual_orders/${encodeURIComponent(id)}`, newOrder, 'PUT');
+    delete pendingMercManualPatchRef.current[id];
+    setMercSyncNotice(ok ? 'Manual order saved to Cloud ✓' : 'Manual order saved locally');
+    setTimeout(() => setMercSyncNotice(null), 2500);
+  };
+
+  const handleUpdateMercManualOrderField = async (
+    manualOrderId: string,
+    updates: Partial<MercManualOrder>
+  ) => {
+    const existing = mercManualOrdersRef.current[manualOrderId];
+    if (!existing) return;
+    const nowIso = new Date().toISOString();
+    const updated: MercManualOrder = {
+      ...existing,
+      ...updates,
+      updatedAt: nowIso
+    };
+    const nextMap = { ...mercManualOrdersRef.current, [manualOrderId]: updated };
+    mercManualOrdersRef.current = nextMap;
+    pendingMercManualPatchRef.current[manualOrderId] = updated;
+    setMercManualOrders(nextMap);
+    setMercSyncNotice('Updating...');
+    const ok = await patchMercFirebaseNode(`/merc_manual_orders/${encodeURIComponent(manualOrderId)}`, updated, 'PATCH');
+    delete pendingMercManualPatchRef.current[manualOrderId];
+    setMercSyncNotice(ok ? 'Updated in Cloud ✓' : 'Updated locally');
+    setTimeout(() => setMercSyncNotice(null), 2000);
+  };
+
+  const handleDeleteMercManualOrder = async (manualOrderId: string, _label: string) => {
+    const nextMap = { ...mercManualOrdersRef.current };
+    delete nextMap[manualOrderId];
+    mercManualOrdersRef.current = nextMap;
+    delete pendingMercManualPatchRef.current[manualOrderId];
+    setMercManualOrders(nextMap);
+    setMercSyncNotice('Removing manual order...');
+    const ok = await patchMercFirebaseNode(`/merc_manual_orders/${encodeURIComponent(manualOrderId)}`, null, 'DELETE');
+    setMercSyncNotice(ok ? 'Manual order deleted ✓' : 'Deleted locally');
+    setTimeout(() => setMercSyncNotice(null), 2500);
   };
 
   // Manual Sync TNA Sheet: pulls Firebase + Target Google Sheet CSV (1Wdu7PtyAEEnOY3R3OgvNM-Hnu9LnTnw1WKJQf06z-Qo) & syncs without removing Closed rows or re-adding manually deleted Google Sheet rows
@@ -5266,6 +5683,25 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               <span>TNA</span>
               <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-teal-100 text-teal-800 font-mono font-bold">
                 {openTnaRows.length.toLocaleString()}
+              </span>
+            </button>
+
+            {/* Tab 5: Merc Meetings (CKU & WARP(UDHANA) Open AN + Manual Orders) */}
+            <button
+              onClick={() => {
+                setActiveSheetTab('merc_meetings');
+                fetchCentralizedMercMeetingsData(false);
+              }}
+              className={`px-3 py-1.5 text-xs font-bold rounded-t-md transition-colors flex items-center gap-1.5 cursor-pointer ${
+                activeSheetTab === 'merc_meetings'
+                  ? 'bg-white text-amber-900 shadow-2xs border-t-2 border-x border-slate-300 border-t-amber-600 -mb-px'
+                  : 'bg-slate-300/75 text-slate-700 hover:bg-slate-300'
+              }`}
+            >
+              <Users className="w-3.5 h-3.5 text-amber-600" />
+              <span>Merc Meetings</span>
+              <span className="ml-0.5 text-[10px] px-1.5 py-0 rounded-full bg-amber-100 text-amber-800 font-mono font-bold">
+                {openMercMeetingsCount.toLocaleString()}
               </span>
             </button>
           </div>
@@ -5805,6 +6241,22 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             onSyncSheet={handleSyncTnaSheet}
             isSyncing={isSyncingTna}
             syncNotice={tnaSyncNotice}
+            isFullWidth={isFullWidth}
+          />
+        ) : activeSheetTab === 'merc_meetings' ? (
+          <MercMeetingsView
+            rows={mercMeetingRows}
+            editorName={mercEditorName}
+            setEditorName={setMercEditorName}
+            onAddRemarkHistoryEntry={handleAddMercRemarkEntry}
+            onUpdateInlineRemark={handleUpdateMercInlineRemark}
+            onDeleteRemarkHistoryEntry={handleDeleteMercRemarkEntry}
+            onAddManualOrder={handleAddMercManualOrder}
+            onUpdateManualOrderField={handleUpdateMercManualOrderField}
+            onDeleteManualOrder={handleDeleteMercManualOrder}
+            onSyncCloud={() => fetchCentralizedMercMeetingsData(true)}
+            isSyncing={isSyncingMerc}
+            syncNotice={mercSyncNotice}
             isFullWidth={isFullWidth}
           />
         ) : (
