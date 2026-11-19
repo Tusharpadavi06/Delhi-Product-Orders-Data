@@ -19,7 +19,10 @@ import {
   Filter,
   Columns,
   Eye,
-  EyeOff
+  EyeOff,
+  FileSpreadsheet,
+  Copy,
+  Check
 } from 'lucide-react';
 import {
   MercManualOrder,
@@ -60,10 +63,15 @@ interface MercMeetingsViewProps {
     manualOrderId: string,
     updates: Partial<MercManualOrder>
   ) => void;
+  onUpdateDispatchQty: (row: MercMeetingRow, nextDispatchQty: number) => void;
+  onUpdateRowStatus: (row: MercMeetingRow, nextStatus: 'Open' | 'Closed') => void;
   onDeleteManualOrder: (manualOrderId: string, label: string) => void;
   onSyncCloud: () => void;
   isSyncing: boolean;
   syncNotice: string | null;
+  thursdayUniqueCount: number;
+  thursdayDuplicateSkippedCount: number;
+  thursdaySheetNeedsAccess: boolean;
   isFullWidth: boolean;
 }
 
@@ -96,20 +104,20 @@ interface MercColDef {
 const MERC_COL_VISIBILITY_STORAGE_KEY = 'ginza_fms_merc_col_visibility_v1';
 
 const MERC_COLUMNS: MercColDef[] = [
-  { key: 'unit', label: 'Unit / Source', align: 'left' },
-  { key: 'orderDate', label: 'Order Date (E)', align: 'left' },
-  { key: 'orderNo', label: 'Order Number (X)', align: 'left' },
-  { key: 'customerName', label: 'Customer Name (C)', align: 'left', thClass: 'min-w-[165px]' },
-  { key: 'designNo', label: 'Design No (G)', align: 'left', thClass: 'min-w-[140px]' },
-  { key: 'color', label: 'Color (H)', align: 'left' },
-  { key: 'totalQty', label: 'Total Qnt (K)', align: 'right', numeric: true },
-  { key: 'rate', label: 'Rate (L)', align: 'right', numeric: true },
-  { key: 'dispatchCommitted', label: 'Dispatch Commited (N)', align: 'left' },
-  { key: 'dispatchQty', label: 'Dispatch Qnt (Y)', align: 'right', numeric: true },
-  { key: 'balanceQty', label: 'Balance Qnt (Z)', align: 'right', numeric: true },
-  { key: 'merchantRemark', label: 'Merchant Remark (+ Log)', align: 'left', thClass: 'min-w-[205px] bg-amber-50/70 text-amber-950' },
-  { key: 'meetingUpdate', label: 'Meeting Update (+ Log)', align: 'left', thClass: 'min-w-[205px] bg-sky-50/70 text-sky-950' },
-  { key: 'orderStatus', label: 'Order Status', align: 'left', thClass: 'min-w-[145px] sticky right-0 z-30 bg-slate-100 border-l border-slate-300 shadow-[-2px_0_4px_-2px_rgba(0,0,0,0.08)]' }
+  { key: 'unit', label: 'Unit', align: 'left', thClass: 'w-[86px] max-w-[92px]' },
+  { key: 'orderDate', label: 'Date (E)', align: 'left', thClass: 'w-[76px]' },
+  { key: 'orderNo', label: 'Order No (X)', align: 'left', thClass: 'w-[104px] max-w-[112px]' },
+  { key: 'customerName', label: 'Customer (C)', align: 'left', thClass: 'min-w-[112px] max-w-[140px]' },
+  { key: 'designNo', label: 'Design (G)', align: 'left', thClass: 'min-w-[84px] max-w-[108px]' },
+  { key: 'color', label: 'Color (H)', align: 'left', thClass: 'w-[76px] max-w-[88px]' },
+  { key: 'totalQty', label: 'Total (K)', align: 'right', numeric: true, thClass: 'w-[66px]' },
+  { key: 'rate', label: 'Rate (L)', align: 'right', numeric: true, thClass: 'w-[54px]' },
+  { key: 'dispatchCommitted', label: 'Commit (N)', align: 'left', thClass: 'w-[76px]' },
+  { key: 'dispatchQty', label: 'Disp (Y)', align: 'right', numeric: true, thClass: 'w-[76px] bg-amber-50/80 text-amber-950' },
+  { key: 'balanceQty', label: 'Bal (Z)', align: 'right', numeric: true, thClass: 'w-[68px] bg-emerald-50/70 text-emerald-950' },
+  { key: 'merchantRemark', label: 'Merch Remark (+)', align: 'left', thClass: 'min-w-[138px] max-w-[170px] bg-amber-50/70 text-amber-950' },
+  { key: 'meetingUpdate', label: 'Meeting Update (+)', align: 'left', thClass: 'min-w-[138px] max-w-[170px] bg-sky-50/70 text-sky-950' },
+  { key: 'orderStatus', label: 'Status', align: 'left', thClass: 'w-[96px] min-w-[96px] sticky right-0 z-30 bg-slate-100 border-l border-slate-300 shadow-[-2px_0_4px_-2px_rgba(0,0,0,0.08)]' }
 ];
 
 const DEFAULT_VISIBLE_COLS: Record<MercColKey, boolean> = {
@@ -144,25 +152,212 @@ function getMercColFilterValue(row: MercMeetingRow, colKey: MercColKey): string 
     case 'color':
       return row.color.trim() || '(Blank)';
     case 'totalQty':
-      return String(row.totalQty ?? 0);
+      return row.totalQtyText || String(row.totalQty ?? 0);
     case 'rate':
-      return String(row.rate ?? 0);
+      return row.rateText || String(row.rate ?? 0);
     case 'dispatchCommitted':
       return row.dispatchCommitted.trim() || '(Blank)';
     case 'dispatchQty':
-      return String(row.dispatchQty ?? 0);
+      return row.dispatchQtyText || String(row.dispatchQty ?? 0);
     case 'balanceQty':
-      return String(row.balanceQty ?? 0);
+      return row.balanceQtyText || String(row.balanceQty ?? 0);
     case 'merchantRemark':
       return row.merchantRemark.trim() || '(Blank)';
     case 'meetingUpdate':
       return row.meetingUpdate.trim() || '(Blank)';
     case 'orderStatus':
-      return row.source === 'manual' ? `${row.orderStatus} (Manual)` : 'Open (Auto AN)';
+      if (row.source === 'manual') return `${row.orderStatus} (Manual)`;
+      if (row.source === 'thursday_sheet') return `${row.orderStatus} (Thursday Sheet)`;
+      return 'Open (Auto AN)';
     default:
       return '(Blank)';
   }
 }
+
+const THURSDAY_SYNC_APPS_SCRIPT = `/**
+ * ==============================================================================
+ * GINZA FMS - THURSDAY MEETING FOR CIRCULAR -> MERC MEETINGS LIVE SYNC (v2)
+ * Paste inside Apps Script of Sheet: 1Wdu7PtyAEEnOY3R3OgvNM-Hnu9LnTnw1WKJQf06z-Qo
+ * Run "syncThursdayMeetingToFirebase()" once (or add a 5-min time trigger).
+ * Preserves exact Google Sheet text for Total Qnt, Rate, Dispatch Qnt, Balance Qnt.
+ * ==============================================================================
+ */
+const MERC_THURSDAY_CFG = {
+  SPREADSHEET_ID: "1Wdu7PtyAEEnOY3R3OgvNM-Hnu9LnTnw1WKJQf06z-Qo",
+  TAB_NAMES: [
+    "Thursday Meeting for circular.",
+    "Thursday Meeting for Circular.",
+    "Thursday Meeting for circular",
+    "Thursday Meeting for Circular"
+  ],
+  DATABASE_URL: "https://delhi-product-order-default-rtdb.firebaseio.com",
+  DATABASE_SECRET: "iIElINFgR124ssaG3QWjExz2lT72cRh5g502oP6J"
+};
+
+function readThursdayMeetingData_() {
+  const ss = SpreadsheetApp.openById(MERC_THURSDAY_CFG.SPREADSHEET_ID);
+  let sheet = null;
+  for (let i = 0; i < MERC_THURSDAY_CFG.TAB_NAMES.length; i++) {
+    sheet = ss.getSheetByName(MERC_THURSDAY_CFG.TAB_NAMES[i]);
+    if (sheet) break;
+  }
+  if (!sheet) {
+    const all = ss.getSheets();
+    for (let i = 0; i < all.length; i++) {
+      const n = all[i].getName().toLowerCase();
+      if (n.indexOf("thursday") !== -1 && n.indexOf("circular") !== -1) {
+        sheet = all[i];
+        break;
+      }
+    }
+  }
+  if (!sheet) throw new Error('Tab "Thursday Meeting for circular." not found.');
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = Math.max(sheet.getLastColumn(), 13);
+  if (lastRow < 2) return { rows: [], detectedHeaders: [], colMap: {} };
+
+  const rng = sheet.getRange(1, 1, lastRow, lastCol);
+  const display = rng.getDisplayValues();
+  const rawVals = rng.getValues();
+  const normH = (s) => String(s || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+  let hdrIdx = -1;
+  const colMap = {};
+  for (let r = 0; r < Math.min(6, display.length); r++) {
+    const m = {};
+    display[r].forEach(function(cell, idx) {
+      const h = normH(cell);
+      if (!h) return;
+      if ((h.includes("order") && h.includes("date")) || h === "date") {
+        if (m.orderDate === undefined) m.orderDate = idx;
+      } else if (h.includes("order") && (h.includes("no") || h.includes("num"))) {
+        if (m.orderNo === undefined) m.orderNo = idx;
+      } else if (h.includes("customer") || h.includes("party")) {
+        if (m.customerName === undefined) m.customerName = idx;
+      } else if (h.includes("design") || h.includes("item")) {
+        if (m.designNo === undefined) m.designNo = idx;
+      } else if (h.includes("color") || h.includes("colour") || h.includes("shade")) {
+        if (m.color === undefined) m.color = idx;
+      } else if (
+        (h.includes("total") && (h.includes("qnt") || h.includes("qty") || h.includes("quant") || h.includes("kg") || h.includes("mtr"))) ||
+        (h.includes("order") && (h.includes("qnt") || h.includes("qty") || h.includes("quant"))) ||
+        h === "total" || h === "qty" || h === "qnt" || h === "quantity"
+      ) {
+        if (m.totalQty === undefined) m.totalQty = idx;
+      } else if (h === "rate" || h.startsWith("rate ") || h.includes("rate") || h.includes("price")) {
+        if (m.rate === undefined) m.rate = idx;
+      } else if (h.includes("commit") || h.includes("commited") || h.includes("delivery") || (h.includes("dispatch") && h.includes("date"))) {
+        if (m.dispatchCommitted === undefined) m.dispatchCommitted = idx;
+      } else if (
+        (h.includes("dispatch") && !h.includes("commit") && !h.includes("commited") && !h.includes("date")) ||
+        h.includes("dispatched")
+      ) {
+        if (m.dispatchQty === undefined) m.dispatchQty = idx;
+      } else if (h.includes("balance") || h.includes("bal") || h.includes("pending qty") || h.includes("pending qnt")) {
+        if (m.balanceQty === undefined) m.balanceQty = idx;
+      } else if (h.includes("merchant") || h.includes("mechant") || h.includes("remark")) {
+        if (m.merchantRemark === undefined) m.merchantRemark = idx;
+      } else if (h.includes("meeting") || h.includes("update")) {
+        if (m.meetingUpdate === undefined) m.meetingUpdate = idx;
+      } else if (h.includes("status")) {
+        if (m.orderStatus === undefined) m.orderStatus = idx;
+      } else if (h === "unit" || h.startsWith("unit ")) {
+        if (m.unit === undefined) m.unit = idx;
+      }
+    });
+    if (Object.keys(m).length >= 4) { hdrIdx = r; Object.assign(colMap, m); break; }
+  }
+
+  const colorIdx = colMap.color !== undefined ? colMap.color : 4;
+  const commitIdx = colMap.dispatchCommitted !== undefined ? colMap.dispatchCommitted : colorIdx + 3;
+  const idxOf = (key, fb) => (colMap[key] !== undefined ? colMap[key] : fb);
+  const getC = (row, idx) => String(row[idx] || "").trim();
+  const toNum = (dispVal, rawVal) => {
+    if (typeof rawVal === "number" && !isNaN(rawVal)) return rawVal;
+    const cleaned = String(dispVal || "").replace(/,/g, "").trim();
+    if (!cleaned) return 0;
+    const match = cleaned.match(/-?\\d+(?:\\.\\d+)?/);
+    return match ? parseFloat(match[0]) : 0;
+  };
+
+  const rows = [];
+  const startRow = hdrIdx >= 0 ? hdrIdx + 1 : 1;
+
+  for (let r = startRow; r < display.length; r++) {
+    const row = display[r];
+    const rRaw = rawVals[r];
+    const customerName = getC(row, idxOf("customerName", 2));
+    const designNo = getC(row, idxOf("designNo", 3));
+    const orderNo = getC(row, idxOf("orderNo", 1));
+    if (!customerName && !designNo && !orderNo) continue;
+
+    const totalIdx = idxOf("totalQty", colorIdx + 1);
+    const rateIdx = idxOf("rate", colorIdx + 2);
+    const dispIdx = idxOf("dispatchQty", commitIdx + 1);
+    const balIdx = idxOf("balanceQty", commitIdx + 2);
+
+    const totalQtyText = getC(row, totalIdx);
+    const rateText = getC(row, rateIdx);
+    const dispatchQtyText = getC(row, dispIdx);
+    const balanceQtyText = getC(row, balIdx);
+
+    const totalQty = toNum(totalQtyText, rRaw[totalIdx]);
+    const rate = toNum(rateText, rRaw[rateIdx]);
+    const dispatchQty = toNum(dispatchQtyText, rRaw[dispIdx]);
+    const balanceQty = balanceQtyText !== ""
+      ? toNum(balanceQtyText, rRaw[balIdx])
+      : Number((totalQty - dispatchQty).toFixed(4));
+
+    const rawStatus = getC(row, idxOf("orderStatus", commitIdx + 5)).toLowerCase();
+    const unitVal = colMap.unit !== undefined ? getC(row, colMap.unit) : "";
+
+    rows.push({
+      rowIndex: r + 1,
+      orderDate: getC(row, idxOf("orderDate", 0)),
+      orderNo: orderNo,
+      customerName: customerName,
+      designNo: designNo,
+      color: getC(row, colorIdx),
+      totalQty: totalQty,
+      totalQtyText: totalQtyText,
+      rate: rate,
+      rateText: rateText,
+      dispatchCommitted: getC(row, commitIdx),
+      dispatchQty: dispatchQty,
+      dispatchQtyText: dispatchQtyText,
+      balanceQty: balanceQty,
+      balanceQtyText: balanceQtyText,
+      merchantRemark: getC(row, idxOf("merchantRemark", commitIdx + 3)),
+      meetingUpdate: getC(row, idxOf("meetingUpdate", commitIdx + 4)),
+      orderStatus: (rawStatus === "closed" || rawStatus === "close") ? "Closed" : "Open",
+      unit: unitVal || "CKU"
+    });
+  }
+  return {
+    rows: rows,
+    detectedHeaders: hdrIdx >= 0 ? display[hdrIdx] : [],
+    colMap: colMap
+  };
+}
+
+function syncThursdayMeetingToFirebase() {
+  const result = readThursdayMeetingData_();
+  const url = MERC_THURSDAY_CFG.DATABASE_URL + "/merc_thursday_sheet_rows.json?auth=" + encodeURIComponent(MERC_THURSDAY_CFG.DATABASE_SECRET);
+  UrlFetchApp.fetch(url, {
+    method: "put",
+    contentType: "application/json",
+    payload: JSON.stringify({
+      updated_at: new Date().toISOString(),
+      count: result.rows.length,
+      detectedHeaders: result.detectedHeaders,
+      colMap: result.colMap,
+      rows: result.rows
+    }),
+    muteHttpExceptions: true
+  });
+  Logger.log("Synced " + result.rows.length + " rows. Mapped columns: " + JSON.stringify(result.colMap));
+}`;
 
 const MONTH_NAMES = [
   'January', 'February', 'March', 'April', 'May', 'June',
@@ -191,21 +386,28 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
   onDeleteRemarkHistoryEntry,
   onAddManualOrder,
   onUpdateManualOrderField,
+  onUpdateDispatchQty,
+  onUpdateRowStatus,
   onDeleteManualOrder,
   onSyncCloud,
   isSyncing,
   syncNotice,
+  thursdayUniqueCount,
+  thursdayDuplicateSkippedCount,
+  thursdaySheetNeedsAccess,
   isFullWidth
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<'Open' | 'Closed' | 'ALL'>('Open');
   const [unitFilter, setUnitFilter] = useState<'ALL' | 'CKU' | 'WARP'>('ALL');
-  const [sourceFilter, setSourceFilter] = useState<'ALL' | 'automation' | 'manual'>('ALL');
+  const [sourceFilter, setSourceFilter] = useState<'ALL' | 'automation' | 'manual' | 'thursday_sheet'>('ALL');
   const [monthFilter, setMonthFilter] = useState<string>('ALL');
   const [yearFilter, setYearFilter] = useState<string>('ALL');
   const [sortConfig, setSortConfig] = useState<{ key: MercSortKey; direction: 'asc' | 'desc' } | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<number>(50);
+  const [showThursdaySyncModal, setShowThursdaySyncModal] = useState(false);
+  const [copiedScript, setCopiedScript] = useState(false);
 
   // Per-column header filters (Google Sheets style)
   const [colFilters, setColFilters] = useState<Partial<Record<MercColKey, string[]>>>({});
@@ -285,7 +487,7 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
     [rows]
   );
   const closedManualCount = useMemo(
-    () => rows.filter(r => r.source === 'manual' && r.orderStatus === 'Closed').length,
+    () => rows.filter(r => r.orderStatus === 'Closed').length,
     [rows]
   );
 
@@ -633,18 +835,22 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
       headers.map(esc).join(','),
       ...filteredRows.map(r =>
         [
-          r.source === 'manual' ? 'Manual Entry' : 'Order Automation',
+          r.source === 'manual'
+            ? 'Manual Entry'
+            : r.source === 'thursday_sheet'
+            ? 'Thursday Meeting Sheet (Unique)'
+            : 'Order Automation',
           r.unit,
           r.orderDate,
           r.orderNo,
           r.customerName,
           r.designNo,
           r.color,
-          r.totalQty,
-          r.rate,
+          r.totalQtyText || r.totalQty,
+          r.rateText || r.rate,
           r.dispatchCommitted,
-          r.dispatchQty,
-          r.balanceQty,
+          r.dispatchQtyText || r.dispatchQty,
+          r.balanceQtyText || r.balanceQty,
           r.merchantRemark,
           formatHist(r.merchantRemarkHistory),
           r.meetingUpdate,
@@ -800,13 +1006,14 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
           <select
             value={sourceFilter}
             onChange={(e) => {
-              setSourceFilter(e.target.value as 'ALL' | 'automation' | 'manual');
+              setSourceFilter(e.target.value as 'ALL' | 'automation' | 'manual' | 'thursday_sheet');
               setPage(1);
             }}
             className="text-xs font-semibold text-slate-800 bg-white border border-slate-300 rounded-md px-2 py-1 focus:outline-none cursor-pointer shadow-2xs"
           >
             <option value="ALL">All Sources</option>
             <option value="automation">Auto (Order Automation)</option>
+            <option value="thursday_sheet">Thursday Sheet (Unique · {thursdayUniqueCount})</option>
             <option value="manual">Manual Orders Only</option>
           </select>
 
@@ -901,14 +1108,30 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
         </div>
       </div>
 
-      {/* Sub-header info + Notice */}
-      <div className="px-3 py-1.5 bg-white border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600">
-        <div className="flex items-center gap-2">
-          <span className="font-semibold text-slate-800">Merc Meetings</span>
-          <span aria-hidden="true">·</span>
-          <span>Auto Feed: Order Automation (AN = Open, Unit = CKU &amp; WARP(UDHANA))</span>
-          <span aria-hidden="true">·</span>
-          <span>Manual Orders + Multi-User Timestamped Remarks</span>
+      {/* Minimal Sub-header: Thursday Sheet Legend + Script Button + Row Count */}
+      <div className="px-3 py-1 bg-white border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 text-slate-700">
+            <span
+              className="inline-block w-3 h-3 rounded-xs bg-[#FEFCE8] border border-amber-300 shrink-0"
+              aria-hidden="true"
+            />
+            <span>
+              Thursday Sheet Unique: <strong className="font-mono tabular-nums text-slate-900">{thursdayUniqueCount}</strong>
+              {thursdayDuplicateSkippedCount > 0 && (
+                <span className="text-slate-500"> ({thursdayDuplicateSkippedCount} duplicates removed)</span>
+              )}
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={() => setShowThursdaySyncModal(true)}
+            className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold bg-[#FEFCE8] text-amber-900 border border-amber-300 rounded hover:bg-amber-100 cursor-pointer"
+            title="View or copy updated Apps Script for Thursday Meeting for circular."
+          >
+            <FileSpreadsheet className="w-3 h-3 text-amber-700" />
+            <span>{thursdaySheetNeedsAccess && thursdayUniqueCount === 0 ? 'Connect Thursday Sheet' : 'Thursday Sheet Script'}</span>
+          </button>
         </div>
         <div className="flex items-center gap-3">
           {(localActionNotice || syncNotice) && (
@@ -925,10 +1148,10 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
         className="overflow-auto border-b border-slate-300 bg-white"
         style={{ maxHeight: isFullWidth ? 'calc(100vh - 220px)' : '62vh' }}
       >
-        <table className="w-full border-collapse text-[11px] leading-tight">
+        <table className="w-full border-collapse text-[10.5px] leading-tight">
           <thead className="sticky top-0 z-20 bg-slate-100 text-slate-800 border-b-2 border-slate-300">
             <tr>
-              <th className="px-2 py-2 text-center font-bold border-r border-slate-300 w-9">#</th>
+              <th className="px-1 py-1.5 text-center font-bold border-r border-slate-300 w-7">#</th>
               {MERC_COLUMNS.map((col) => {
                 if (!visibleCols[col.key]) return null;
                 const isFiltered = Array.isArray(colFilters[col.key]) && colFilters[col.key]!.length > 0;
@@ -936,36 +1159,36 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                 return (
                   <th
                     key={col.key}
-                    className={`px-2 py-1.5 font-bold border-r border-slate-300 whitespace-nowrap select-none ${
+                    className={`px-1.5 py-1 font-bold border-r border-slate-300 whitespace-nowrap select-none ${
                       col.align === 'right' ? 'text-right' : 'text-left'
                     } ${col.thClass || ''}`}
                   >
                     <div
-                      className={`flex items-center gap-1.5 ${
+                      className={`flex items-center gap-1 ${
                         col.align === 'right' ? 'justify-end' : 'justify-between'
                       }`}
                     >
                       <button
                         type="button"
                         onClick={() => toggleSort(col.key)}
-                        className="inline-flex items-center gap-1 hover:text-amber-800 cursor-pointer"
+                        className="inline-flex items-center gap-0.5 hover:text-amber-800 cursor-pointer"
                         title={`Sort by ${col.label}`}
                       >
                         <span>{col.label}</span>
                         {isSorted ? (
                           sortConfig!.direction === 'asc' ? (
-                            <ArrowUp className="w-3 h-3 text-amber-700 shrink-0" />
+                            <ArrowUp className="w-2.5 h-2.5 text-amber-700 shrink-0" />
                           ) : (
-                            <ArrowDown className="w-3 h-3 text-amber-700 shrink-0" />
+                            <ArrowDown className="w-2.5 h-2.5 text-amber-700 shrink-0" />
                           )
                         ) : (
-                          <ArrowUpDown className="w-3 h-3 text-slate-400 shrink-0" />
+                          <ArrowUpDown className="w-2.5 h-2.5 text-slate-400 shrink-0" />
                         )}
                       </button>
                       <button
                         type="button"
                         onClick={(e) => openColumnFilterPopover(col.key, e)}
-                        className={`p-1 rounded transition-colors cursor-pointer shrink-0 ${
+                        className={`p-0.5 rounded transition-colors cursor-pointer shrink-0 ${
                           isFiltered
                             ? 'bg-amber-700 text-white hover:bg-amber-800'
                             : activeFilterMenu?.colKey === col.key
@@ -975,7 +1198,7 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                         title={isFiltered ? `Filtered (${colFilters[col.key]!.length}) — Click to edit` : `Filter ${col.label}`}
                         aria-label={`Filter ${col.label}`}
                       >
-                        <Filter className="w-3 h-3" />
+                        <Filter className="w-2.5 h-2.5" />
                       </button>
                     </div>
                   </th>
@@ -1017,8 +1240,29 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                 const globalIndex = pageSize === 0 ? idx + 1 : (safePage - 1) * pageSize + idx + 1;
                 const merchDraftKey = `${row.mercKey}__merch`;
                 const meetDraftKey = `${row.mercKey}__meet`;
+                const dispDraftKey = `${row.mercKey}__disp`;
                 const merchVal = inlineDrafts[merchDraftKey] ?? row.merchantRemark;
                 const meetVal = inlineDrafts[meetDraftKey] ?? row.meetingUpdate;
+                const hasDispDraft = dispDraftKey in inlineDrafts;
+                const dispInputVal = hasDispDraft
+                  ? inlineDrafts[dispDraftKey]
+                  : row.dispatchQty === 0
+                  ? ''
+                  : String(row.dispatchQty);
+                const liveDispNum = hasDispDraft
+                  ? inlineDrafts[dispDraftKey].trim() === ''
+                    ? 0
+                    : Number(inlineDrafts[dispDraftKey]) || 0
+                  : row.dispatchQty;
+                const liveBalanceNum = hasDispDraft
+                  ? Number((row.totalQty - liveDispNum).toFixed(4))
+                  : row.balanceQty;
+                const qtyUnitMatch = (row.totalQtyText || '').match(/[a-zA-Z]+$/);
+                const balUnitSuffix = qtyUnitMatch ? ` ${qtyUnitMatch[0]}` : '';
+                const liveBalanceDisplay = hasDispDraft
+                  ? `${liveBalanceNum.toLocaleString()}${balUnitSuffix}`
+                  : row.balanceQtyText || row.balanceQty.toLocaleString();
+
                 const latestMerch =
                   row.merchantRemarkHistory.length > 0
                     ? row.merchantRemarkHistory[row.merchantRemarkHistory.length - 1]
@@ -1028,110 +1272,161 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                     ? row.meetingUpdateHistory[row.meetingUpdateHistory.length - 1]
                     : null;
 
+                const isThursdayUnique = row.source === 'thursday_sheet';
+
                 return (
                   <tr
                     key={row.mercKey}
-                    className={`hover:bg-amber-50/30 transition-colors ${
-                      row.source === 'manual' ? 'bg-amber-50/20' : 'bg-white'
+                    className={`transition-colors ${
+                      isThursdayUnique
+                        ? 'bg-[#FEFCE8] hover:bg-[#FEF9C3]/80'
+                        : row.source === 'manual'
+                        ? 'bg-amber-50/20 hover:bg-amber-50/40'
+                        : 'bg-white hover:bg-slate-50/80'
                     }`}
                   >
-                    <td className="px-2 py-1.5 text-center font-mono tabular-nums text-slate-500 border-r border-slate-200">
+                    <td className="px-1 py-1 text-center font-mono tabular-nums text-slate-500 border-r border-slate-200 w-7">
                       {globalIndex}
                     </td>
 
                     {visibleCols.unit && (
-                      <td className="px-2 py-1.5 border-r border-slate-200 whitespace-nowrap text-slate-700">
+                      <td
+                        className="px-1.5 py-1 border-r border-slate-200 whitespace-nowrap text-slate-700 max-w-[92px] truncate"
+                        title={`${row.unit || '—'} · ${isThursdayUnique ? 'Thursday Sheet' : row.source === 'manual' ? 'Manual' : 'Auto'}`}
+                      >
                         <span className="font-semibold text-slate-900">{row.unit || '—'}</span>
-                        <span aria-hidden="true" className="mx-1 text-slate-400">·</span>
-                        <span className={row.source === 'manual' ? 'text-amber-700 font-semibold' : 'text-slate-500'}>
-                          {row.source === 'manual' ? 'Manual' : 'Auto'}
+                        <span aria-hidden="true" className="mx-0.5 text-slate-400">·</span>
+                        <span
+                          className={
+                            isThursdayUnique
+                              ? 'text-amber-800 font-semibold'
+                              : row.source === 'manual'
+                              ? 'text-amber-700 font-semibold'
+                              : 'text-slate-500'
+                          }
+                        >
+                          {isThursdayUnique ? 'Sheet' : row.source === 'manual' ? 'Man' : 'Auto'}
                         </span>
                       </td>
                     )}
 
                     {visibleCols.orderDate && (
-                      <td className="px-2 py-1.5 border-r border-slate-200 whitespace-nowrap font-mono tabular-nums text-slate-700">
+                      <td className="px-1.5 py-1 border-r border-slate-200 whitespace-nowrap font-mono tabular-nums text-slate-700 max-w-[78px] truncate" title={row.orderDate}>
                         {row.orderDate || '—'}
                       </td>
                     )}
 
                     {visibleCols.orderNo && (
-                      <td className="px-2 py-1.5 border-r border-slate-200 whitespace-nowrap font-mono font-semibold text-slate-900">
+                      <td className="px-1.5 py-1 border-r border-slate-200 whitespace-nowrap font-mono font-semibold text-slate-900 max-w-[112px] truncate" title={row.orderNo}>
                         {row.orderNo || '—'}
                       </td>
                     )}
 
                     {visibleCols.customerName && (
-                      <td className="px-2 py-1.5 border-r border-slate-200 font-medium text-slate-900 max-w-[220px] truncate" title={row.customerName}>
+                      <td className="px-1.5 py-1 border-r border-slate-200 font-medium text-slate-900 max-w-[140px] truncate" title={row.customerName}>
                         {row.customerName || '—'}
                       </td>
                     )}
 
                     {visibleCols.designNo && (
-                      <td className="px-2 py-1.5 border-r border-slate-200 text-slate-800 max-w-[190px] truncate" title={row.designNo}>
+                      <td className="px-1.5 py-1 border-r border-slate-200 text-slate-800 max-w-[108px] truncate" title={row.designNo}>
                         {row.designNo || '—'}
                       </td>
                     )}
 
                     {visibleCols.color && (
-                      <td className="px-2 py-1.5 border-r border-slate-200 whitespace-nowrap text-slate-700">
+                      <td className="px-1.5 py-1 border-r border-slate-200 whitespace-nowrap text-slate-700 max-w-[88px] truncate" title={row.color}>
                         {row.color || '—'}
                       </td>
                     )}
 
                     {visibleCols.totalQty && (
-                      <td className="px-2 py-1.5 border-r border-slate-200 text-right font-mono tabular-nums font-semibold text-slate-900">
-                        {row.totalQty.toLocaleString()}
+                      <td className="px-1.5 py-1 border-r border-slate-200 text-right font-mono tabular-nums font-semibold text-slate-900 whitespace-nowrap">
+                        {row.totalQtyText || row.totalQty.toLocaleString()}
                       </td>
                     )}
 
                     {visibleCols.rate && (
-                      <td className="px-2 py-1.5 border-r border-slate-200 text-right font-mono tabular-nums text-slate-700">
-                        {row.rate.toLocaleString()}
+                      <td className="px-1.5 py-1 border-r border-slate-200 text-right font-mono tabular-nums text-slate-700 whitespace-nowrap">
+                        {row.rateText || row.rate.toLocaleString()}
                       </td>
                     )}
 
                     {visibleCols.dispatchCommitted && (
-                      <td className="px-2 py-1.5 border-r border-slate-200 whitespace-nowrap font-mono tabular-nums text-slate-700">
+                      <td className="px-1.5 py-1 border-r border-slate-200 whitespace-nowrap font-mono tabular-nums text-slate-700 max-w-[78px] truncate" title={row.dispatchCommitted}>
                         {row.dispatchCommitted || '—'}
                       </td>
                     )}
 
                     {visibleCols.dispatchQty && (
-                      <td className="px-2 py-1.5 border-r border-slate-200 text-right font-mono tabular-nums text-slate-800">
-                        {row.source === 'manual' && row.manualOrderId ? (
-                          <input
-                            type="number"
-                            value={row.dispatchQty}
-                            onChange={(e) => {
-                              const nextDisp = Number(e.target.value) || 0;
-                              const nextBal = Number((row.totalQty - nextDisp).toFixed(4));
-                              onUpdateManualOrderField(row.manualOrderId!, {
-                                dispatchQty: nextDisp,
-                                balanceQty: nextBal
+                      <td
+                        className={`px-1 py-0.5 border-r border-slate-200 text-right font-mono tabular-nums whitespace-nowrap ${
+                          isThursdayUnique ? 'bg-[#FEFCE8]' : 'bg-amber-50/35'
+                        }`}
+                      >
+                        <input
+                          type="number"
+                          step="any"
+                          value={dispInputVal}
+                          placeholder="0"
+                          aria-label="Edit Dispatch Qty"
+                          title={
+                            row.dispatchQtyText
+                              ? `Sheet value: ${row.dispatchQtyText} — Edit to auto-update Balance Qty (K - Y)`
+                              : 'Edit Dispatch Qty (Y) — auto-updates Balance Qty (Z = K - Y)'
+                          }
+                          onChange={(e) => {
+                            const nextStr = e.target.value;
+                            setInlineDrafts(prev => ({ ...prev, [dispDraftKey]: nextStr }));
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              (e.target as HTMLInputElement).blur();
+                            } else if (e.key === 'Escape') {
+                              setInlineDrafts(prev => {
+                                const copy = { ...prev };
+                                delete copy[dispDraftKey];
+                                return copy;
                               });
-                            }}
-                            className="w-20 px-1.5 py-0.5 text-right font-mono tabular-nums border border-slate-300 rounded bg-white focus:outline-none focus:ring-1 focus:ring-amber-500"
-                          />
-                        ) : (
-                          row.dispatchQty.toLocaleString()
-                        )}
+                              (e.target as HTMLInputElement).blur();
+                            }
+                          }}
+                          onBlur={() => {
+                            if (!(dispDraftKey in inlineDrafts)) return;
+                            const rawStr = inlineDrafts[dispDraftKey].trim();
+                            const nextNum = rawStr === '' ? 0 : Number(rawStr);
+                            setInlineDrafts(prev => {
+                              const copy = { ...prev };
+                              delete copy[dispDraftKey];
+                              return copy;
+                            });
+                            if (Number.isFinite(nextNum) && nextNum !== row.dispatchQty) {
+                              onUpdateDispatchQty(row, nextNum);
+                            }
+                          }}
+                          className="w-16 px-1 py-0.5 text-right font-mono text-[10.5px] font-bold text-amber-950 bg-white border border-amber-300 rounded focus:outline-none focus:ring-1 focus:ring-amber-500"
+                        />
                       </td>
                     )}
 
                     {visibleCols.balanceQty && (
                       <td
-                        className={`px-2 py-1.5 border-r border-slate-200 text-right font-mono tabular-nums font-semibold ${
-                          row.balanceQty > 0 ? 'text-rose-700' : 'text-emerald-700'
-                        }`}
+                        className={`px-1.5 py-1 border-r border-slate-200 text-right font-mono tabular-nums font-semibold whitespace-nowrap ${
+                          liveBalanceNum > 0 ? 'text-rose-700' : 'text-emerald-700'
+                        } ${isThursdayUnique ? 'bg-[#FEFCE8]' : 'bg-emerald-50/25'}`}
+                        title={`Balance Qty (Z) = Total Qty (${row.totalQty}) - Dispatch Qty (${liveDispNum})`}
                       >
-                        {row.balanceQty.toLocaleString()}
+                        {liveBalanceDisplay}
                       </td>
                     )}
 
                     {/* Merchant Remark + "+" Log Card Button */}
                     {visibleCols.merchantRemark && (
-                      <td className="px-1.5 py-1 border-r border-slate-200 bg-amber-50/25">
+                      <td
+                        className={`px-1 py-0.5 border-r border-slate-200 ${
+                          isThursdayUnique ? 'bg-[#FEFCE8]' : 'bg-amber-50/25'
+                        }`}
+                      >
                         <div className="flex items-center gap-1">
                           <input
                             type="text"
@@ -1160,18 +1455,18 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                                 return copy;
                               });
                             }}
-                            placeholder="Type merchant remark..."
+                            placeholder="Remark..."
                             title={
                               latestMerch
                                 ? `Last by ${latestMerch.editorName} (${latestMerch.timestamp}) — Click + for all ${row.merchantRemarkHistory.length} notes`
                                 : 'Type remark or click + to add with Editor Name & Timestamp'
                             }
-                            className="flex-1 min-w-[140px] px-1.5 py-1 text-[11px] bg-white border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-amber-500 text-slate-900"
+                            className="flex-1 min-w-[96px] max-w-[138px] px-1 py-0.5 text-[10.5px] bg-white border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-amber-500 text-slate-900"
                           />
                           <button
                             type="button"
                             onClick={() => openRemarkCardModal(row, 'merchantRemark')}
-                            className={`shrink-0 h-6 min-w-[24px] px-1.5 rounded border text-[10px] font-bold inline-flex items-center justify-center cursor-pointer transition-colors ${
+                            className={`shrink-0 h-5 min-w-[20px] px-1 rounded border text-[9.5px] font-bold inline-flex items-center justify-center cursor-pointer transition-colors ${
                               row.merchantRemarkHistory.length > 0
                                 ? 'bg-amber-700 text-white border-amber-800 hover:bg-amber-800'
                                 : 'bg-amber-100 text-amber-900 border-amber-300 hover:bg-amber-200'
@@ -1184,7 +1479,7 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                           </button>
                         </div>
                         {latestMerch && (
-                          <div className="text-[9px] text-slate-500 truncate mt-0.5 font-mono tabular-nums">
+                          <div className="text-[8.5px] text-slate-500 truncate mt-0.5 font-mono tabular-nums max-w-[155px]">
                             {latestMerch.editorName} · {latestMerch.timestamp}
                           </div>
                         )}
@@ -1193,7 +1488,11 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
 
                     {/* Meeting Update + "+" Log Card Button */}
                     {visibleCols.meetingUpdate && (
-                      <td className="px-1.5 py-1 border-r border-slate-200 bg-sky-50/25">
+                      <td
+                        className={`px-1 py-0.5 border-r border-slate-200 ${
+                          isThursdayUnique ? 'bg-[#FEFCE8]' : 'bg-sky-50/25'
+                        }`}
+                      >
                         <div className="flex items-center gap-1">
                           <input
                             type="text"
@@ -1222,18 +1521,18 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                                 return copy;
                               });
                             }}
-                            placeholder="Type meeting update..."
+                            placeholder="Update..."
                             title={
                               latestMeet
                                 ? `Last by ${latestMeet.editorName} (${latestMeet.timestamp}) — Click + for all ${row.meetingUpdateHistory.length} updates`
                                 : 'Type update or click + to add with Editor Name & Timestamp'
                             }
-                            className="flex-1 min-w-[140px] px-1.5 py-1 text-[11px] bg-white border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-sky-500 text-slate-900"
+                            className="flex-1 min-w-[96px] max-w-[138px] px-1 py-0.5 text-[10.5px] bg-white border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-sky-500 text-slate-900"
                           />
                           <button
                             type="button"
                             onClick={() => openRemarkCardModal(row, 'meetingUpdate')}
-                            className={`shrink-0 h-6 min-w-[24px] px-1.5 rounded border text-[10px] font-bold inline-flex items-center justify-center cursor-pointer transition-colors ${
+                            className={`shrink-0 h-5 min-w-[20px] px-1 rounded border text-[9.5px] font-bold inline-flex items-center justify-center cursor-pointer transition-colors ${
                               row.meetingUpdateHistory.length > 0
                                 ? 'bg-sky-700 text-white border-sky-800 hover:bg-sky-800'
                                 : 'bg-sky-100 text-sky-900 border-sky-300 hover:bg-sky-200'
@@ -1246,7 +1545,7 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                           </button>
                         </div>
                         {latestMeet && (
-                          <div className="text-[9px] text-slate-500 truncate mt-0.5 font-mono tabular-nums">
+                          <div className="text-[8.5px] text-slate-500 truncate mt-0.5 font-mono tabular-nums max-w-[155px]">
                             {latestMeet.editorName} · {latestMeet.timestamp}
                           </div>
                         )}
@@ -1256,12 +1555,16 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                     {/* Order Status (Pinned right for instant Open / Closed manual toggle) */}
                     {visibleCols.orderStatus && (
                       <td
-                        className={`px-2 py-1.5 whitespace-nowrap sticky right-0 z-10 border-l border-slate-300 shadow-[-2px_0_4px_-2px_rgba(0,0,0,0.06)] ${
-                          row.source === 'manual' ? 'bg-amber-50' : 'bg-white'
+                        className={`px-1.5 py-1 whitespace-nowrap sticky right-0 z-10 border-l border-slate-300 shadow-[-2px_0_4px_-2px_rgba(0,0,0,0.06)] ${
+                          isThursdayUnique
+                            ? 'bg-[#FEFCE8]'
+                            : row.source === 'manual'
+                            ? 'bg-amber-50'
+                            : 'bg-white'
                         }`}
                       >
                         {row.source === 'manual' && row.manualOrderId ? (
-                          <div className="flex items-center gap-1.5">
+                          <div className="flex items-center gap-1">
                             <select
                               aria-label="Manual Order Status"
                               value={row.orderStatus}
@@ -1276,7 +1579,7 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                                     : 'Manual order reopened to "Open".'
                                 );
                               }}
-                              className={`px-2 py-1 text-[11px] font-bold rounded border focus:outline-none focus:ring-1 focus:ring-amber-500 cursor-pointer ${
+                              className={`px-1.5 py-0.5 text-[10.5px] font-bold rounded border focus:outline-none focus:ring-1 focus:ring-amber-500 cursor-pointer ${
                                 row.orderStatus === 'Closed'
                                   ? 'bg-slate-200 text-slate-800 border-slate-400'
                                   : 'bg-emerald-50 text-emerald-900 border-emerald-400'
@@ -1286,7 +1589,7 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                               <option value="Closed">Closed</option>
                             </select>
                             {confirmDeleteId === row.manualOrderId ? (
-                              <div className="inline-flex items-center gap-1">
+                              <div className="inline-flex items-center gap-0.5">
                                 <button
                                   type="button"
                                   onClick={() => {
@@ -1296,37 +1599,61 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                                     );
                                     setConfirmDeleteId(null);
                                   }}
-                                  className="px-1.5 py-0.5 text-[10px] font-bold bg-rose-600 text-white rounded hover:bg-rose-700 cursor-pointer"
+                                  className="px-1 py-0.5 text-[9.5px] font-bold bg-rose-600 text-white rounded hover:bg-rose-700 cursor-pointer"
                                 >
-                                  Delete
+                                  Del
                                 </button>
                                 <button
                                   type="button"
                                   onClick={() => setConfirmDeleteId(null)}
-                                  className="px-1.5 py-0.5 text-[10px] font-semibold bg-slate-200 text-slate-700 rounded hover:bg-slate-300 cursor-pointer"
+                                  className="px-1 py-0.5 text-[9.5px] font-semibold bg-slate-200 text-slate-700 rounded hover:bg-slate-300 cursor-pointer"
                                 >
-                                  Cancel
+                                  No
                                 </button>
                               </div>
                             ) : (
                               <button
                                 type="button"
                                 onClick={() => setConfirmDeleteId(row.manualOrderId!)}
-                                className="p-1 text-slate-400 hover:text-rose-600 rounded cursor-pointer"
+                                className="p-0.5 text-slate-400 hover:text-rose-600 rounded cursor-pointer"
                                 title="Delete manual entry"
                               >
-                                <Trash2 className="w-3.5 h-3.5" />
+                                <Trash2 className="w-3 h-3" />
                               </button>
                             )}
                           </div>
+                        ) : isThursdayUnique ? (
+                          <div className="flex items-center gap-1">
+                            <select
+                              aria-label="Thursday Sheet Order Status"
+                              value={row.orderStatus}
+                              onChange={(e) => {
+                                const nextStatus = e.target.value as 'Open' | 'Closed';
+                                onUpdateRowStatus(row, nextStatus);
+                                triggerLocalNotice(
+                                  nextStatus === 'Closed'
+                                    ? 'Thursday Sheet row marked Closed — view or reopen under "Closed Manual".'
+                                    : 'Thursday Sheet row reopened to "Open".'
+                                );
+                              }}
+                              className={`px-1.5 py-0.5 text-[10.5px] font-bold rounded border focus:outline-none focus:ring-1 focus:ring-amber-500 cursor-pointer ${
+                                row.orderStatus === 'Closed'
+                                  ? 'bg-slate-200 text-slate-800 border-slate-400'
+                                  : 'bg-white text-amber-950 border-amber-400'
+                              }`}
+                            >
+                              <option value="Open">Open</option>
+                              <option value="Closed">Closed</option>
+                            </select>
+                          </div>
                         ) : (
                           <div
-                            className="text-[11px]"
+                            className="text-[10.5px]"
                             title="This row will be removed automatically when Col AN is marked Closed in Order Automation"
                           >
                             <span className="font-bold text-emerald-700">Open</span>
-                            <span aria-hidden="true" className="mx-1 text-slate-400">·</span>
-                            <span className="text-slate-500 text-[10px]">Auto AN</span>
+                            <span aria-hidden="true" className="mx-0.5 text-slate-400">·</span>
+                            <span className="text-slate-500 text-[9.5px]">Auto</span>
                           </div>
                         )}
                       </td>
@@ -2060,6 +2387,97 @@ export const MercMeetingsView: React.FC<MercMeetingsViewProps> = ({
                   className="px-4 py-1.5 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white rounded-md cursor-pointer"
                 >
                   Done
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 4: Connect Private Google Sheet ("Thursday Meeting for circular.") */}
+      {showThursdaySyncModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/45 flex items-center justify-center p-4 overflow-y-auto"
+          onClick={() => setShowThursdaySyncModal(false)}
+        >
+          <div
+            className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden text-xs my-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 py-3.5 bg-slate-900 text-white flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <FileSpreadsheet className="w-4 h-4 text-amber-400" />
+                <div>
+                  <h3 className="font-bold text-sm">Connect "Thursday Meeting for circular." Sheet Tab</h3>
+                  <p className="text-[11px] text-slate-300">
+                    Sheet ID: 1Wdu7PtyAEEnOY3R3OgvNM-Hnu9LnTnw1WKJQf06z-Qo
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowThursdaySyncModal(false)}
+                className="p-1 text-slate-400 hover:text-white rounded cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 max-h-[78vh] overflow-y-auto">
+              <p className="text-slate-700 leading-relaxed">
+                Google Sheet <span className="font-mono font-semibold text-slate-900">1Wdu7PtyAEEnOY3R3OgvNM-Hnu9LnTnw1WKJQf06z-Qo</span> is currently private (requires access). Use either option below to load unique rows from <strong>"Thursday Meeting for circular."</strong> in silent yellow while skipping all duplicates:
+              </p>
+
+              <div className="p-3.5 rounded-lg border border-amber-200 bg-[#FEFCE8] space-y-1.5">
+                <div className="font-bold text-slate-900">Option 1 (Fastest — No Script Required)</div>
+                <p className="text-slate-700">
+                  Open the Google Sheet → Click <strong>Share</strong> → Change General access to <strong>Anyone with the link (Viewer)</strong> → Click <strong>Sync Cloud</strong> here.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="font-bold text-slate-900">
+                    Option 2 (Keep Sheet Private via Apps Script)
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard?.writeText(THURSDAY_SYNC_APPS_SCRIPT).catch(() => {});
+                      setCopiedScript(true);
+                      setTimeout(() => setCopiedScript(false), 2500);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-bold bg-slate-900 hover:bg-slate-800 text-white rounded cursor-pointer"
+                  >
+                    {copiedScript ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                    <span>{copiedScript ? 'Copied!' : 'Copy Apps Script'}</span>
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-600">
+                  In the same Google Sheet, open <strong>Extensions → Apps Script</strong>, add a new script file (e.g. <span className="font-mono">ThursdaySync.gs</span>), paste this code, save, and run <strong>syncThursdayMeetingToFirebase</strong> (plus add a 5-min trigger if you want auto-updates). Then click <strong>Sync Cloud</strong>.
+                </p>
+                <pre className="p-3 bg-slate-950 text-slate-100 rounded-lg text-[10px] font-mono overflow-x-auto max-h-56 leading-relaxed">
+                  {THURSDAY_SYNC_APPS_SCRIPT}
+                </pre>
+              </div>
+
+              <div className="pt-2 border-t border-slate-200 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowThursdaySyncModal(false);
+                    onSyncCloud();
+                  }}
+                  className="px-3.5 py-1.5 font-bold bg-amber-700 hover:bg-amber-800 text-white rounded-md cursor-pointer"
+                >
+                  Sync Cloud Now
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowThursdaySyncModal(false)}
+                  className="px-3.5 py-1.5 font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md cursor-pointer"
+                >
+                  Close
                 </button>
               </div>
             </div>

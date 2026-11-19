@@ -22,15 +22,20 @@ import {
   toTnaStorageDate
 } from '../utils/tnaUtils';
 import {
+  MERC_THURSDAY_SPREADSHEET_ID,
+  MERC_THURSDAY_TAB_NAMES,
   MercManualOrder,
   MercMeetingManualData,
   MercMeetingRow,
   MercRemarkEntry,
-  buildMercMeetingRows,
+  MercThursdaySheetRow,
+  buildMercMeetingData,
   formatMercDateToday,
   formatMercTimestampNow,
   normalizeMercManualData,
   normalizeMercManualOrder,
+  normalizeMercThursdayRow,
+  parseMercThursdaySheetCsv,
   toFirebaseSafeMercKey
 } from '../utils/mercMeetingsUtils';
 import { saveOrdersToStorage, loadOrdersFromStorage, clearOrdersFromStorage } from '../utils/orderStorage';
@@ -107,6 +112,7 @@ const LOCAL_STORAGE_COL_AL_KEY = 'ginza_fms_col_al_v10';
 const LOCAL_STORAGE_TNA_RECORDS = 'ginza_fms_tna_records_v2';
 const LOCAL_STORAGE_MERC_RECORDS = 'ginza_fms_merc_records_v1';
 const LOCAL_STORAGE_MERC_MANUAL_ORDERS = 'ginza_fms_merc_manual_orders_v1';
+const LOCAL_STORAGE_MERC_THURSDAY_ROWS = 'ginza_fms_merc_thursday_rows_v1';
 const LOCAL_STORAGE_MERC_EDITOR_NAME = 'ginza_fms_merc_editor_name_v1';
 const LOCAL_STORAGE_FMS_WEBAPP_URL = 'ginza_fms_sheet_webapp_url_v1';
 const LOCAL_STORAGE_STATUS_OVERRIDES = 'ginza_fms_status_overrides_v1';
@@ -786,6 +792,17 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       return '';
     }
   });
+  const [mercThursdayRows, setMercThursdayRows] = useState<MercThursdaySheetRow[]>(() => {
+    try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_MERC_THURSDAY_ROWS);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch (e) {}
+    return [];
+  });
+  const [thursdaySheetNeedsAccess, setThursdaySheetNeedsAccess] = useState<boolean>(false);
   const [isSyncingMerc, setIsSyncingMerc] = useState<boolean>(false);
   const [mercSyncNotice, setMercSyncNotice] = useState<string | null>(null);
   const mercRecordsRef = useRef<Record<string, MercMeetingManualData>>(mercRecords);
@@ -4406,11 +4423,12 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     } catch (e) {}
   }, [tnaRecords]);
 
-  // Merc Meetings rows: Order Automation (AN === 'Open' & Unit === CKU / WARP(UDHANA)) + Manual Merc Orders
-  const mercMeetingRows = useMemo(
-    () => buildMercMeetingRows(groupedOrders, mercRecords, mercManualOrders),
-    [groupedOrders, mercRecords, mercManualOrders]
+  // Merc Meetings rows: Order Automation (AN === 'Open' & Unit === CKU / WARP(UDHANA)) + Manual Orders + Unique rows from "Thursday Meeting for circular."
+  const mercMeetingData = useMemo(
+    () => buildMercMeetingData(groupedOrders, mercRecords, mercManualOrders, mercThursdayRows),
+    [groupedOrders, mercRecords, mercManualOrders, mercThursdayRows]
   );
+  const mercMeetingRows = mercMeetingData.rows;
 
   const openMercMeetingsCount = useMemo(
     () => mercMeetingRows.filter(r => r.orderStatus === 'Open').length,
@@ -4431,6 +4449,12 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       localStorage.setItem(LOCAL_STORAGE_MERC_MANUAL_ORDERS, JSON.stringify(mercManualOrders));
     } catch (e) {}
   }, [mercManualOrders]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LOCAL_STORAGE_MERC_THURSDAY_ROWS, JSON.stringify(mercThursdayRows));
+    } catch (e) {}
+  }, [mercThursdayRows]);
 
   useEffect(() => {
     try {
@@ -5119,10 +5143,61 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }
   };
 
+  const fetchThursdaySheetFromGoogle = async (): Promise<{
+    rows: MercThursdaySheetRow[] | null;
+    blocked: boolean;
+  }> => {
+    // 1. Try Apps Script Web App first (works even when Google Sheet is private!)
+    const targetWebApp = (tnaWebAppUrl || DEFAULT_TNA_WEBAPP_URL || '').trim();
+    if (targetWebApp) {
+      try {
+        const sep = targetWebApp.includes('?') ? '&' : '?';
+        const r = await fetch(`${targetWebApp}${sep}action=read_thursday_meeting&_cb=${Date.now()}`);
+        if (r.ok) {
+          const json = await r.json().catch(() => null);
+          if (json && Array.isArray(json.rows)) {
+            const norm = json.rows
+              .map((row: any) => normalizeMercThursdayRow(row))
+              .filter((x: MercThursdaySheetRow | null): x is MercThursdaySheetRow => Boolean(x));
+            return { rows: norm, blocked: false };
+          }
+        }
+      } catch (e) {}
+    }
+
+    // 2. Try Direct Google Sheet CSV export (works immediately when Sheet is shared "Anyone with link -> Viewer")
+    let sawAuthBlock = false;
+    for (const tabName of MERC_THURSDAY_TAB_NAMES) {
+      try {
+        const csvUrl = `https://docs.google.com/spreadsheets/d/${MERC_THURSDAY_SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tabName)}&_cb=${Date.now()}`;
+        const r = await fetch(csvUrl);
+        if (r.status === 401 || r.status === 403) {
+          sawAuthBlock = true;
+          break;
+        }
+        if (r.ok) {
+          const text = await r.text();
+          if (text && !text.trim().startsWith('<!DOCTYPE') && !text.includes('<html')) {
+            const parsed = parseMercThursdaySheetCsv(text);
+            if (parsed.length > 0) {
+              return { rows: parsed, blocked: false };
+            }
+          } else {
+            sawAuthBlock = true;
+          }
+        }
+      } catch (e) {
+        sawAuthBlock = true;
+      }
+    }
+
+    return { rows: null, blocked: sawAuthBlock };
+  };
+
   const fetchCentralizedMercMeetingsData = async (showBanner = false) => {
     if (showBanner) {
       setIsSyncingMerc(true);
-      setMercSyncNotice('Syncing with Firebase...');
+      setMercSyncNotice('Syncing Firebase & Thursday Sheet...');
     }
     try {
       const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
@@ -5144,9 +5219,11 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         }
       };
 
-      const [recRes, manRes] = await Promise.all([
+      const [recRes, manRes, fbThursdayRes, liveThursdayRes] = await Promise.all([
         safeFetchNode('/merc_meeting_records'),
-        safeFetchNode('/merc_manual_orders')
+        safeFetchNode('/merc_manual_orders'),
+        safeFetchNode('/merc_thursday_sheet_rows'),
+        fetchThursdaySheetFromGoogle()
       ]);
 
       if (recRes.ok && recRes.data && typeof recRes.data === 'object') {
@@ -5197,9 +5274,53 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         });
       }
 
+      // Resolve Thursday Meeting for circular. rows: prefer live Sheet/Apps Script, fallback to Firebase cache
+      let loadedThursdayCount = 0;
+      if (liveThursdayRes.rows && liveThursdayRes.rows.length > 0) {
+        setMercThursdayRows(liveThursdayRes.rows);
+        setThursdaySheetNeedsAccess(false);
+        loadedThursdayCount = liveThursdayRes.rows.length;
+        // Cache live sheet rows to Firebase so all team members load them immediately
+        patchMercFirebaseNode(
+          '/merc_thursday_sheet_rows',
+          {
+            updated_at: new Date().toISOString(),
+            count: liveThursdayRes.rows.length,
+            rows: liveThursdayRes.rows
+          },
+          'PUT'
+        ).catch(() => {});
+      } else {
+        const fbRawRows = Array.isArray(fbThursdayRes.data)
+          ? fbThursdayRes.data
+          : Array.isArray(fbThursdayRes.data?.rows)
+          ? fbThursdayRes.data.rows
+          : null;
+        if (fbRawRows && fbRawRows.length > 0) {
+          const normFb = fbRawRows
+            .map((r: any) => normalizeMercThursdayRow(r))
+            .filter((x: MercThursdaySheetRow | null): x is MercThursdaySheetRow => Boolean(x));
+          if (normFb.length > 0) {
+            setMercThursdayRows(normFb);
+            setThursdaySheetNeedsAccess(false);
+            loadedThursdayCount = normFb.length;
+          } else {
+            setThursdaySheetNeedsAccess(liveThursdayRes.blocked);
+          }
+        } else {
+          setThursdaySheetNeedsAccess(liveThursdayRes.blocked);
+        }
+      }
+
       if (showBanner) {
-        setMercSyncNotice(recRes.ok || manRes.ok ? 'Synced with Cloud ✓' : 'Offline Cache Active');
-        setTimeout(() => setMercSyncNotice(null), 3000);
+        if (loadedThursdayCount > 0) {
+          setMercSyncNotice(`Synced Cloud + Thursday Sheet (${loadedThursdayCount} rows) ✓`);
+        } else if (liveThursdayRes.blocked) {
+          setMercSyncNotice('Cloud Synced ✓ — Click "Thursday Sheet Sync" to connect private sheet');
+        } else {
+          setMercSyncNotice(recRes.ok || manRes.ok ? 'Synced with Cloud ✓' : 'Offline Cache Active');
+        }
+        setTimeout(() => setMercSyncNotice(null), 4000);
       }
     } catch (e) {
       if (showBanner) {
@@ -5421,6 +5542,66 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     const ok = await patchMercFirebaseNode(`/merc_manual_orders/${encodeURIComponent(manualOrderId)}`, null, 'DELETE');
     setMercSyncNotice(ok ? 'Manual order deleted ✓' : 'Deleted locally');
     setTimeout(() => setMercSyncNotice(null), 2500);
+  };
+
+  const handleUpdateMercRowStatus = (
+    row: MercMeetingRow,
+    nextStatus: 'Open' | 'Closed'
+  ) => {
+    if (row.source === 'manual' && row.manualOrderId) {
+      handleUpdateMercManualOrderField(row.manualOrderId, { orderStatus: nextStatus });
+      return;
+    }
+    if (row.source === 'thursday_sheet') {
+      const existing = getCurrentMercDataForRow(row);
+      persistMercRowRemarkState(row, {
+        ...existing,
+        orderStatusOverride: nextStatus,
+        updatedAt: new Date().toISOString()
+      });
+    }
+  };
+
+  const handleUpdateMercDispatchQty = (
+    row: MercMeetingRow,
+    nextDispatchQty: number
+  ) => {
+    const cleanDisp = Number.isFinite(nextDispatchQty) ? nextDispatchQty : 0;
+    const nextBalance = Number((row.totalQty - cleanDisp).toFixed(4));
+
+    if (row.source === 'manual' && row.manualOrderId) {
+      handleUpdateMercManualOrderField(row.manualOrderId, {
+        dispatchQty: cleanDisp,
+        balanceQty: nextBalance
+      });
+      return;
+    }
+
+    if (row.source === 'automation' && row.automationOrderKey && row.automationItemId) {
+      handleDispatchChange(
+        row.automationOrderKey,
+        {
+          id: row.automationItemId,
+          itemName: row.designNo,
+          color: row.color,
+          width: row.automationItemWidth || '',
+          qty: row.totalQty
+        },
+        String(cleanDisp)
+      );
+      setMercSyncNotice('Dispatch & Balance Qty updated ✓');
+      setTimeout(() => setMercSyncNotice(null), 2000);
+      return;
+    }
+
+    if (row.source === 'thursday_sheet') {
+      const existing = getCurrentMercDataForRow(row);
+      persistMercRowRemarkState(row, {
+        ...existing,
+        dispatchQtyOverride: cleanDisp,
+        updatedAt: new Date().toISOString()
+      });
+    }
   };
 
   // Manual Sync TNA Sheet: pulls Firebase + Target Google Sheet CSV (1Wdu7PtyAEEnOY3R3OgvNM-Hnu9LnTnw1WKJQf06z-Qo) & syncs without removing Closed rows or re-adding manually deleted Google Sheet rows
@@ -6253,10 +6434,15 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             onDeleteRemarkHistoryEntry={handleDeleteMercRemarkEntry}
             onAddManualOrder={handleAddMercManualOrder}
             onUpdateManualOrderField={handleUpdateMercManualOrderField}
+            onUpdateDispatchQty={handleUpdateMercDispatchQty}
+            onUpdateRowStatus={handleUpdateMercRowStatus}
             onDeleteManualOrder={handleDeleteMercManualOrder}
             onSyncCloud={() => fetchCentralizedMercMeetingsData(true)}
             isSyncing={isSyncingMerc}
             syncNotice={mercSyncNotice}
+            thursdayUniqueCount={mercMeetingData.thursdayUniqueCount}
+            thursdayDuplicateSkippedCount={mercMeetingData.thursdayDuplicateSkippedCount}
+            thursdaySheetNeedsAccess={thursdaySheetNeedsAccess}
             isFullWidth={isFullWidth}
           />
         ) : (
