@@ -3050,9 +3050,11 @@ function setupCompleteTwoWaySync() {
    3B. INSTANT WEBHOOK (doPost) & LIGHTWEIGHT SINGLE-ROW SHEET EDIT (onEdit)
    ========================================================= */
 
-function applyDirectAAABBatch_(rows) {
+function applyDirectAAABBatch_(rows, spreadsheetId) {
   if (!rows || !rows.length) return { updated: 0 };
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss =
+    SpreadsheetApp.getActiveSpreadsheet() ||
+    SpreadsheetApp.openById(spreadsheetId || "15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0");
   const sheet = ss.getSheetByName(FIREBASE_CONFIG.SOURCE_TAB);
   if (!sheet) return { updated: 0, error: "Source tab not found: " + FIREBASE_CONFIG.SOURCE_TAB };
 
@@ -3090,6 +3092,7 @@ function applyDirectAAABBatch_(rows) {
     return [r[26] || "", r[27] || ""];
   });
 
+  const directRowWrites = [];
   let updatedCount = 0;
   let lastPo = "";
   let lastCust = "";
@@ -3132,14 +3135,31 @@ function applyDirectAAABBatch_(rows) {
     if (nextAA && (String(aaAbBatch[i][0] || "").trim() !== nextAA || (!aaAbBatch[i][1] && nextAB))) {
       aaAbBatch[i][0] = nextAA;
       aaAbBatch[i][1] = nextAB;
+      directRowWrites.push({ rowNum: sheetRowNum, aa: nextAA, ab: nextAB });
       updatedCount++;
     }
   }
 
   if (updatedCount > 0) {
-    sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 27, rowCount, 2).setValues(aaAbBatch);
+    if (directRowWrites.length <= 50) {
+      directRowWrites.forEach(function(w) {
+        sheet.getRange(w.rowNum, 27, 1, 2).setValues([[w.aa, w.ab]]);
+      });
+    } else {
+      sheet.getRange(FIREBASE_CONFIG.FIRST_DATA_ROW, 27, rowCount, 2).setValues(aaAbBatch);
+    }
+    SpreadsheetApp.flush();
   }
   return { updated: updatedCount };
+}
+
+function doGet() {
+  return ContentService.createTextOutput(JSON.stringify({
+    ok: true,
+    status: "GINZA FMS Webhook Active",
+    source_tab: FIREBASE_CONFIG.SOURCE_TAB,
+    timestamp: new Date().toISOString()
+  })).setMimeType(ContentService.MimeType.JSON);
 }
 
 function doPost(e) {
@@ -3154,7 +3174,7 @@ function doPost(e) {
     }
 
     if (body.action === "update_aa_ab" && Array.isArray(body.rows)) {
-      const resAAAB = applyDirectAAABBatch_(body.rows);
+      const resAAAB = applyDirectAAABBatch_(body.rows, body.spreadsheetId);
       return ContentService.createTextOutput(JSON.stringify({
         ok: true,
         action: "update_aa_ab",
@@ -3174,7 +3194,7 @@ function doPost(e) {
 
     let directRes = { updated: 0 };
     if (Array.isArray(body.aa_ab_rows) && body.aa_ab_rows.length > 0) {
-      directRes = applyDirectAAABBatch_(body.aa_ab_rows);
+      directRes = applyDirectAAABBatch_(body.aa_ab_rows, body.spreadsheetId);
     }
     syncProductOrderAAABWithFirebase();
     syncWebAppUpdatesToAutomationSheet();

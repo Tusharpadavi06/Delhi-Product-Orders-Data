@@ -4,6 +4,7 @@ import { initialRawResponses, initialExistingDispatch, fmsColumnMapping, product
 import { ProductOrderView, isDateOrTimestampStr, DEFAULT_BRANCH_HEAD_NAME, DEFAULT_BRANCH_HEAD_EMAIL, MONTH_OPTIONS, parseOrderDateParts } from './ProductOrderView';
 import { TNAView, TnaDateFieldKey } from './TNAView';
 import { MercMeetingsView, MercRemarkFieldKey } from './MercMeetingsView';
+import { DispatchLogModal, DispatchLogEntry, DispatchLogModalTarget } from './DispatchLogModal';
 import {
   TNA_SPREADSHEET_ID,
   TNA_TAB_NAME,
@@ -479,6 +480,20 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     return merged;
   });
 
+  // Part-Dispatch History Ledger for Col Y (multiple date/timestamped dispatches per item row)
+  const LOCAL_STORAGE_DISPATCH_HISTORY_KEY = 'ginza_fms_dispatch_history_v1';
+  const [dispatchHistoryMap, setDispatchHistoryMap] = useState<Record<string, DispatchLogEntry[]>>(() => {
+    try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_DISPATCH_HISTORY_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object') return parsed;
+      }
+    } catch (e) {}
+    return {};
+  });
+  const [dispatchLogTarget, setDispatchLogTarget] = useState<DispatchLogModalTarget | null>(null);
+
   // Column Visibility state (Allows hiding/showing manual columns like Addresses, Follow-ups, etc.)
   const [visibleCols, setVisibleCols] = useState<Record<string, boolean>>(() => {
     try {
@@ -881,6 +896,15 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }, 600);
     return () => clearTimeout(timer);
   }, [dispatchRecords]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem(LOCAL_STORAGE_DISPATCH_HISTORY_KEY, JSON.stringify(dispatchHistoryMap));
+      } catch (e) {}
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [dispatchHistoryMap]);
 
   useEffect(() => {
     try {
@@ -1495,6 +1519,165 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     scheduleAutoSaveFlush();
   };
 
+  // Canonical Firebase-safe key for Part-Dispatch History (Col Y '+' Ledger)
+  const buildDispatchHistoryKey = (
+    orderKey: string,
+    item: { itemName: string; color: string; width: string; qty?: number }
+  ): string => {
+    const parts = orderKey.split('_');
+    const poCanon = normalizePoVal((parts[0] || '').trim());
+    const custPart = (parts[1] || '').trim().toLowerCase();
+    const itemTrim = (item.itemName || '').trim().toLowerCase();
+    const colTrim = (item.color || '').trim().toLowerCase();
+    const widTrim = (item.width || '').trim().toLowerCase();
+    const qtyNum = Number(item.qty) || 0;
+    const raw = `${poCanon}|${custPart}|${itemTrim}|${colTrim}|${widTrim}|${qtyNum}`;
+    return raw.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
+  };
+
+  const persistDispatchHistoryToFirebase = async (
+    historyKey: string,
+    entries: DispatchLogEntry[]
+  ) => {
+    try {
+      const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
+      const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
+      const authQuery = cleanSecret ? `?auth=${encodeURIComponent(cleanSecret)}` : '';
+      await fetch(`${baseTargetUrl}/dispatch_history/${encodeURIComponent(historyKey)}.json${authQuery}`, {
+        method: entries.length > 0 ? 'PUT' : 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: entries.length > 0 ? JSON.stringify(entries) : undefined
+      });
+    } catch (e) {}
+  };
+
+  const handleOpenDispatchLogModal = (order: GroupedOrder, item: OrderItem) => {
+    const historyKey = buildDispatchHistoryKey(order.orderKey, item);
+    setDispatchLogTarget({
+      orderKey: order.orderKey,
+      orderNo: order.orderNo || '',
+      customerName: order.customerName || '',
+      customerPO: order.customerPO || '',
+      item: {
+        id: item.id,
+        itemName: item.itemName,
+        color: item.color,
+        width: item.width,
+        unit: item.unit,
+        qty: Number(item.qty) || 0,
+        dispatchQty: Number(item.dispatchQty) || 0,
+        balanceQty: Number(item.balanceQty) || 0
+      },
+      historyKey
+    });
+  };
+
+  const handleAddDispatchLogEntry = (payload: {
+    qty: number;
+    date: string;
+    remark: string;
+    preserveLegacyInitialQty?: number;
+  }) => {
+    if (!dispatchLogTarget) return;
+    const { historyKey, orderKey, item } = dispatchLogTarget;
+    const now = new Date();
+    const nowTs = formatMercTimestampNow(now);
+
+    const existing = dispatchHistoryMap[historyKey] || [];
+    const nextList: DispatchLogEntry[] = [...existing];
+
+    // If this row already had a Col Y dispatch value before using the '+' ledger, keep it as Entry #1
+    if (nextList.length === 0 && payload.preserveLegacyInitialQty && payload.preserveLegacyInitialQty > 0) {
+      nextList.push({
+        id: `disp_prev_${Date.now()}`,
+        date: 'Previous',
+        timestamp: 'Before Log',
+        qty: Number(payload.preserveLegacyInitialQty),
+        remark: 'Previous dispatched qty',
+        createdAt: new Date(now.getTime() - 1000).toISOString()
+      });
+    }
+
+    nextList.push({
+      id: `disp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      date: payload.date,
+      timestamp: nowTs,
+      qty: payload.qty,
+      remark: payload.remark || '',
+      createdAt: now.toISOString()
+    });
+
+    const totalSum = Number(
+      nextList.reduce((sum, entry) => sum + (Number(entry.qty) || 0), 0).toFixed(4)
+    );
+    const nextBal = Number(((Number(item.qty) || 0) - totalSum).toFixed(4));
+
+    setDispatchHistoryMap(prev => ({ ...prev, [historyKey]: nextList }));
+    setDispatchLogTarget(prev =>
+      prev
+        ? {
+            ...prev,
+            item: { ...prev.item, dispatchQty: totalSum, balanceQty: nextBal }
+          }
+        : null
+    );
+    handleDispatchChange(orderKey, item, String(totalSum));
+    persistDispatchHistoryToFirebase(historyKey, nextList);
+    setSyncFeedback(
+      `✓ Added +${payload.qty.toLocaleString()} dispatch (${payload.date}) — Total Col Y: ${totalSum.toLocaleString()} | Balance Col Z: ${nextBal.toLocaleString()}`
+    );
+    setTimeout(() => setSyncFeedback(null), 4500);
+  };
+
+  const handleDeleteDispatchLogEntry = (entryId: string) => {
+    if (!dispatchLogTarget) return;
+    const { historyKey, orderKey, item } = dispatchLogTarget;
+    const existing = dispatchHistoryMap[historyKey] || [];
+    const nextList = existing.filter(e => e.id !== entryId);
+    const totalSum = Number(
+      nextList.reduce((sum, entry) => sum + (Number(entry.qty) || 0), 0).toFixed(4)
+    );
+    const nextBal = Number(((Number(item.qty) || 0) - totalSum).toFixed(4));
+
+    setDispatchHistoryMap(prev => {
+      const copy = { ...prev };
+      if (nextList.length > 0) copy[historyKey] = nextList;
+      else delete copy[historyKey];
+      return copy;
+    });
+    setDispatchLogTarget(prev =>
+      prev
+        ? {
+            ...prev,
+            item: { ...prev.item, dispatchQty: totalSum, balanceQty: nextBal }
+          }
+        : null
+    );
+    handleDispatchChange(orderKey, item, String(totalSum));
+    persistDispatchHistoryToFirebase(historyKey, nextList);
+  };
+
+  const handleClearDispatchLogEntries = () => {
+    if (!dispatchLogTarget) return;
+    const { historyKey, orderKey, item } = dispatchLogTarget;
+    const nextBal = Number(item.qty) || 0;
+    setDispatchHistoryMap(prev => {
+      const copy = { ...prev };
+      delete copy[historyKey];
+      return copy;
+    });
+    setDispatchLogTarget(prev =>
+      prev
+        ? {
+            ...prev,
+            item: { ...prev.item, dispatchQty: 0, balanceQty: nextBal }
+          }
+        : null
+    );
+    handleDispatchChange(orderKey, item, '0');
+    persistDispatchHistoryToFirebase(historyKey, []);
+  };
+
   // Delete an entire order
   const handleDeleteOrder = (orderKey: string, poName: string) => {
     if (!window.confirm(`Are you sure you want to delete order "${poName}"?`)) return;
@@ -1733,6 +1916,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       }
       const res = await fetch(targetUrl, {
         method: 'POST',
+        redirect: 'follow',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify(payload)
       });
@@ -1750,12 +1934,18 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       } catch {
         return {
           configured: true,
-          ok: res.ok,
-          error: res.ok ? undefined : `HTTP ${res.status}`
+          ok: false,
+          error: txt.includes('SyntaxError') || txt.includes('Error')
+            ? 'Apps Script Error (check duplicate .gs file & redeploy New Version)'
+            : `Apps Script returned non-JSON (HTTP ${res.status} — redeploy Web App as Anyone)`
         };
       }
     } catch (err: any) {
-      return { configured: true, ok: false, error: err?.message || 'Webhook POST failed' };
+      const msg = String(err?.message || 'Webhook POST failed');
+      const friendly = msg.toLowerCase().includes('failed to fetch')
+        ? 'Apps Script Webhook error/CORS (Remove duplicate .gs file like fmsNewApp.gs & Deploy → New Version → Access: Anyone)'
+        : msg;
+      return { configured: true, ok: false, error: friendly };
     }
   };
 
@@ -3557,7 +3747,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         return '';
       };
 
-      const [fbCloud, aaAbCloudData, cellUpdatesCloud, fmsConfigCloud, sheetAutoCsv, sheetClosedCsv] = await Promise.all([
+      const [fbCloud, aaAbCloudData, cellUpdatesCloud, fmsConfigCloud, dispatchHistoryCloud, sheetAutoCsv, sheetClosedCsv] = await Promise.all([
         fetchOrdersFromFirebase(),
         fetch(`${baseTargetUrl}/product_order_aa_ab.json${authQuery}`)
           .then(r => (r.ok ? r.json() : null))
@@ -3568,9 +3758,25 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         fetch(`${baseTargetUrl}/fms_config.json${authQuery}`)
           .then(r => (r.ok ? r.json() : null))
           .catch(() => null),
+        fetch(`${baseTargetUrl}/dispatch_history.json${authQuery}`)
+          .then(r => (r.ok ? r.json() : null))
+          .catch(() => null),
         fetchSheetTabCsvSilent(['Order Automation 1', 'Order Automation 1 ', 'Product Automation']),
         fetchSheetTabCsvSilent(['Closed Orders', 'Closed Orders '])
       ]);
+
+      if (dispatchHistoryCloud && typeof dispatchHistoryCloud === 'object' && !dispatchHistoryCloud.error) {
+        setDispatchHistoryMap(prev => {
+          const merged: Record<string, DispatchLogEntry[]> = { ...prev };
+          Object.entries(dispatchHistoryCloud).forEach(([hKey, list]) => {
+            if (Array.isArray(list) && list.length > 0) {
+              const localList = prev[hKey] || [];
+              merged[hKey] = list.length >= localList.length ? (list as DispatchLogEntry[]) : localList;
+            }
+          });
+          return merged;
+        });
+      }
 
       if (fmsConfigCloud?.webapp_url && typeof fmsConfigCloud.webapp_url === 'string' && fmsConfigCloud.webapp_url.trim().startsWith('https://')) {
         const cleanHook = fmsConfigCloud.webapp_url.trim();
@@ -3920,6 +4126,26 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         pushAAABOverrideToFirebase(unsyncedLocalAAAB, false).catch(() => {});
       }
 
+      // Automatic silent background push: if any rows have Order No in Firebase/App that is still missing in Google Sheet Col AA/AB, push them automatically!
+      if (isSilent && pendingSheetAAABRows.length > 0) {
+        const autoAAABPayload = pendingSheetAAABRows.map(r => ({
+          order_no: r.orderNo || '',
+          order_no_timestamp: r.orderNoTimestamp || '',
+          reference_no: r.referenceNo || '',
+          customer_po: r.customerPO || '',
+          customer_name: r.customerName || '',
+          order_date: r.orderDate || '',
+          item_name: r.itemName || '',
+          sheet_row: r.orderId.startsWith('DELHI-') ? Number(r.orderId.replace('DELHI-', '')) : null
+        }));
+        postToFmsSheetWebhook({
+          action: 'update_aa_ab',
+          spreadsheetId: fmsSheetId,
+          tabName: 'Product Order',
+          rows: autoAAABPayload
+        }).catch(() => {});
+      }
+
       // Push canonical dataset to Firebase when manually clicked OR when healing a count mismatch
       if ((!isSilent || hadCountMismatchHeal) && finalMergedForCloud.length > 0) {
         setTimeout(() => {
@@ -3929,7 +4155,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
       if (!isSilent) {
         let webhookNote = '';
-        if (pendingSheetAAABRows.length > 0 || fmsWebAppUrlRef.current) {
+        if (pendingSheetAAABRows.length > 0 || fmsWebAppUrlRef.current || DEFAULT_FMS_WEBAPP_URL) {
           const directAAABPayload = pendingSheetAAABRows.map(r => ({
             order_no: r.orderNo || '',
             order_no_timestamp: r.orderNoTimestamp || '',
@@ -6640,6 +6866,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   freezeColumns,
                   {
                     onDispatchChange: handleDispatchChange,
+                    onOpenDispatchLogModal: handleOpenDispatchLogModal,
+                    dispatchHistoryMap,
+                    getDispatchHistoryKey: buildDispatchHistoryKey,
                     onItemStatusChange: handleItemStatusChange,
                     onDeleteOrder: handleDeleteOrder,
                     onDeleteItem: handleDeleteItem,
@@ -8181,6 +8410,17 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           </div>
         </div>
       )}
+      {/* Part-Dispatch Ledger Modal (Col Y '+' Button) */}
+      {dispatchLogTarget && (
+        <DispatchLogModal
+          target={dispatchLogTarget}
+          entries={dispatchHistoryMap[dispatchLogTarget.historyKey] || []}
+          onClose={() => setDispatchLogTarget(null)}
+          onAddEntry={handleAddDispatchLogEntry}
+          onDeleteEntry={handleDeleteDispatchLogEntry}
+          onClearAll={handleClearDispatchLogEntries}
+        />
+      )}
     </div>
   );
 };
@@ -8193,6 +8433,9 @@ function renderSpreadsheetRows(
   freezeColumns: number,
   handlers: {
     onDispatchChange: (orderKey: string, item: any, valStr: string) => void;
+    onOpenDispatchLogModal: (order: GroupedOrder, item: OrderItem) => void;
+    dispatchHistoryMap: Record<string, DispatchLogEntry[]>;
+    getDispatchHistoryKey: (orderKey: string, item: { itemName: string; color: string; width: string; qty?: number }) => string;
     onItemStatusChange: (orderId: string, newStatus: 'Open' | 'In-Progress' | 'Closed') => void;
     onDeleteOrder: (orderKey: string, poName: string) => void;
     onDeleteItem: (itemOrderId: string) => void;
@@ -8636,23 +8879,50 @@ function renderSpreadsheetRows(
             </>
           )}
 
-          {/* COLUMN Y: DISPATCH QNT (MANUAL USER ENTRY PER ITEM ROW) */}
-          {visibleCols['Y'] && (
-            <td
-              className={`px-1 py-0 border-r border-slate-300 bg-amber-50/40 whitespace-nowrap text-right leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
-            >
-              <div className="flex items-center justify-end gap-1">
-                <input
-                  type="number"
-                  step="any"
-                  value={item.dispatchQty || ''}
-                  placeholder="0"
-                  onChange={(e) => handlers.onDispatchChange(order.orderKey, item, e.target.value)}
-                  className="w-16 px-1 py-0 text-right font-mono text-[10px] font-bold text-amber-950 bg-white border border-amber-300 rounded focus:ring-1 focus:ring-amber-500 focus:outline-none h-5"
-                />
-              </div>
-            </td>
-          )}
+          {/* COLUMN Y: DISPATCH QNT (MANUAL ENTRY + PART-DISPATCH '+' LEDGER) */}
+          {visibleCols['Y'] && (() => {
+            const histKey = handlers.getDispatchHistoryKey(order.orderKey, item);
+            const histEntries = handlers.dispatchHistoryMap[histKey] || [];
+            const histTooltip =
+              histEntries.length > 0
+                ? `Part Dispatches (${histEntries.length}): ${histEntries
+                    .map(h => `${h.date}: ${Number(h.qty).toLocaleString()}`)
+                    .join(' | ')} — Click + to add or view`
+                : 'Click + to add date-wise Part Dispatches (auto-sums in Col Y & updates Balance Col Z)';
+            return (
+              <td
+                className={`px-1 py-0 border-r border-slate-300 bg-amber-50/40 whitespace-nowrap text-right leading-tight ${useMerge && isLast ? 'border-b-2 border-b-slate-400' : ''}`}
+              >
+                <div className="flex items-center justify-end gap-1">
+                  <input
+                    type="number"
+                    step="any"
+                    value={item.dispatchQty || ''}
+                    placeholder="0"
+                    title={histTooltip}
+                    onChange={(e) => handlers.onDispatchChange(order.orderKey, item, e.target.value)}
+                    className="w-16 px-1 py-0 text-right font-mono text-[10px] font-bold text-amber-950 bg-white border border-amber-300 rounded focus:ring-1 focus:ring-amber-500 focus:outline-none h-5"
+                  />
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handlers.onOpenDispatchLogModal(order, item);
+                    }}
+                    title={histTooltip}
+                    aria-label="Add or view part dispatch history"
+                    className={`shrink-0 h-5 min-w-[20px] px-1 rounded border text-[9.5px] font-extrabold inline-flex items-center justify-center cursor-pointer transition-colors ${
+                      histEntries.length > 0
+                        ? 'bg-amber-700 text-white border-amber-800 hover:bg-amber-800'
+                        : 'bg-amber-100 text-amber-900 border-amber-300 hover:bg-amber-200'
+                    }`}
+                  >
+                    {histEntries.length > 0 ? `+${histEntries.length}` : '+'}
+                  </button>
+                </div>
+              </td>
+            );
+          })()}
 
           {/* COLUMN Z: BALANCE QNT (= K - Y) */}
           {visibleCols['Z'] && (
