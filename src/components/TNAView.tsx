@@ -818,6 +818,7 @@ export const TNAView: React.FC<TNAViewProps> = ({
                         value={m.totalDispatchedQty}
                         onChange={(e) => onUpdateField(row.tnaKey, row.altKey, 'totalDispatchedQty', e.target.value)}
                         placeholder="0"
+                        title="Live synced with Order Automation Dispatch Qty (Col Y) & Merc Meetings Disp (Y)"
                         className={textInputClass}
                       />
                     </td>
@@ -828,7 +829,12 @@ export const TNAView: React.FC<TNAViewProps> = ({
                         type="text"
                         value={m.pendingQty}
                         onChange={(e) => onUpdateField(row.tnaKey, row.altKey, 'pendingQty', e.target.value)}
-                        placeholder="0"
+                        placeholder={
+                          row.automationBalanceQty !== undefined
+                            ? String(row.automationBalanceQty)
+                            : String(row.qty || 0)
+                        }
+                        title="Live synced with Order Automation Balance Qty (Col Z = Total Qty - Dispatch Qty)"
                         className={textInputClass}
                       />
                     </td>

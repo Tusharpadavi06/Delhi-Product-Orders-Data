@@ -41,6 +41,10 @@ export interface TnaRowItem {
   tnaKey: string;
   altKey: string;
   orderKey: string;
+  automationItemId?: string;
+  automationItemWidth?: string;
+  automationDispatchQty?: number;
+  automationBalanceQty?: number;
   orderDate: string;      // Col A <- Automation Col E
   orderNo: string;        // Col B <- Automation Col X
   customerName: string;   // Col C <- Automation Col C
@@ -399,6 +403,51 @@ export function normalizeTnaManual(raw?: Partial<TnaManualEntry> | null): TnaMan
   };
 }
 
+/**
+ * Merges live Order Automation Dispatch Qty (Col Y) & Balance Qty (Col Z)
+ * into TNA manual entry while the order is Open in Order Automation.
+ */
+function applyAutomationDispatchToTnaManual(
+  manual: TnaManualEntry,
+  isOpenInAutomation: boolean,
+  autoDisp: number,
+  autoBal: number
+): TnaManualEntry {
+  if (!isOpenInAutomation || autoDisp <= 0) {
+    return manual;
+  }
+
+  const roundedDisp = Number(autoDisp.toFixed(4));
+  const roundedBal = Number(autoBal.toFixed(4));
+
+  const existingDispTrim = manual.totalDispatchedQty.trim();
+  const existingDispNum = existingDispTrim !== '' ? Number(existingDispTrim) : NaN;
+  const nextTotalDispatchedQty =
+    Number.isFinite(existingDispNum) && Math.abs(existingDispNum - roundedDisp) < 1e-6
+      ? manual.totalDispatchedQty
+      : String(roundedDisp);
+
+  const existingBalTrim = manual.pendingQty.trim();
+  const existingBalNum = existingBalTrim !== '' ? Number(existingBalTrim) : NaN;
+  const nextPendingQty =
+    Number.isFinite(existingBalNum) && Math.abs(existingBalNum - roundedBal) < 1e-6
+      ? manual.pendingQty
+      : String(roundedBal);
+
+  if (
+    nextTotalDispatchedQty === manual.totalDispatchedQty &&
+    nextPendingQty === manual.pendingQty
+  ) {
+    return manual;
+  }
+
+  return {
+    ...manual,
+    totalDispatchedQty: nextTotalDispatchedQty,
+    pendingQty: nextPendingQty
+  };
+}
+
 export function buildAllTnaRowsLookup(
   groupedOrders: GroupedOrder[],
   tnaRecordsMap: Record<string, TnaManualEntry>
@@ -415,10 +464,16 @@ export function buildAllTnaRowsLookup(
       const itemName = (item.itemName || '').trim();
       if (itemName === '') return;
 
+      const itemStatus = item.statusAN || 'Open';
       const color = (item.color || '').trim();
       const width = (item.width || '').trim();
       const unit = (item.unit || '').trim();
       const qty = Number(item.qty) || 0;
+      const autoDisp = Number(item.dispatchQty) || 0;
+      const autoBal =
+        item.balanceQty !== undefined
+          ? Number(item.balanceQty)
+          : Number((qty - autoDisp).toFixed(4));
       const unitOfItem = (item.unitOfItem || '').trim();
       const deliveryDate = toTnaStorageDate(item.deliveryDate || '') || (item.deliveryDate || '').trim();
 
@@ -426,7 +481,7 @@ export function buildAllTnaRowsLookup(
       occ[altKey] = (occ[altKey] || 0) + 1;
       const tnaKey = `${altKey}|_${occ[altKey]}`.substring(0, 180);
 
-      const manual = resolveTnaManualRecord(
+      const baseManual = resolveTnaManualRecord(
         tnaRecordsMap,
         tnaKey,
         altKey,
@@ -438,11 +493,21 @@ export function buildAllTnaRowsLookup(
         width,
         qty
       );
+      const manual = applyAutomationDispatchToTnaManual(
+        baseManual,
+        itemStatus === 'Open',
+        autoDisp,
+        autoBal
+      );
 
       const rowObj: TnaRowItem = {
         tnaKey,
         altKey,
         orderKey: order.orderKey,
+        automationItemId: item.id,
+        automationItemWidth: item.width || '',
+        automationDispatchQty: autoDisp,
+        automationBalanceQty: autoBal,
         orderDate,
         orderNo,
         customerName,
@@ -490,6 +555,11 @@ export function buildOpenTnaRows(
       const width = (item.width || '').trim();
       const unit = (item.unit || '').trim();
       const qty = Number(item.qty) || 0;
+      const autoDisp = Number(item.dispatchQty) || 0;
+      const autoBal =
+        item.balanceQty !== undefined
+          ? Number(item.balanceQty)
+          : Number((qty - autoDisp).toFixed(4));
       const unitOfItem = (item.unitOfItem || '').trim();
       const deliveryDate = toTnaStorageDate(item.deliveryDate || '') || (item.deliveryDate || '').trim();
 
@@ -497,7 +567,7 @@ export function buildOpenTnaRows(
       occurrenceCounter[altKey] = (occurrenceCounter[altKey] || 0) + 1;
       const tnaKey = `${altKey}|_${occurrenceCounter[altKey]}`.substring(0, 180);
 
-      const manual = resolveTnaManualRecord(
+      const baseManual = resolveTnaManualRecord(
         tnaRecordsMap,
         tnaKey,
         altKey,
@@ -509,11 +579,16 @@ export function buildOpenTnaRows(
         width,
         qty
       );
+      const manual = applyAutomationDispatchToTnaManual(baseManual, true, autoDisp, autoBal);
 
       rows.push({
         tnaKey,
         altKey,
         orderKey: order.orderKey,
+        automationItemId: item.id,
+        automationItemWidth: item.width || '',
+        automationDispatchQty: autoDisp,
+        automationBalanceQty: autoBal,
         orderDate,
         orderNo,
         customerName,

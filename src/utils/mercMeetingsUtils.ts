@@ -614,6 +614,98 @@ export function buildMercMeetingData(
     getMercDedupSignatures(item).forEach((s) => existingSignatures.add(s));
   };
 
+  // Pre-index ALL Open items from Order Automation (across ALL units, not just CKU/WARP)
+  // so matching Thursday Sheet or Manual rows also receive live Dispatch Qty (Y) & Balance Qty (Z)
+  // while the order remains Open in Order Automation.
+  interface OpenAutoLookupEntry {
+    orderKey: string;
+    itemId: string;
+    width: string;
+    qty: number;
+    dispatchQty: number;
+    balanceQty: number;
+  }
+  const openAutoBySig = new Map<string, OpenAutoLookupEntry>();
+  const openAutoByOrdDes = new Map<string, OpenAutoLookupEntry | null>();
+
+  groupedOrders.forEach((order) => {
+    const orderDate = toTnaStorageDate(order.orderDate || '') || (order.orderDate || '').trim();
+    const orderNo = (order.orderNo || '').trim();
+    const customerName = (order.customerName || '').trim();
+    const ordTok = normDedupToken(orderNo);
+
+    order.items.forEach((item) => {
+      if ((item.statusAN || 'Open') !== 'Open') return;
+      const designNo = (item.itemName || '').trim();
+      if (!designNo && !customerName) return;
+
+      const color = (item.color || '').trim();
+      const qty = Number(item.qty) || 0;
+      const dispatchQty = Number(item.dispatchQty) || 0;
+      const balanceQty =
+        item.balanceQty !== undefined
+          ? Number(item.balanceQty)
+          : Number((qty - dispatchQty).toFixed(4));
+
+      const entry: OpenAutoLookupEntry = {
+        orderKey: order.orderKey,
+        itemId: item.id,
+        width: item.width || '',
+        qty,
+        dispatchQty,
+        balanceQty
+      };
+
+      const sigs = getMercDedupSignatures({
+        orderDate,
+        orderNo,
+        customerName,
+        designNo,
+        color,
+        totalQty: qty
+      });
+      sigs.forEach((s) => {
+        if (!openAutoBySig.has(s)) openAutoBySig.set(s, entry);
+      });
+
+      // Fallback index by Order No + Design (only used when target row has blank color & match is unique)
+      if (ordTok) {
+        getDesignDedupVariants(designNo).forEach((des) => {
+          const k = `${ordTok}|${des}`;
+          if (!openAutoByOrdDes.has(k)) {
+            openAutoByOrdDes.set(k, entry);
+          } else {
+            openAutoByOrdDes.set(k, null); // Ambiguous multi-color order -> do not match without color
+          }
+        });
+      }
+    });
+  });
+
+  const findOpenAutoMatch = (row: {
+    orderDate?: string;
+    orderNo?: string;
+    customerName?: string;
+    designNo?: string;
+    color?: string;
+    totalQty?: number;
+  }): OpenAutoLookupEntry | undefined => {
+    const sigs = getMercDedupSignatures(row);
+    for (const s of sigs) {
+      const hit = openAutoBySig.get(s);
+      if (hit) return hit;
+    }
+    const ordTok = normDedupToken(row.orderNo);
+    const colTok = normDedupToken(row.color);
+    if (ordTok && !colTok) {
+      for (const des of getDesignDedupVariants(row.designNo)) {
+        const hit = openAutoByOrdDes.get(`${ordTok}|${des}`);
+        if (hit) return hit;
+      }
+    }
+    return undefined;
+  };
+
   // 1. Manual Orders added directly inside Merc Meetings tab (newest first at top)
   const manualList = Object.entries(manualOrdersMap)
     .map(([id, raw]) => normalizeMercManualOrder(id, raw))
@@ -622,20 +714,31 @@ export function buildMercMeetingData(
 
   manualList.forEach((m) => {
     registerSigs(m);
+    const autoMatch = m.orderStatus === 'Open' ? findOpenAutoMatch(m) : undefined;
+    const effectiveTotalQty = m.totalQty > 0 ? m.totalQty : autoMatch?.qty || 0;
+    const liveDisp = autoMatch && autoMatch.dispatchQty > 0 ? autoMatch.dispatchQty : m.dispatchQty;
+    const liveBal =
+      autoMatch && autoMatch.dispatchQty > 0
+        ? Number((effectiveTotalQty - liveDisp).toFixed(4))
+        : m.balanceQty;
+
     rows.push({
       mercKey: toFirebaseSafeMercKey(m.id),
       source: 'manual',
       manualOrderId: m.id,
+      automationOrderKey: autoMatch?.orderKey,
+      automationItemId: autoMatch?.itemId,
+      automationItemWidth: autoMatch?.width,
       orderDate: m.orderDate,
       orderNo: m.orderNo,
       customerName: m.customerName,
       designNo: m.designNo,
       color: m.color,
-      totalQty: m.totalQty,
+      totalQty: effectiveTotalQty,
       rate: m.rate,
       dispatchCommitted: m.dispatchCommitted,
-      dispatchQty: m.dispatchQty,
-      balanceQty: m.balanceQty,
+      dispatchQty: liveDisp,
+      balanceQty: liveBal,
       unit: m.unit,
       merchantRemark: m.merchantRemark,
       meetingUpdate: m.meetingUpdate,
@@ -711,6 +814,8 @@ export function buildMercMeetingData(
   // 3. Unique rows from Google Sheet tab "Thursday Meeting for circular."
   //    - Any row matching an Order Automation / Manual / earlier Sheet row is SKIPPED (no duplicates).
   //    - Unique rows are marked source = 'thursday_sheet' (displayed in silent yellow full-row fill).
+  //    - If a Thursday Sheet row matches an Open order in Order Automation (e.g. non-CKU unit),
+  //      live Dispatch Qty (Y) & Balance Qty (Z) stay synced with Order Automation while Open!
   let thursdayUniqueCount = 0;
   let thursdayDuplicateSkippedCount = 0;
 
@@ -747,35 +852,48 @@ export function buildMercMeetingData(
     const finalMeetingUpdate = saved.meetingUpdate || tRow.meetingUpdate;
     const finalStatus: 'Open' | 'Closed' = saved.orderStatusOverride || tRow.orderStatus || 'Open';
 
+    const autoMatch = finalStatus === 'Open' ? findOpenAutoMatch(tRow) : undefined;
+    const effectiveTotalQty = tRow.totalQty > 0 ? tRow.totalQty : autoMatch?.qty || 0;
+    const hasAutoLiveDispatch = Boolean(autoMatch && autoMatch.dispatchQty > 0);
     const hasDispatchOverride = saved.dispatchQtyOverride !== undefined;
-    const finalDispatchQty = hasDispatchOverride ? saved.dispatchQtyOverride! : tRow.dispatchQty;
-    const finalBalanceQty = hasDispatchOverride
-      ? Number((tRow.totalQty - finalDispatchQty).toFixed(4))
-      : tRow.balanceQty;
 
-    // Extract optional unit suffix from totalQtyText (e.g. "200 Kg" -> "Kg") if user edited Dispatch Qty
+    const finalDispatchQty = hasAutoLiveDispatch
+      ? autoMatch!.dispatchQty
+      : hasDispatchOverride
+      ? saved.dispatchQtyOverride!
+      : tRow.dispatchQty;
+    const finalBalanceQty =
+      hasAutoLiveDispatch || hasDispatchOverride
+        ? Number((effectiveTotalQty - finalDispatchQty).toFixed(4))
+        : tRow.balanceQty;
+
+    // Extract optional unit suffix from totalQtyText (e.g. "200 Kg" -> "Kg") if overridden or live-synced
     const qtyUnitMatch = (tRow.totalQtyText || '').match(/[a-zA-Z]+$/);
     const unitSuffix = qtyUnitMatch ? ` ${qtyUnitMatch[0]}` : '';
+    const useDynamicDispBalText = hasAutoLiveDispatch || hasDispatchOverride;
 
     rows.push({
       mercKey,
       source: 'thursday_sheet',
+      automationOrderKey: autoMatch?.orderKey,
+      automationItemId: autoMatch?.itemId,
+      automationItemWidth: autoMatch?.width,
       orderDate: tRow.orderDate,
       orderNo: tRow.orderNo,
       customerName: tRow.customerName,
       designNo: tRow.designNo,
       color: tRow.color,
-      totalQty: tRow.totalQty,
+      totalQty: effectiveTotalQty,
       totalQtyText: tRow.totalQtyText,
       rate: tRow.rate,
       rateText: tRow.rateText,
       dispatchCommitted: tRow.dispatchCommitted,
       dispatchQty: finalDispatchQty,
-      dispatchQtyText: hasDispatchOverride
+      dispatchQtyText: useDynamicDispBalText
         ? `${finalDispatchQty.toLocaleString()}${unitSuffix}`
         : tRow.dispatchQtyText,
       balanceQty: finalBalanceQty,
-      balanceQtyText: hasDispatchOverride
+      balanceQtyText: useDynamicDispBalText
         ? `${finalBalanceQty.toLocaleString()}${unitSuffix}`
         : tRow.balanceQtyText,
       unit: tRow.unit || 'CKU',

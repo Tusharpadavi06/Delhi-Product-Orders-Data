@@ -777,6 +777,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   const [isSyncingTna, setIsSyncingTna] = useState<boolean>(false);
   const [tnaSyncNotice, setTnaSyncNotice] = useState<string | null>(null);
   const tnaRecordsRef = useRef<Record<string, TnaManualEntry>>(tnaRecords);
+  const openTnaRowsRef = useRef<TnaRowItem[]>([]);
+  const commitTnaRecordUpdateRef = useRef<((tnaKey: string, altKey: string, updatedEntry: TnaManualEntry) => void) | null>(null);
   const pendingTnaPatchRef = useRef<Record<string, TnaManualEntry>>({});
   const tnaSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tnaLoadedFromCloudRef = useRef<boolean>(false);
@@ -1468,11 +1470,12 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     }, 1800);
   };
 
-  // Handle changing Dispatch Qty in Col Y (ZERO-LAG: updates dispatchRecords only; does NOT map over 6,500 rawResponses on every keystroke!)
+  // Handle changing Dispatch Qty in Col Y (ZERO-LAG: updates dispatchRecords only; also syncs Open TNA rows -> Firebase & TNA Google Sheet)
   const handleDispatchChange = (
     orderKey: string,
     item: { id: string; itemName: string; color: string; width: string; qty?: number },
-    newQtyStr: string
+    newQtyStr: string,
+    skipTnaSync = false
   ) => {
     const val = newQtyStr === '' ? 0 : (Number(newQtyStr) || 0);
     const itemTrim = (item.itemName || '').trim();
@@ -1517,6 +1520,38 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       updated_at: new Date().toISOString()
     };
     scheduleAutoSaveFlush();
+
+    // Live-sync Open order's Dispatch Qty (Col Y) & Balance Qty (Col Z) into TNA Tab -> Step 3 (Total Dispatched Qty) & Step 4 (Pending Qty) + TNA Google Sheet
+    if (!skipTnaSync && commitTnaRecordUpdateRef.current) {
+      const matchedTnaRow = openTnaRowsRef.current.find(
+        r =>
+          r.orderKey === orderKey &&
+          (r.automationItemId === item.id ||
+            (r.itemName.trim().toLowerCase() === itemTrim.toLowerCase() &&
+              r.color.trim().toLowerCase() === colTrim.toLowerCase() &&
+              (r.automationItemWidth || r.width || '').trim().toLowerCase() === widTrim.toLowerCase()))
+      );
+      if (matchedTnaRow) {
+        const rowQty = Number(item.qty ?? matchedTnaRow.qty) || 0;
+        const nextDispStr = val > 0 ? String(Number(val.toFixed(4))) : '';
+        const nextPendingStr = val > 0 ? String(Number((rowQty - val).toFixed(4))) : '';
+        const curTnaMap = tnaRecordsRef.current;
+        const existingTna = normalizeTnaManual(
+          curTnaMap[matchedTnaRow.tnaKey] || curTnaMap[matchedTnaRow.altKey]
+        );
+        if (
+          existingTna.totalDispatchedQty !== nextDispStr ||
+          existingTna.pendingQty !== nextPendingStr
+        ) {
+          commitTnaRecordUpdateRef.current(matchedTnaRow.tnaKey, matchedTnaRow.altKey, {
+            ...existingTna,
+            totalDispatchedQty: nextDispStr,
+            pendingQty: nextPendingStr,
+            updatedAt: new Date().toISOString()
+          });
+        }
+      }
+    }
   };
 
   // Canonical Firebase-safe key for Part-Dispatch History (Col Y '+' Ledger)
@@ -1533,6 +1568,42 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     const qtyNum = Number(item.qty) || 0;
     const raw = `${poCanon}|${custPart}|${itemTrim}|${colTrim}|${widTrim}|${qtyNum}`;
     return raw.replace(/[.#$/[\]\s]+/g, '_').substring(0, 180);
+  };
+
+  // Returns the LATEST (current) dispatch qty for AO -> AP Delivered WhatsApp link (instead of cumulative Col Y total)
+  const getCurrentDispatchQtyForItem = (
+    orderKey: string,
+    item: { itemName: string; color: string; width: string; qty?: number; dispatchQty?: number }
+  ): { currentQty: number; cumulativeQty: number; latestDate?: string; isPartDispatch: boolean } => {
+    const cumulativeQty = Number(item.dispatchQty) || 0;
+    if (cumulativeQty <= 0) {
+      return { currentQty: 0, cumulativeQty: 0, isPartDispatch: false };
+    }
+    const historyKey = buildDispatchHistoryKey(orderKey, item);
+    const entries = dispatchHistoryMap[historyKey] || [];
+    if (entries.length > 0) {
+      const histSum = Number(
+        entries.reduce((sum, e) => sum + (Number(e.qty) || 0), 0).toFixed(4)
+      );
+      const latestEntry = entries[entries.length - 1];
+      const latestQty = Number(latestEntry.qty) || 0;
+      if (Math.abs(cumulativeQty - histSum) < 1e-4) {
+        return {
+          currentQty: latestQty,
+          cumulativeQty,
+          latestDate: latestEntry.date,
+          isPartDispatch: entries.length > 1 || Math.abs(latestQty - cumulativeQty) > 1e-4
+        };
+      }
+      if (cumulativeQty > histSum) {
+        return {
+          currentQty: Number((cumulativeQty - histSum).toFixed(4)),
+          cumulativeQty,
+          isPartDispatch: true
+        };
+      }
+    }
+    return { currentQty: cumulativeQty, cumulativeQty, isPartDispatch: false };
   };
 
   const persistDispatchHistoryToFirebase = async (
@@ -4640,6 +4711,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     () => buildOpenTnaRows(groupedOrders, tnaRecords),
     [groupedOrders, tnaRecords]
   );
+  openTnaRowsRef.current = openTnaRows;
 
   // Keep tnaRecordsRef in sync and save TNA records locally whenever updated
   useEffect(() => {
@@ -5211,8 +5283,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       }
     }, 900);
   };
+  commitTnaRecordUpdateRef.current = commitTnaRecordUpdate;
 
-  // Handle manual non-date cell edit inside TNA tab (Isolated to TNA + Centralized Firebase + Target TNA Google Sheet)
+  // Handle manual non-date cell edit inside TNA tab (2-way synced with Order Automation Col Y/Z & Merc Meetings while Open)
   const handleUpdateTnaField = (
     tnaKey: string,
     altKey: string,
@@ -5227,6 +5300,35 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       [field]: value,
       updatedAt: nowIso
     };
+
+    if (field === 'totalDispatchedQty') {
+      const matchedRow = openTnaRowsRef.current.find(
+        r => r.tnaKey === tnaKey || r.altKey === altKey
+      );
+      if (matchedRow) {
+        const trimmed = value.trim();
+        const numVal = trimmed === '' ? 0 : Number(trimmed);
+        if (Number.isFinite(numVal)) {
+          updatedEntry.pendingQty =
+            trimmed === '' ? '' : String(Number((matchedRow.qty - numVal).toFixed(4)));
+          if (matchedRow.orderKey && matchedRow.automationItemId) {
+            handleDispatchChange(
+              matchedRow.orderKey,
+              {
+                id: matchedRow.automationItemId,
+                itemName: matchedRow.itemName,
+                color: matchedRow.color,
+                width: matchedRow.automationItemWidth || matchedRow.width,
+                qty: matchedRow.qty
+              },
+              trimmed === '' ? '' : String(numVal),
+              true
+            );
+          }
+        }
+      }
+    }
+
     commitTnaRecordUpdate(tnaKey, altKey, updatedEntry);
   };
 
@@ -5795,15 +5897,9 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     const cleanDisp = Number.isFinite(nextDispatchQty) ? nextDispatchQty : 0;
     const nextBalance = Number((row.totalQty - cleanDisp).toFixed(4));
 
-    if (row.source === 'manual' && row.manualOrderId) {
-      handleUpdateMercManualOrderField(row.manualOrderId, {
-        dispatchQty: cleanDisp,
-        balanceQty: nextBalance
-      });
-      return;
-    }
-
-    if (row.source === 'automation' && row.automationOrderKey && row.automationItemId) {
+    // If linked to an Open Order Automation item (automation, Open-matched thursday_sheet, or Open-matched manual),
+    // update Order Automation Col Y/Z + TNA Tab (Total Dispatched Qty & Pending Qty) in real time!
+    if (row.automationOrderKey && row.automationItemId) {
       handleDispatchChange(
         row.automationOrderKey,
         {
@@ -5815,8 +5911,19 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         },
         String(cleanDisp)
       );
-      setMercSyncNotice('Dispatch & Balance Qty updated ✓');
-      setTimeout(() => setMercSyncNotice(null), 2000);
+    }
+
+    if (row.source === 'manual' && row.manualOrderId) {
+      handleUpdateMercManualOrderField(row.manualOrderId, {
+        dispatchQty: cleanDisp,
+        balanceQty: nextBalance
+      });
+      return;
+    }
+
+    if (row.source === 'automation') {
+      setMercSyncNotice('Dispatch & Balance Qty synced across Automation, TNA & Merc ✓');
+      setTimeout(() => setMercSyncNotice(null), 2200);
       return;
     }
 
@@ -8084,22 +8191,30 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
       {/* MODAL: WHATSAPP DISPATCH PREVIEW */}
       {whatsAppModalOrder && (() => {
-        const cleanPhone = (whatsAppModalOrder.customerNumber || '').replace(/[+\-\s]/g, '').replace(/^0+/, '');
-        const itemBlocks = whatsAppModalOrder.items.map(it => (
+        const activeOrder =
+          groupedOrders.find(o => o.orderKey === whatsAppModalOrder.orderKey) || whatsAppModalOrder;
+        const cleanPhone = (activeOrder.customerNumber || '').replace(/[+\-\s]/g, '').replace(/^0+/, '');
+        const itemDispatchDetails = activeOrder.items.map(it => ({
+          item: it,
+          info: getCurrentDispatchQtyForItem(activeOrder.orderKey, it)
+        }));
+        const hasPartDispatch = itemDispatchDetails.some(d => d.info.isPartDispatch);
+
+        const itemBlocks = itemDispatchDetails.map(({ item: it, info }) => (
           `*Item Name*    : ${it.itemName}\n` +
           `*Color*        : ${it.color}\n` +
-          `*Dispatch Qnt* : ${it.dispatchQty || 0}\n` +
+          `*Dispatch Qnt* : ${info.currentQty}\n` +
           `*Unit of Item* : ${it.unitOfItem}`
         )).join('\n--------------------------\n');
 
         const messageText =
-          `Dear ${whatsAppModalOrder.customerName},\n\n` +
+          `Dear ${activeOrder.customerName},\n\n` +
           `We are pleased to inform you that your order has been *successfully dispatched*.\n\n` +
           `*Order Summary*\n` +
           `--------------------------\n` +
-          `Order Date : ${whatsAppModalOrder.orderDate}\n` +
-          `Order No   : ${whatsAppModalOrder.orderNo || 'DMN/02241/25-26'}\n` +
-          `Transporter: ${whatsAppModalOrder.transporterName || 'Mehta transport'}\n\n` +
+          `Order Date : ${activeOrder.orderDate}\n` +
+          `Order No   : ${activeOrder.orderNo || 'DMN/02241/25-26'}\n` +
+          `Transporter: ${activeOrder.transporterName || 'Mehta transport'}\n\n` +
           `*Dispatched Items*\n` +
           `--------------------------\n` +
           itemBlocks + `\n\n` +
@@ -8117,7 +8232,11 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   </span>
                   <div>
                     <h3 className="font-bold text-sm">WhatsApp Dispatch Link Preview (Col AO → AP)</h3>
-                    <p className="text-[11px] text-emerald-100">Formula generated via HYPERLINK + ENCODEURL</p>
+                    <p className="text-[11px] text-emerald-100">
+                      {hasPartDispatch
+                        ? 'Using Current (Latest) Dispatch Qty — not cumulative total'
+                        : 'Current Dispatch Qty included in WhatsApp message'}
+                    </p>
                   </div>
                 </div>
                 <button
@@ -8132,23 +8251,23 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                 <div className="grid grid-cols-2 gap-3 text-xs bg-slate-50 p-3 rounded-lg border border-slate-200">
                   <div>
                     <span className="text-slate-500 block text-[11px]">Customer &amp; Phone (Col P)</span>
-                    <span className="font-bold text-slate-800">{whatsAppModalOrder.customerName}</span>
+                    <span className="font-bold text-slate-800">{activeOrder.customerName}</span>
                     <span className="font-mono text-emerald-700 block">{cleanPhone || '8800421410'}</span>
                   </div>
                   <div>
                     <span className="text-slate-500 block text-[11px]">Order No &amp; Date (Col X &amp; E)</span>
-                    <span className="font-bold text-slate-800">{whatsAppModalOrder.orderNo || 'DMN/02241/25-26'}</span>
-                    <span className="text-slate-600 block">{whatsAppModalOrder.orderDate}</span>
+                    <span className="font-bold text-slate-800">{activeOrder.orderNo || 'DMN/02241/25-26'}</span>
+                    <span className="text-slate-600 block">{activeOrder.orderDate}</span>
                   </div>
                 </div>
 
                 <div>
-                  <div className="flex items-center justify-between mb-1.5">
+                  <div className="flex items-center justify-between mb-1.5 gap-2">
                     <label className="text-xs font-semibold text-slate-700">
-                      Dispatched Message (Multi-item summary):
+                      Dispatched Message (Current Dispatch Qty):
                     </label>
                     <span className="text-[11px] text-emerald-700 font-medium bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                      {whatsAppModalOrder.items.length} Product Items
+                      {activeOrder.items.length} Product Items
                     </span>
                   </div>
                   <div className="bg-[#eef8f2] border border-[#c1e7ce] p-3.5 rounded-xl font-mono text-xs whitespace-pre-wrap text-slate-800 leading-relaxed shadow-inner">
@@ -9186,7 +9305,7 @@ function renderSpreadsheetRows(
                   rowSpan={rowSpan}
                   className={`px-1 py-0 border-r border-slate-300 text-center align-middle bg-emerald-50/20 whitespace-nowrap leading-tight ${cellBottomBorder}`}
                 >
-                  {(handlers.aoStatuses[currentOrderKey] || 'Pending') === 'Message Sent' ? (
+                  {(handlers.aoStatuses[currentOrderKey] ?? order.colAO ?? 'Pending') === 'Message Sent' ? (
                     <button
                       onClick={() => handlers.onOpenWhatsAppModal(order)}
                       className="inline-flex items-center gap-0.5 px-1.5 py-0 h-5 text-[10px] font-bold rounded bg-emerald-600 text-white hover:bg-emerald-700 transition-colors shadow-2xs"
