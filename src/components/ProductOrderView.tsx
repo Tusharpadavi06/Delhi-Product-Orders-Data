@@ -482,15 +482,15 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
     return list;
   }, [orders, filterPendingOnly, selectedMonth, selectedYear, filterYesterdayTodayOnly, currentYesterdayTodayIsoSet, searchTerm, poColFilters, poSortConfig]);
 
-  // Safe pagination calculation
-  const totalPages = Math.max(1, Math.ceil(filteredRows.length / (pageSize || 30)));
+  // Safe pagination calculation (capped at 500 rows per page to prevent browser OOM/tab crash)
+  const effectivePageSize = pageSize > 0 ? Math.min(pageSize, 500) : 500;
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / effectivePageSize));
   const safeCurrentPage = Math.min(currentPage, totalPages);
 
   const paginatedRows = useMemo(() => {
-    if (pageSize === 0) return filteredRows; // All
-    const start = (safeCurrentPage - 1) * pageSize;
-    return filteredRows.slice(start, start + pageSize);
-  }, [filteredRows, safeCurrentPage, pageSize]);
+    const start = (safeCurrentPage - 1) * effectivePageSize;
+    return filteredRows.slice(start, start + effectivePageSize);
+  }, [filteredRows, safeCurrentPage, effectivePageSize]);
 
   /**
    * Toggle "New Orders" ON / OFF:
@@ -1201,9 +1201,7 @@ export const ProductOrderView: React.FC<ProductOrderViewProps> = ({
               <option value={50}>50</option>
               <option value={100}>100</option>
               <option value={250}>250</option>
-              <option value={500}>500</option>
-              <option value={1000}>1,000</option>
-              <option value={0}>All ({filteredRows.length.toLocaleString()})</option>
+              <option value={500}>500 (Max)</option>
             </select>
           </div>
 

@@ -24,35 +24,60 @@ function openDB(): Promise<IDBDatabase> {
   });
 }
 
+let idbWriteInFlight = false;
+let pendingIdbOrders: ProductOrderRow[] | null = null;
+
 /**
- * Save all product order rows (supports 10,000+ rows with zero quota error)
+ * Save all product order rows (supports 10,000+ rows with zero quota error).
+ * Coalesces concurrent writes so large structured-clones never stack in memory.
  */
 export async function saveOrdersToStorage(orders: ProductOrderRow[]): Promise<boolean> {
-  try {
-    const db = await openDB();
-    return new Promise((resolve) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
-      // Store under fixed key 'current_dataset'
-      store.put({ id: 'current_dataset', data: orders, updatedAt: Date.now() });
+  if (idbWriteInFlight) {
+    pendingIdbOrders = orders;
+    return true;
+  }
+  idbWriteInFlight = true;
+  let currentOrders: ProductOrderRow[] | null = orders;
+  let lastOk = false;
 
-      tx.oncomplete = () => {
-        db.close();
-        resolve(true);
-      };
-      tx.onerror = () => {
-        db.close();
-        resolve(false);
-      };
-    });
-  } catch (err) {
-    console.warn('IndexedDB save failed, falling back to localStorage if size allows', err);
-    try {
-      if (orders.length <= 1500) {
-        localStorage.setItem('fms_simulated_orders', JSON.stringify(orders));
+  try {
+    while (currentOrders) {
+      const batch = currentOrders;
+      pendingIdbOrders = null;
+      try {
+        const db = await openDB();
+        lastOk = await new Promise<boolean>((resolve) => {
+          const tx = db.transaction(STORE_NAME, 'readwrite');
+          const store = tx.objectStore(STORE_NAME);
+          store.put({ id: 'current_dataset', data: batch, updatedAt: Date.now() });
+
+          tx.oncomplete = () => {
+            db.close();
+            resolve(true);
+          };
+          tx.onerror = () => {
+            db.close();
+            resolve(false);
+          };
+          tx.onabort = () => {
+            db.close();
+            resolve(false);
+          };
+        });
+      } catch (err) {
+        console.warn('IndexedDB save failed, falling back to localStorage if size allows', err);
+        try {
+          if (batch.length <= 1500) {
+            localStorage.setItem('fms_simulated_orders', JSON.stringify(batch));
+          }
+        } catch (e) {}
+        lastOk = false;
       }
-    } catch (e) {}
-    return false;
+      currentOrders = pendingIdbOrders;
+    }
+    return lastOk;
+  } finally {
+    idbWriteInFlight = false;
   }
 }
 

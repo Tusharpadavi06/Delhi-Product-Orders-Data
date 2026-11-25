@@ -18,6 +18,7 @@ import {
   computeTnaDelayDays,
   computeTnaOrderStatus,
   emptyTnaManual,
+  hasAnyTnaManualData,
   normalizeTnaManual,
   toFirebaseSafeTnaKey,
   toTnaStorageDate
@@ -765,11 +766,22 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   // Active Sheet tab: 'product_order' | 'automation' | 'closed' | 'tna' | 'merc_meetings'
   const [activeSheetTab, setActiveSheetTab] = useState<'product_order' | 'automation' | 'closed' | 'tna' | 'merc_meetings'>('product_order');
 
-  // Centralized TNA manual records (/tna_records in Firebase + localStorage cache)
+  // Centralized TNA manual records (/tna_records in Firebase + localStorage cache — strips empty/blank entries to keep memory & localStorage tiny)
   const [tnaRecords, setTnaRecords] = useState<Record<string, TnaManualEntry>>(() => {
     try {
       const saved = localStorage.getItem(LOCAL_STORAGE_TNA_RECORDS);
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object') {
+          const compact: Record<string, TnaManualEntry> = {};
+          Object.entries(parsed).forEach(([k, v]) => {
+            if (!v || typeof v !== 'object') return;
+            const norm = normalizeTnaManual(v as Partial<TnaManualEntry>);
+            if (hasAnyTnaManualData(norm)) compact[k] = norm;
+          });
+          return compact;
+        }
+      }
     } catch (e) {}
     return {};
   });
@@ -786,6 +798,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   const tnaSheetKnownKeysRef = useRef<Record<string, boolean>>({});
   const tnaSheetDeletedKeysRef = useRef<Record<string, boolean>>({});
   const tnaSheetMetaLoadedRef = useRef<boolean>(false);
+  const isSheetSyncInFlightRef = useRef<boolean>(false);
+  const isTnaSyncInFlightRef = useRef<boolean>(false);
+  const isMercSyncInFlightRef = useRef<boolean>(false);
+  const lastThursdayJsonSigRef = useRef<string>('');
 
   // Centralized Merc Meetings state (/merc_meeting_records & /merc_manual_orders in Firebase + localStorage cache)
   const [mercRecords, setMercRecords] = useState<Record<string, MercMeetingManualData>>(() => {
@@ -872,7 +888,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     filterSummary: string;
   } | null>(null);
 
-  // Debounced safe saving to IndexedDB (supports 10,000+ items without 3,000 cap)
+  // Debounced safe saving to IndexedDB (supports 10,000+ items without 3,000 cap; 2s debounce avoids back-to-back structured-clone spikes)
   useEffect(() => {
     if (!isStorageHydratedRef.current) return;
     const timer = setTimeout(() => {
@@ -886,7 +902,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       } catch (e) {
         // LocalStorage quota reached, safely handled by IndexedDB above
       }
-    }, 600);
+    }, 2000);
     return () => clearTimeout(timer);
   }, [rawResponses]);
 
@@ -3594,6 +3610,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   // (Tabs: "Product Order", "Order Automation 1", "Closed Orders") + Firebase Realtime Database
   const handleSyncDelhiImportRange = async (silent: boolean = false) => {
     const isSilent = silent === true;
+    if (isSheetSyncInFlightRef.current) {
+      return;
+    }
+    isSheetSyncInFlightRef.current = true;
     const fmsSheetId = '15jjr5tjxaWRPiv_nh6L9EZyFHNFZyQ3PQ6Jd89cV4k0';
     const delhiSheetId = '1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY';
     const delhiTab = 'Delhi';
@@ -3858,6 +3878,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         } catch (e) {}
       }
 
+      // Yield once to keep browser UI responsive before parsing secondary CSVs
+      await new Promise(resolve => setTimeout(resolve, 0));
       const sheetAutoRows = parse45ColSheetCsvForSync(sheetAutoCsv, false);
       const sheetClosedRows = parse45ColSheetCsvForSync(sheetClosedCsv, true);
 
@@ -3914,7 +3936,23 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       });
 
       if (Object.keys(cloudDispOverrides).length > 0 || Object.keys(sheetDispPatches).length > 0) {
-        setDispatchRecords(prev => ({ ...sheetDispPatches, ...cloudDispOverrides, ...prev }));
+        setDispatchRecords(prev => {
+          let changed = false;
+          const next = { ...prev };
+          Object.entries(sheetDispPatches).forEach(([k, v]) => {
+            if (next[k] === undefined) {
+              next[k] = v;
+              changed = true;
+            }
+          });
+          Object.entries(cloudDispOverrides).forEach(([k, v]) => {
+            if (next[k] === undefined) {
+              next[k] = v;
+              changed = true;
+            }
+          });
+          return changed ? next : prev;
+        });
       }
 
       let finalMergedForCloud: ProductOrderRow[] = [];
@@ -4178,6 +4216,38 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         if (cleanPrev.length !== finalMergedForCloud.length) {
           hadCountMismatchHeal = true;
         }
+        // Skip full React re-render & IndexedDB structured-clone if every row is identical to prev
+        if (prev.length === finalMergedForCloud.length && prev.length === cleanPrev.length) {
+          let isIdentical = true;
+          for (let i = 0; i < prev.length; i++) {
+            const a = prev[i];
+            const b = finalMergedForCloud[i];
+            if (
+              a.orderId !== b.orderId ||
+              a.orderNo !== b.orderNo ||
+              a.orderNoTimestamp !== b.orderNoTimestamp ||
+              a.statusAN !== b.statusAN ||
+              a.sheetSource !== b.sheetSource ||
+              a.dispatchQty !== b.dispatchQty ||
+              a.qty !== b.qty ||
+              a.colAA !== b.colAA ||
+              a.colAB !== b.colAB ||
+              a.colAE !== b.colAE ||
+              a.colAG !== b.colAG ||
+              a.colAJ !== b.colAJ ||
+              a.lrNumber !== b.lrNumber ||
+              a.colAO !== b.colAO ||
+              a.itemName !== b.itemName ||
+              a.color !== b.color
+            ) {
+              isIdentical = false;
+              break;
+            }
+          }
+          if (isIdentical) {
+            return prev;
+          }
+        }
         return finalMergedForCloud;
       });
 
@@ -4217,8 +4287,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         }).catch(() => {});
       }
 
-      // Push canonical dataset to Firebase when manually clicked OR when healing a count mismatch
-      if ((!isSilent || hadCountMismatchHeal) && finalMergedForCloud.length > 0) {
+      // Push full canonical dataset to Firebase ONLY on explicit manual Sync click (never during silent background polls/fresh page loads, which would upload 8MB+ across 40+ HTTP requests!)
+      if (!isSilent && finalMergedForCloud.length > 0) {
         setTimeout(() => {
           pushOrdersToFirebase(finalMergedForCloud).catch(() => {});
         }, 400);
@@ -4272,6 +4342,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         setSyncFeedback(null);
       }
     } finally {
+      isSheetSyncInFlightRef.current = false;
       if (!isSilent) {
         setIsSyncingImportRange(false);
       }
@@ -4396,7 +4467,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     } catch (e) {}
   };
 
-  // Sync Firebase Cloud + Google Sheet "Product Order" (A:AB) on mount and every 2 minutes in background
+  // Sync Firebase Cloud + Google Sheet "Product Order" (A:AB) on mount (single unified sync — no duplicate 11MB startup download) and every 5 minutes when tab is visible
   useEffect(() => {
     const nonZeroDisp: Record<string, number> = {};
     Object.entries(dispatchRecords).forEach(([k, v]) => {
@@ -4406,13 +4477,13 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       pushCellUpdatesToFirebase(nonZeroDisp);
     }
 
-    handleRefreshFromFirebaseCloud();
     const timer = setTimeout(() => {
       handleSyncDelhiImportRange(true);
-    }, 600);
+    }, 350);
     const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       handleSyncDelhiImportRange(true);
-    }, 120000);
+    }, 300000);
     return () => {
       clearTimeout(timer);
       clearInterval(interval);
@@ -4660,22 +4731,23 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   const [automationPage, setAutomationPage] = useState(1);
   const [automationPageSize, setAutomationPageSize] = useState<number>(50);
 
-  const totalAutomationPages = Math.max(1, Math.ceil(filteredOrders.length / (automationPageSize || 50)));
+  // Safe pagination cap (max 250 order blocks per page to prevent 200k+ DOM node browser crash)
+  const effectiveAutomationPageSize = automationPageSize > 0 ? Math.min(automationPageSize, 250) : 250;
+  const totalAutomationPages = Math.max(1, Math.ceil(filteredOrders.length / effectiveAutomationPageSize));
   const safeAutomationPage = Math.min(automationPage, totalAutomationPages);
 
   const paginatedOrders = useMemo(() => {
-    if (automationPageSize === 0) return filteredOrders;
-    const start = (safeAutomationPage - 1) * automationPageSize;
-    return filteredOrders.slice(start, start + automationPageSize);
-  }, [filteredOrders, safeAutomationPage, automationPageSize]);
+    const start = (safeAutomationPage - 1) * effectiveAutomationPageSize;
+    return filteredOrders.slice(start, start + effectiveAutomationPageSize);
+  }, [filteredOrders, safeAutomationPage, effectiveAutomationPageSize]);
 
   const startRowNumber = useMemo(() => {
-    if (automationPageSize === 0 || safeAutomationPage <= 1) return 2;
+    if (safeAutomationPage <= 1) return 2;
     let count = 2;
-    const prev = filteredOrders.slice(0, (safeAutomationPage - 1) * automationPageSize);
+    const prev = filteredOrders.slice(0, (safeAutomationPage - 1) * effectiveAutomationPageSize);
     prev.forEach(o => { count += o.items.length; });
     return count;
-  }, [filteredOrders, safeAutomationPage, automationPageSize]);
+  }, [filteredOrders, safeAutomationPage, effectiveAutomationPageSize]);
 
   // Total Orders for Product Order tab (as per =IMPORTRANGE("1ciwoXm38UcdjVe8n2LB51H66NLyel1Q1FERMb42AfGY","Delhi!A:Z"))
   // Always displays 100% of all rows (6,490+ rows) in Product Order — Open/Closed status is strictly for Order Automation -> Closed Orders!
@@ -4685,7 +4757,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
   // Aggregate metrics (Exact Row Counts matching Google Sheets 1:1)
   const totalOrdersCount = groupedOrders.length;
-  const pendingOnCount = productOrderRows.filter(r => !r.orderNo || r.orderNo.trim() === '').length;
+  const pendingOnCount = useMemo(
+    () => productOrderRows.filter(r => !r.orderNo || r.orderNo.trim() === '').length,
+    [productOrderRows]
+  );
   const activeItemsCount = useMemo(() => {
     let count = 0;
     groupedOrders.forEach(o => {
@@ -4713,12 +4788,19 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   );
   openTnaRowsRef.current = openTnaRows;
 
-  // Keep tnaRecordsRef in sync and save TNA records locally whenever updated
+  // Keep tnaRecordsRef in sync and save ONLY populated TNA records locally (debounced — prevents 2.89MB localStorage quota overflow)
   useEffect(() => {
     tnaRecordsRef.current = tnaRecords;
-    try {
-      localStorage.setItem(LOCAL_STORAGE_TNA_RECORDS, JSON.stringify(tnaRecords));
-    } catch (e) {}
+    const timer = setTimeout(() => {
+      try {
+        const compact: Record<string, TnaManualEntry> = {};
+        Object.entries(tnaRecords).forEach(([k, v]) => {
+          if (hasAnyTnaManualData(v)) compact[k] = v;
+        });
+        localStorage.setItem(LOCAL_STORAGE_TNA_RECORDS, JSON.stringify(compact));
+      } catch (e) {}
+    }, 800);
+    return () => clearTimeout(timer);
   }, [tnaRecords]);
 
   // Merc Meetings rows: Order Automation (AN === 'Open' & Unit === CKU / WARP(UDHANA)) + Manual Orders + Unique rows from "Thursday Meeting for circular."
@@ -4733,25 +4815,34 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     [mercMeetingRows]
   );
 
-  // Keep Merc refs and localStorage in sync
+  // Keep Merc refs and localStorage in sync (debounced to avoid blocking main thread)
   useEffect(() => {
     mercRecordsRef.current = mercRecords;
-    try {
-      localStorage.setItem(LOCAL_STORAGE_MERC_RECORDS, JSON.stringify(mercRecords));
-    } catch (e) {}
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem(LOCAL_STORAGE_MERC_RECORDS, JSON.stringify(mercRecords));
+      } catch (e) {}
+    }, 800);
+    return () => clearTimeout(timer);
   }, [mercRecords]);
 
   useEffect(() => {
     mercManualOrdersRef.current = mercManualOrders;
-    try {
-      localStorage.setItem(LOCAL_STORAGE_MERC_MANUAL_ORDERS, JSON.stringify(mercManualOrders));
-    } catch (e) {}
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem(LOCAL_STORAGE_MERC_MANUAL_ORDERS, JSON.stringify(mercManualOrders));
+      } catch (e) {}
+    }, 800);
+    return () => clearTimeout(timer);
   }, [mercManualOrders]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(LOCAL_STORAGE_MERC_THURSDAY_ROWS, JSON.stringify(mercThursdayRows));
-    } catch (e) {}
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem(LOCAL_STORAGE_MERC_THURSDAY_ROWS, JSON.stringify(mercThursdayRows));
+      } catch (e) {}
+    }, 800);
+    return () => clearTimeout(timer);
   }, [mercThursdayRows]);
 
   useEffect(() => {
@@ -5152,8 +5243,10 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
     return postResult;
   };
 
-  // Load centralized TNA records + Web App URL + Sheet tracking state from Firebase RTDB on mount and periodically (every 45s)
+  // Load centralized TNA records + Web App URL + Sheet tracking state from Firebase RTDB (strips blank entries & skips no-op re-renders)
   const fetchCentralizedTnaRecords = async () => {
+    if (isTnaSyncInFlightRef.current) return;
+    isTnaSyncInFlightRef.current = true;
     try {
       const baseTargetUrl = normalizeFirebaseDbUrl(firebaseUrl || DEFAULT_FIREBASE_RTDB_URL);
       const cleanSecret = (firebaseSecret || DEFAULT_FIREBASE_SECRET).trim();
@@ -5175,7 +5268,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       ]);
 
       if (cloudConfig?.webapp_url && typeof cloudConfig.webapp_url === 'string') {
-        setTnaWebAppUrl(cloudConfig.webapp_url.trim());
+        const cleanUrl = cloudConfig.webapp_url.trim();
+        setTnaWebAppUrl(prev => (prev === cleanUrl ? prev : cleanUrl));
       }
       if (knownMeta && typeof knownMeta === 'object' && !knownMeta.error) {
         tnaSheetKnownKeysRef.current = knownMeta;
@@ -5187,27 +5281,43 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
       if (cloudRecords && typeof cloudRecords === 'object' && !cloudRecords.error) {
         setTnaRecords(prev => {
+          let changed = false;
           const merged: Record<string, TnaManualEntry> = { ...prev };
           Object.entries(cloudRecords).forEach(([k, v]) => {
             if (!v || typeof v !== 'object') return;
             if (pendingTnaPatchRef.current[k]) return; // Preserve un-flushed local edit
             const cloudNorm = normalizeTnaManual(v as Partial<TnaManualEntry>);
+            // Drop completely empty Firebase placeholder records (saves 2.8+ MB RAM & localStorage!)
+            if (!hasAnyTnaManualData(cloudNorm)) return;
             const localNorm = prev[k];
-            if (!localNorm || !localNorm.updatedAt || (cloudNorm.updatedAt && cloudNorm.updatedAt >= localNorm.updatedAt)) {
-              merged[k] = cloudNorm;
+            if (
+              !localNorm ||
+              !localNorm.updatedAt ||
+              (cloudNorm.updatedAt && cloudNorm.updatedAt > localNorm.updatedAt)
+            ) {
+              if (!localNorm || JSON.stringify(localNorm) !== JSON.stringify(cloudNorm)) {
+                merged[k] = cloudNorm;
+                changed = true;
+              }
             }
           });
-          return merged;
+          return changed ? merged : prev;
         });
       }
       tnaLoadedFromCloudRef.current = true;
-    } catch (e) {}
+    } catch (e) {
+    } finally {
+      isTnaSyncInFlightRef.current = false;
+    }
   };
 
   useEffect(() => {
-    fetchCentralizedTnaRecords();
-    fetchCentralizedMercMeetingsData(false);
+    const startTimer = setTimeout(() => {
+      fetchCentralizedTnaRecords();
+      fetchCentralizedMercMeetingsData(false);
+    }, 1500);
     const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       if (Object.keys(pendingTnaPatchRef.current).length === 0) {
         fetchCentralizedTnaRecords();
       }
@@ -5217,8 +5327,11 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       ) {
         fetchCentralizedMercMeetingsData(false);
       }
-    }, 45000);
-    return () => clearInterval(timer);
+    }, 120000);
+    return () => {
+      clearTimeout(startTimer);
+      clearInterval(timer);
+    };
   }, []);
 
   // Auto-sync when AN status changes Open <-> Closed:
@@ -5523,6 +5636,8 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
   };
 
   const fetchCentralizedMercMeetingsData = async (showBanner = false) => {
+    if (isMercSyncInFlightRef.current) return;
+    isMercSyncInFlightRef.current = true;
     if (showBanner) {
       setIsSyncingMerc(true);
       setMercSyncNotice('Syncing Firebase & Thursday Sheet...');
@@ -5556,17 +5671,25 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
 
       if (recRes.ok && recRes.data && typeof recRes.data === 'object') {
         setMercRecords(prev => {
+          let changed = false;
           const merged: Record<string, MercMeetingManualData> = { ...prev };
           Object.entries(recRes.data).forEach(([k, v]) => {
             if (!v || typeof v !== 'object') return;
             if (pendingMercRecordPatchRef.current[k]) return;
             const cloudNorm = normalizeMercManualData(v as Partial<MercMeetingManualData>);
             const localNorm = prev[k];
-            if (!localNorm || !localNorm.updatedAt || (cloudNorm.updatedAt && cloudNorm.updatedAt >= localNorm.updatedAt)) {
-              merged[k] = cloudNorm;
+            if (
+              !localNorm ||
+              !localNorm.updatedAt ||
+              (cloudNorm.updatedAt && cloudNorm.updatedAt > localNorm.updatedAt)
+            ) {
+              if (!localNorm || JSON.stringify(localNorm) !== JSON.stringify(cloudNorm)) {
+                merged[k] = cloudNorm;
+                changed = true;
+              }
             }
           });
-          return merged;
+          return changed ? merged : prev;
         });
       }
 
@@ -5598,6 +5721,12 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           Object.entries(pendingMercManualPatchRef.current).forEach(([id, ord]) => {
             if (ord && !merged[id]) merged[id] = ord;
           });
+          if (
+            Object.keys(prev).length === Object.keys(merged).length &&
+            JSON.stringify(prev) === JSON.stringify(merged)
+          ) {
+            return prev;
+          }
           return merged;
         });
       }
@@ -5605,19 +5734,23 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
       // Resolve Thursday Meeting for circular. rows: prefer live Sheet/Apps Script, fallback to Firebase cache
       let loadedThursdayCount = 0;
       if (liveThursdayRes.rows && liveThursdayRes.rows.length > 0) {
-        setMercThursdayRows(liveThursdayRes.rows);
+        const nextSig = JSON.stringify(liveThursdayRes.rows);
+        if (nextSig !== lastThursdayJsonSigRef.current) {
+          lastThursdayJsonSigRef.current = nextSig;
+          setMercThursdayRows(liveThursdayRes.rows);
+          // Cache live sheet rows to Firebase ONLY when changed (avoids redundant PUT every poll)
+          patchMercFirebaseNode(
+            '/merc_thursday_sheet_rows',
+            {
+              updated_at: new Date().toISOString(),
+              count: liveThursdayRes.rows.length,
+              rows: liveThursdayRes.rows
+            },
+            'PUT'
+          ).catch(() => {});
+        }
         setThursdaySheetNeedsAccess(false);
         loadedThursdayCount = liveThursdayRes.rows.length;
-        // Cache live sheet rows to Firebase so all team members load them immediately
-        patchMercFirebaseNode(
-          '/merc_thursday_sheet_rows',
-          {
-            updated_at: new Date().toISOString(),
-            count: liveThursdayRes.rows.length,
-            rows: liveThursdayRes.rows
-          },
-          'PUT'
-        ).catch(() => {});
       } else {
         const fbRawRows = Array.isArray(fbThursdayRes.data)
           ? fbThursdayRes.data
@@ -5629,7 +5762,11 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
             .map((r: any) => normalizeMercThursdayRow(r))
             .filter((x: MercThursdaySheetRow | null): x is MercThursdaySheetRow => Boolean(x));
           if (normFb.length > 0) {
-            setMercThursdayRows(normFb);
+            const nextSig = JSON.stringify(normFb);
+            if (nextSig !== lastThursdayJsonSigRef.current) {
+              lastThursdayJsonSigRef.current = nextSig;
+              setMercThursdayRows(normFb);
+            }
             setThursdaySheetNeedsAccess(false);
             loadedThursdayCount = normFb.length;
           } else {
@@ -5656,6 +5793,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
         setTimeout(() => setMercSyncNotice(null), 4000);
       }
     } finally {
+      isMercSyncInFlightRef.current = false;
       if (showBanner) setIsSyncingMerc(false);
     }
   };
@@ -6014,6 +6152,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
           if (!v || typeof v !== 'object') return;
           if (pendingTnaPatchRef.current[k]) return;
           const cNorm = normalizeTnaManual(v as Partial<TnaManualEntry>);
+          if (!hasAnyTnaManualData(cNorm)) return;
           const lNorm = finalTnaMap[k];
           if (!lNorm || !lNorm.updatedAt || (cNorm.updatedAt && cNorm.updatedAt >= lNorm.updatedAt)) {
             finalTnaMap[k] = cNorm;
@@ -7033,7 +7172,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
               <div className="flex items-center gap-1 ml-1 pl-2 border-l border-slate-300">
                 <span className="text-[10px] text-slate-500">Show:</span>
                 <select
-                  value={automationPageSize}
+                  value={effectiveAutomationPageSize}
                   onChange={(e) => {
                     setAutomationPageSize(Number(e.target.value));
                     setAutomationPage(1);
@@ -7044,7 +7183,7 @@ export const SpreadsheetSimulator: React.FC<SpreadsheetSimulatorProps> = ({
                   <option value={25}>25</option>
                   <option value={50}>50</option>
                   <option value={100}>100</option>
-                  <option value={0}>All</option>
+                  <option value={250}>250 (Max)</option>
                 </select>
               </div>
             </div>

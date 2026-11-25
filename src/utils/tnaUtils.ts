@@ -403,6 +403,34 @@ export function normalizeTnaManual(raw?: Partial<TnaManualEntry> | null): TnaMan
   };
 }
 
+/** Returns true only if a TNA manual entry contains at least one non-empty field or history item. */
+export function hasAnyTnaManualData(m?: TnaManualEntry | null): boolean {
+  if (!m || typeof m !== 'object') return false;
+  if (
+    m.labdipCommittedDate.trim() ||
+    m.labdipActualDate.trim() ||
+    m.labdipRejectionDate.trim() ||
+    m.labdipApprovalDate.trim() ||
+    m.fobCommittedDate.trim() ||
+    m.fobActualDate.trim() ||
+    m.fobRejectionDate.trim() ||
+    m.fobApprovalDate.trim() ||
+    m.actualDispatchDate.trim() ||
+    m.totalDispatchedQty.trim() ||
+    m.pendingQty.trim() ||
+    m.committedBalanceDate.trim() ||
+    m.actualBalanceDispatchDate.trim() ||
+    m.balanceDispatchQty.trim() ||
+    m.orderRemarks.trim()
+  ) {
+    return true;
+  }
+  if (m.labdipRejectionHistory && m.labdipRejectionHistory.length > 0) return true;
+  if (m.fobRejectionHistory && m.fobRejectionHistory.length > 0) return true;
+  if (m.stepDateHistory && Object.keys(m.stepDateHistory).length > 0) return true;
+  return false;
+}
+
 /**
  * Merges live Order Automation Dispatch Qty (Col Y) & Balance Qty (Col Z)
  * into TNA manual entry while the order is Open in Order Automation.
